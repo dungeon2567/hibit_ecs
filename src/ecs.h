@@ -676,33 +676,25 @@ static inline int ecs_iterator_next(ecs_iterator_t* it) {
     return ecs_iterator_next_slow(it);
 }
 
-/* "Current frame" data -- predicted when dirty, confirmed when not.
-   CONFIRMED-mode specialization: dirty == 0 invariant (only PREDICT writes set
-   it), so off = slot. Skips l1->dirty load + shift + mask. it->mode is written
-   only at iterator_init -> loop-invariant; branch predicts perfectly and
-   hoists under LTO. */
+/* "Current frame" data -- predicted when dirty, confirmed when not. Branchless
+   via slot-offset shift (+64 when dirty), gated by mode multiplier (0 in
+   CONFIRMED zeroes the contribution, 1 in PREDICT keeps it). */
 static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx) {
     assert(it);
     assert(tree_idx < it->query->tree_count);
-    size_t slot = (size_t)it->l1_idx;
-    size_t off  = slot;
-    if (it->mode != ECS_MODE_CONFIRMED) {
-        const ecs_l1_t* l1 = it->l1[tree_idx];
-        uint64_t dirty_hi = (l1->dirty >> slot) & 1ULL;
-        off += (size_t)(dirty_hi << 6);
-    }
+    const ecs_l1_t* l1 = it->l1[tree_idx];
+    size_t   slot     = (size_t)it->l1_idx;
+    uint64_t dirty_hi = (l1->dirty >> slot) & 1ULL;
+    size_t   off      = slot + (size_t)(dirty_hi << 6) * (size_t)it->mode;
     return (char*)it->l1_data[tree_idx] + off * it->data_size[tree_idx];
 }
 
-/* Mode-specialized write. Caller supplies full slot value -- no seed/RMW.
-   Short-circuits via memcmp against the current visible value: if bytes
-   match, skip memcpy AND mask/dirty updates entirely (avoids spurious dirty
-   in PREDICT, avoids redundant memcpy in CONFIRMED). Slot bit is assumed
-   already present (iterator only visits live slots); L2/L3 dirty propagation
-   happens via the slow-path walk (no-op in CONFIRMED mode).
-   CONFIRMED specialization: dst = conf, victim is conf bit (always live),
-   no dirty update, no mode multiplexing. it->mode is loop-invariant ->
-   branch predicts perfectly and hoists under LTO. */
+/* Branchless mode-multiplexed write. Caller supplies full slot value -- no
+   seed/RMW. Short-circuits via memcmp against the current visible value: if
+   bytes match, skip memcpy AND mask/dirty updates entirely (avoids spurious
+   dirty in PREDICT, avoids redundant memcpy in CONFIRMED). Slot bit is
+   assumed already present (iterator only visits live slots); L2/L3 dirty
+   propagation happens via the slow-path walk (no-op in confirmed mode). */
 static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const void* new_value) {
     assert(it);
     assert(new_value);
@@ -713,42 +705,34 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
 
     uint64_t  bit  = 1ULL << it->l1_idx;
     char*     conf = (char*)it->l1_data[tree_idx] + (size_t)it->l1_idx * ds;
+    uint64_t  m    = (uint64_t)it->mode;                          /* 0 or 1 */
+    char*     dst  = conf + (size_t)64 * ds * (size_t)m;          /* conf when 0, pred when 1 */
 
     ecs_tree_t* tree  = it->query->trees[tree_idx];
     int         owned = tree->copy_element != NULL;
 
-    if (it->mode == ECS_MODE_CONFIRMED) {
-        if (owned) {
-            if (tree->destroy_component_fn) tree->destroy_component_fn(conf, ds);
-            tree->copy_element(conf, new_value, ds);
-        } else {
-            if (ECS_UNLIKELY(memcmp(conf, new_value, ds) == 0)) return;
-            memcpy(conf, new_value, ds);
-        }
-        l1->changed            |= bit;
-        l1->predicted_mask_any |= bit;
-        l1->confirmed_mask_any |= bit;
-        return;
-    }
-
-    /* PREDICT */
-    char* dst = conf + (size_t)64 * ds;
     if (owned) {
-        /* Heap-owning predict: victim is predicted slot iff
-           (predicted_mask & dirty) bit set -- "predicted owns heap"
-           indicator, safe against prior predict-remove this cycle. */
-        uint64_t victim_live = l1->predicted_mask_any & l1->dirty & bit;
+        /* Heap-owning: skip memcmp short-circuit (alias would still need
+           deep-clone), destroy victim if live, then deep-copy. CONFIRMED
+           victim = confirmed slot (iterator only visits live slots, so conf
+           bit is set). PREDICT victim = predicted slot iff (predicted_mask
+           & dirty) bit set -- same "predicted owns heap" rule as tree_set,
+           safe against prior predict-remove this cycle. */
+        uint64_t victim_live = (m == 0) ? bit : (l1->predicted_mask_any & l1->dirty & bit);
         if (victim_live && tree->destroy_component_fn)
             tree->destroy_component_fn(dst, ds);
         tree->copy_element(dst, new_value, ds);
     } else {
-        /* POD predict: visible value is predicted when dirty, else confirmed. */
+        /* POD: visible value is predicted when dirty, else confirmed. */
         uint64_t  dirty_hi = (l1->dirty >> it->l1_idx) & 1ULL;
         const char* cur    = conf + (size_t)64 * ds * (size_t)dirty_hi;
         if (ECS_UNLIKELY(memcmp(cur, new_value, ds) == 0)) return;
         memcpy(dst, new_value, ds);
     }
-    l1->dirty              |= bit;
+
+    uint64_t conf_set = bit & -(uint64_t)(1ULL - m);              /* bit when m=0, 0 when m=1 */
+    l1->dirty              |= bit * m;
     l1->changed            |= bit;
     l1->predicted_mask_any |= bit;
+    l1->confirmed_mask_any |= conf_set;
 }
