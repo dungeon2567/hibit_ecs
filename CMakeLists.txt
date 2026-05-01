@@ -136,7 +136,7 @@ endif()
 # -------------------------
 # fixed.h SIMD backend selects via arch macros: x86 → SSE4.1+AVX2, arm64 → NEON,
 # else scalar. x86-only flags (/arch:AVX2, -msse4.1, -mavx2) must be gated.
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86|x86)$")
+if (NOT EMSCRIPTEN AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86|x86)$")
     set(ECS_ARCH_X86 TRUE)
 else()
     set(ECS_ARCH_X86 FALSE)
@@ -181,6 +181,20 @@ foreach(_tgt ${_ecs_targets})
         target_link_options(${_tgt} PRIVATE
             $<$<CONFIG:Release>:/LTCG>
             $<$<CONFIG:RelWithDebInfo>:/LTCG>
+        )
+
+    elseif (EMSCRIPTEN)
+
+        # Emscripten: scalar backend in fixed.h (no __x86_64__/__aarch64__).
+        # -march=native invalid; SSE flags require -msimd128. Skip both.
+        target_compile_options(${_tgt} PRIVATE
+            $<$<CONFIG:Release>:-O3 -flto -DNDEBUG>
+            $<$<CONFIG:RelWithDebInfo>:-O3 -flto -DNDEBUG>
+        )
+
+        target_link_options(${_tgt} PRIVATE
+            $<$<CONFIG:Release>:-flto>
+            $<$<CONFIG:RelWithDebInfo>:-flto>
         )
 
     else()
