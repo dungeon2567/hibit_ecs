@@ -26,7 +26,7 @@ static inline int ecs_popcount64(uint64_t x) { return __builtin_popcountll(x); }
 #define ECS_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
-/* mimalloc wrappers. 'x' prefix = abort on OOM (xmalloc convention) â€” every
+/* mimalloc wrappers. 'x' prefix = abort on OOM (xmalloc convention) -- every
    allocation site in this engine treats failure as fatal, so callers don't
    check. ecs_free is a thin pass-through for symmetry. */
 static inline void* ecs_xmalloc_aligned(size_t size, size_t align) {
@@ -52,9 +52,9 @@ static inline void* ecs_xrealloc_aligned(void* p, size_t size, size_t align) {
 }
 
 /* ==========================================================================
-   ecs_list_t â€” typed dynamic array. Wraps a single `ecs_list_header_t*`
+   ecs_list_t -- typed dynamic array. Wraps a single `ecs_list_header_t*`
    that owns size + capacity + flexible-array data in one allocation. Both
-   `size` and `capacity` are byte counts (NOT element counts) â€” the list is
+   `size` and `capacity` are byte counts (NOT element counts) -- the list is
    element-size-agnostic at the storage level. Caller passes elem_size to
    every op that needs to address elements; the same value must be used for
    every call on a given list (no runtime check). Wrapper makes
@@ -71,12 +71,12 @@ static inline void* ecs_xrealloc_aligned(void* p, size_t size, size_t align) {
        ecs_list_destroy(&xs);
    ========================================================================== */
 /* _Alignas(8) on size forces 8-byte alignment on the whole struct, which
-   guarantees the FAM `data` (sitting at offset 8) is also 8-byte aligned â€”
+   guarantees the FAM `data` (sitting at offset 8) is also 8-byte aligned --
    safe for any element up to 8-byte natural alignment without padding. */
 typedef struct ecs_list_header_t {
     _Alignas(8) uint32_t size;              /* bytes used */
     uint32_t capacity;                      /* bytes allocated for data */
-    char     data[];                        /* flexible array â€” element bytes inline */
+    char     data[];                        /* flexible array -- element bytes inline */
 } ecs_list_header_t;
 
 typedef struct ecs_list_t {
@@ -101,7 +101,7 @@ static inline void ecs_list_reserve(ecs_list_t* l, uint32_t min_cap_bytes) {
     while (newcap < min_cap_bytes) newcap = newcap + (newcap >> 1) + 1u;  /* 1.5Ã— */
     ecs_list_header_t* nh = (ecs_list_header_t*)ecs_xrealloc_aligned(
         l->h, sizeof(ecs_list_header_t) + (size_t)newcap, 8);
-    if (!l->h) nh->size = 0u;               /* fresh alloc â€” size was uninitialized */
+    if (!l->h) nh->size = 0u;               /* fresh alloc -- size was uninitialized */
     nh->capacity = newcap;
     l->h = nh;
 }
@@ -173,7 +173,7 @@ typedef struct ecs_l1_t {
     uint64_t predicted_mask_any;       /* live this frame; iterator masks come from here */
     uint64_t dirty;                    /* slots written in PREDICT mode since last rollback */
     uint64_t changed;                  /* slots written this tick; cleared by ecs_tree_rollback */
-    /* tail: 128 * data_size bytes â€” [0..63] confirmed slots, [64..127] predicted slots */
+    /* tail: 128 * data_size bytes -- [0..63] confirmed slots, [64..127] predicted slots */
 } ecs_l1_t;
 
 typedef struct ecs_l2_t {
@@ -375,7 +375,7 @@ void     ecs_pipeline_run(ecs_pipeline_t* p, ecs_world_t* world);
 
 /* Default per-L1 batch encoder. Writes only the set-bit slots back-to-back,
    coalescing consecutive set bits into one ecs_serializer_write_bytes call.
-   Compression here is positional: absent slots emit 0 bytes â€” the mask is
+   Compression here is positional: absent slots emit 0 bytes -- the mask is
    what reconstructs layout on read. write_bytes self-aligns, so callers
    need not pre-pad. */
 void     ecs_serialize_batch_raw(const void* l1_data,
@@ -383,7 +383,7 @@ void     ecs_serialize_batch_raw(const void* l1_data,
                                  uint64_t    mask,
                                  ecs_serializer_t* s);
 
-/* Mirror of ecs_serialize_batch_raw â€” reads runs of set-bit slots from the
+/* Mirror of ecs_serialize_batch_raw -- reads runs of set-bit slots from the
    deserializer into the L1 inline data tail. */
 void     ecs_deserialize_batch_raw(void* l1_data,
                                    size_t      block_size,
@@ -433,14 +433,14 @@ void     ecs_deserialize_batch_raw(void* l1_data,
 
    Other compression: empty L2/L1 subtrees skipped entirely; only set-slot
    data emitted (no padding). Predicted/dirty state intentionally omitted
-   â€” transient, reconstructed by the simulator.
+   -- transient, reconstructed by the simulator.
 
    Caller owns the backing buffer and is responsible for sizing it.
    Bitpacker asserts on overflow. */
 void     ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s);
 
 /* Deserialize a tree previously written by ecs_tree_serialize. Totally
-   replaces tree state â€” confirmed/predicted/dirty/tick are overwritten
+   replaces tree state -- confirmed/predicted/dirty/tick are overwritten
    from the stream, predicted_mask = confirmed_mask, dirty = 0.
 
    Reuses already-allocated nodes when possible: l2/l1 nodes that exist
@@ -460,7 +460,7 @@ int      ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d);
        tree_mask  = encoded u64 (which of the 64 tree slots are populated)
        per set bit i in tree_mask:
            tree i serialized via ecs_tree_serialize
-   Tree names are NOT serialized â€” slot index is the stable identity. */
+   Tree names are NOT serialized -- slot index is the stable identity. */
 void     ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s);
 
 /* Deserialize a world. Trees in the old mask but missing from the new mask
@@ -485,7 +485,7 @@ void     ecs_world_destroy(ecs_world_t* world);
 void     ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value);
 
 /* Remove a slot. Fires `destroy_component_fn` on the live slot (if hook set)
-   before clearing presence â€” so heap-owning components free correctly.
+   before clearing presence -- so heap-owning components free correctly.
    In CONFIRMED mode that's the confirmed slot; in PREDICT mode it's the
    predicted clone, but only when (predicted_mask & dirty) is set for that bit
    (i.e. a live predict-set this cycle). Plain predict-remove on a confirmed-
@@ -493,14 +493,14 @@ void     ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value);
    Returns 1 if a slot was actually removed, 0 if it wasn't present. */
 int      ecs_tree_remove(ecs_tree_t* tree, int index);
 
-/* Dispatcher â€” calls tree->destroy_component_fn(element, data_size) if hook set,
+/* Dispatcher -- calls tree->destroy_component_fn(element, data_size) if hook set,
    else no-op. Safe to call on any slot ptr. */
 static inline void ecs_element_destroy(ecs_tree_t* tree, void* element) {
     assert(tree);
     if (tree->destroy_component_fn && element) tree->destroy_component_fn(element, tree->data_size);
 }
 
-/* Dispatcher â€” calls tree->copy_element(dst, src) if hook set, else memcpy. */
+/* Dispatcher -- calls tree->copy_element(dst, src) if hook set, else memcpy. */
 static inline void ecs_element_copy(ecs_tree_t* tree, void* dst, const void* src) {
     assert(tree && dst && src);
     if (tree->copy_element) tree->copy_element(dst, src, tree->data_size);
@@ -631,7 +631,7 @@ static inline int ecs_mask_pop_run(uint64_t* mask, int* out_idx) {
 }
 
 /* Sparse memcpy: src and dst both indexed by mask bit. Coalesces consecutive
-   set bits into one memcpy call. __restrict â€” no overlap. */
+   set bits into one memcpy call. __restrict -- no overlap. */
 static inline void ecs_memcpy_sparse(void* __restrict dst, const void* __restrict src, size_t block_size, uint64_t mask) {
     assert(!mask || (dst && src && block_size));
     assert(mask == 0 || (src != dst && "ecs_memcpy_sparse does not support in-place copying"));
@@ -665,7 +665,7 @@ static inline int ecs_tree_no_dirty(const ecs_tree_t* tree) {
     return 1;
 }
 
-/* Fast path: pop next entity from current L1 block. Slow path (L1 exhausted â†’
+/* Fast path: pop next entity from current L1 block. Slow path (L1 exhausted ->
    advance L2/L3 + dirty propagation) lives in ecs.c. */
 static inline int ecs_iterator_next(ecs_iterator_t* it) {
     if (it->l1_mask) {
@@ -676,24 +676,33 @@ static inline int ecs_iterator_next(ecs_iterator_t* it) {
     return ecs_iterator_next_slow(it);
 }
 
-/* "Current frame" data â€” predicted when dirty, confirmed when not. Branchless
-   via slot-offset shift (+64 when dirty). */
+/* "Current frame" data -- predicted when dirty, confirmed when not.
+   CONFIRMED-mode specialization: dirty == 0 invariant (only PREDICT writes set
+   it), so off = slot. Skips l1->dirty load + shift + mask. it->mode is written
+   only at iterator_init -> loop-invariant; branch predicts perfectly and
+   hoists under LTO. */
 static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx) {
     assert(it);
     assert(tree_idx < it->query->tree_count);
-    const ecs_l1_t* l1 = it->l1[tree_idx];
-    size_t   slot     = (size_t)it->l1_idx;
-    uint64_t dirty_hi = (l1->dirty >> slot) & 1ULL;
-    size_t   off      = slot + (size_t)(dirty_hi << 6);
+    size_t slot = (size_t)it->l1_idx;
+    size_t off  = slot;
+    if (it->mode != ECS_MODE_CONFIRMED) {
+        const ecs_l1_t* l1 = it->l1[tree_idx];
+        uint64_t dirty_hi = (l1->dirty >> slot) & 1ULL;
+        off += (size_t)(dirty_hi << 6);
+    }
     return (char*)it->l1_data[tree_idx] + off * it->data_size[tree_idx];
 }
 
-/* Branchless mode-multiplexed write. Caller supplies full slot value â€” no
-   seed/RMW. Short-circuits via memcmp against the current visible value: if
-   bytes match, skip memcpy AND mask/dirty updates entirely (avoids spurious
-   dirty in PREDICT, avoids redundant memcpy in CONFIRMED). Slot bit is
-   assumed already present (iterator only visits live slots); L2/L3 dirty
-   propagation happens via the slow-path walk (no-op in confirmed mode). */
+/* Mode-specialized write. Caller supplies full slot value -- no seed/RMW.
+   Short-circuits via memcmp against the current visible value: if bytes
+   match, skip memcpy AND mask/dirty updates entirely (avoids spurious dirty
+   in PREDICT, avoids redundant memcpy in CONFIRMED). Slot bit is assumed
+   already present (iterator only visits live slots); L2/L3 dirty propagation
+   happens via the slow-path walk (no-op in CONFIRMED mode).
+   CONFIRMED specialization: dst = conf, victim is conf bit (always live),
+   no dirty update, no mode multiplexing. it->mode is loop-invariant ->
+   branch predicts perfectly and hoists under LTO. */
 static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const void* new_value) {
     assert(it);
     assert(new_value);
@@ -703,36 +712,43 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
     assert(ds > 0 && "ecs_iterator_set called on tag component (data_size == 0)");
 
     uint64_t  bit  = 1ULL << it->l1_idx;
-    char*     base = (char*)it->l1_data[tree_idx];
-    char*     conf = base + (size_t)it->l1_idx * ds;
-    uint64_t  m    = (uint64_t)it->mode;                          /* 0 or 1 */
-    char*     dst  = conf + (size_t)64 * ds * (size_t)m;          /* conf when 0, pred when 1 */
+    char*     conf = (char*)it->l1_data[tree_idx] + (size_t)it->l1_idx * ds;
 
     ecs_tree_t* tree  = it->query->trees[tree_idx];
     int         owned = tree->copy_element != NULL;
 
+    if (it->mode == ECS_MODE_CONFIRMED) {
+        if (owned) {
+            if (tree->destroy_component_fn) tree->destroy_component_fn(conf, ds);
+            tree->copy_element(conf, new_value, ds);
+        } else {
+            if (ECS_UNLIKELY(memcmp(conf, new_value, ds) == 0)) return;
+            memcpy(conf, new_value, ds);
+        }
+        l1->changed            |= bit;
+        l1->predicted_mask_any |= bit;
+        l1->confirmed_mask_any |= bit;
+        return;
+    }
+
+    /* PREDICT */
+    char* dst = conf + (size_t)64 * ds;
     if (owned) {
-        /* Heap-owning: skip memcmp short-circuit (alias would still need
-           deep-clone), destroy victim if live, then deep-copy. CONFIRMED
-           victim = confirmed slot (iterator only visits live slots, so conf
-           bit is set). PREDICT victim = predicted slot iff (predicted_mask
-           & dirty) bit set — same "predicted owns heap" rule as tree_set,
-           safe against prior predict-remove this cycle. */
-        uint64_t victim_live = (m == 0) ? bit : (l1->predicted_mask_any & l1->dirty & bit);
+        /* Heap-owning predict: victim is predicted slot iff
+           (predicted_mask & dirty) bit set -- "predicted owns heap"
+           indicator, safe against prior predict-remove this cycle. */
+        uint64_t victim_live = l1->predicted_mask_any & l1->dirty & bit;
         if (victim_live && tree->destroy_component_fn)
             tree->destroy_component_fn(dst, ds);
         tree->copy_element(dst, new_value, ds);
     } else {
-        /* POD: visible value is predicted when dirty, else confirmed. */
+        /* POD predict: visible value is predicted when dirty, else confirmed. */
         uint64_t  dirty_hi = (l1->dirty >> it->l1_idx) & 1ULL;
         const char* cur    = conf + (size_t)64 * ds * (size_t)dirty_hi;
-        if (ECS_UNLIKELY(memcmp(cur, new_value, ds) == 0)) return; /* no change, skip all work */
+        if (ECS_UNLIKELY(memcmp(cur, new_value, ds) == 0)) return;
         memcpy(dst, new_value, ds);
     }
-
-    uint64_t conf_set = bit & -(uint64_t)(1ULL - m);              /* bit when m=0, 0 when m=1 */
-    l1->dirty              |= bit * m;
+    l1->dirty              |= bit;
     l1->changed            |= bit;
     l1->predicted_mask_any |= bit;
-    l1->confirmed_mask_any |= conf_set;
 }

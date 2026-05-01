@@ -113,12 +113,15 @@ static uint64_t iter_compute_l1_mask(const ecs_compiled_query_t* q,
 static inline void iter_load_l1(ecs_iterator_t* it, uint32_t tree_count) {
     for (uint32_t i = 0; i < tree_count; i++) {
         ecs_l1_t* l1 = (ecs_l1_t*)it->l2[i]->children[it->l2_idx];
+        /* Prefetch L1 mask line. Address already in hand (loaded above), no
+           extra work. Goal isn't to hide a single demand miss -- it's to
+           expose DRAM parallelism: iter_compute_l1_mask reads l1[n]->mask
+           through a serial `bits &= ...` AND chain, which CPU can't reorder.
+           Issuing N prefetches here lets the misses fetch concurrently via
+           LFBs instead of serializing. */
+        ECS_PREFETCH(l1);
         it->l1[i]      = l1;
         it->l1_data[i] = (char*)l1 + sizeof(ecs_l1_t);
-        /* Prefetch slot[0] cache line — caller's first ecs_iterator_get/set
-           after this load lands here. l1 header itself is already touched by
-           iter_compute_l1_mask reading predicted_mask_any. */
-        ECS_PREFETCH(it->l1_data[i]);
     }
 }
 
@@ -234,7 +237,7 @@ next_l2:
 }
 
 /* ==========================================================================
-   Stage writes â€” predicted side
+   Stage writes -- predicted side
    ========================================================================== */
 
 /* Write-only setter. Caller supplies full component value (no seed from
@@ -242,7 +245,7 @@ next_l2:
      PREDICT   -> predicted slot, dirty bit set, only predicted_mask updated.
      CONFIRMED -> confirmed slot, no dirty, both confirmed_mask and predicted_mask
                   updated in lockstep so the at-rest invariant holds.
-   Short-circuits via memcmp when the slot already exists and bytes match â€”
+   Short-circuits via memcmp when the slot already exists and bytes match --
    no memcpy, no dirty bit, no mask churn.
    For tag components (data_size == 0), new_value may be NULL. */
 void ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value) {
@@ -426,7 +429,7 @@ int ecs_tree_remove(ecs_tree_t* tree, int index) {
 }
 
 /* ==========================================================================
-   CRC64 â€” over confirmed state only (post-promote observable state).
+   CRC64 -- over confirmed state only (post-promote observable state).
    ========================================================================== */
 
 #define ECS_CRC64_POLY 0xC96C5795D7870F42ULL
@@ -623,7 +626,7 @@ void ecs_pipeline_run(ecs_pipeline_t* p, ecs_world_t* world) {
 }
 
 /* ==========================================================================
-   Mask invariant â€” at-rest (no dirty) state. Verifies tree is internally
+   Mask invariant -- at-rest (no dirty) state. Verifies tree is internally
    consistent: predicted == confirmed everywhere, mask_any reflects child
    presence, mask_all reflects full-subtree fullness (bit set iff every slot
    in subtree carries the term).
@@ -703,13 +706,13 @@ void ecs_world_rollback(ecs_world_t* world) {
 }
 
 /* Switch a single tree's VM mode. Caller must guarantee no in-flight prediction
-   on this tree (dirty == 0 everywhere). Cheap: just flips the tag â€” masks are
+   on this tree (dirty == 0 everywhere). Cheap: just flips the tag -- masks are
    already in lockstep when dirty == 0, so the in-CONFIRMED invariant holds
    the moment the flip happens. */
 void ecs_tree_set_mode(ecs_tree_t* tree, ecs_mode_t mode) {
     assert(tree);
     assert(ecs_tree_no_dirty(tree) &&
-           "ecs_tree_set_mode: in-flight prediction â€” promote or rollback first");
+           "ecs_tree_set_mode: in-flight prediction -- promote or rollback first");
     tree->mode = mode;
 }
 
@@ -734,7 +737,7 @@ void ecs_world_destroy(ecs_world_t* world) {
 }
 
 /* ==========================================================================
-   Binary serializer â€” confirmed state only, mask-driven sparse format,
+   Binary serializer -- confirmed state only, mask-driven sparse format,
    bitpacked via ecs_serializer.
    ========================================================================== */
 
@@ -763,7 +766,7 @@ void ecs_deserialize_batch_raw(void* l1_data, size_t block_size,
 }
 
 static void ecs_serialize_u64_(uint64_t v, ecs_serializer_t* s) {
-    /* Fast path â€” single 64-bit bit-write. Endian normalization happens
+    /* Fast path -- single 64-bit bit-write. Endian normalization happens
        inside the bitpacker on the qword scratch flush, so the wire format
        is identical to write_bytes(8) but skips the byte-alignment dance. */
     ecs_serializer_write_bits(s, v, 64);
@@ -782,7 +785,7 @@ static void ecs_serialize_u64_(uint64_t v, ecs_serializer_t* s) {
    (reader reconstructs as ~indexed). k = min(popcount, 64-popcount), so
    polarity is picked to minimise k. The indexed path is taken when the
    `min_count <= 8` test passes; k is stored in 3 bits so the effective
-   range is 0..7 (note: min_count == 8 would overflow the field â€” tighten
+   range is 0..7 (note: min_count == 8 would overflow the field -- tighten
    to <= 7 or widen k(3) to k(4) if exact 8 is needed).
 
    Hot ECS shapes:
@@ -850,7 +853,7 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
 
     /* ---- Pass 1: structural metadata (all masks) ----
        Walk the tree once writing l3, l2, l1 masks contiguously. Decoder
-       can rebuild full topology from this block alone â€” useful for
+       can rebuild full topology from this block alone -- useful for
        streaming, partial parsing, or piping the payload block into a
        separate compressor (zstd, lz4) on top. */
     ecs_serialize_mask(l3->confirmed_mask_any, s);
@@ -874,9 +877,9 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
 
     /* ---- Pass 2: payload (batch-encoded component data) ----
        write_bytes self-aligns at the byte boundary on its first call here,
-       so we don't pre-pad â€” the alignment cost (<=7 bits) lands inside
+       so we don't pre-pad -- the alignment cost (<=7 bits) lands inside
        write_bytes once at the pass-1/pass-2 boundary.
-       Same walk order as pass 1 â€” decoder traverses the reconstructed
+       Same walk order as pass 1 -- decoder traverses the reconstructed
        topology in the identical order to find each batch's payload.
        tree->serialize_batch is set by ecs_tree_init (defaults to
        ecs_serialize_batch_raw), so no NULL check needed here. */
@@ -896,7 +899,7 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
 }
 
 /* ==========================================================================
-   Binary deserializer â€” mirrors ecs_tree_serialize.
+   Binary deserializer -- mirrors ecs_tree_serialize.
    ========================================================================== */
 
 static uint64_t ecs_deserialize_varint(ecs_deserializer_t* d) {
@@ -944,7 +947,7 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
 
     uint64_t data_size = ecs_deserialize_varint(d);
     if (!tree->root) {
-        /* Uninitialized slot â€” set up topology with the stream's data_size.
+        /* Uninitialized slot -- set up topology with the stream's data_size.
            Lets ecs_world_deserialize hydrate empty world tree-slots in
            one step. */
         ecs_tree_init(tree, (size_t)data_size);
