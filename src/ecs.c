@@ -186,17 +186,30 @@ void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query) {
 
 int ecs_iterator_next_slow(ecs_iterator_t* it) {
     const ecs_compiled_query_t* q = it->query;
+    /* CONFIRMED mode invariant: l*->dirty == 0 everywhere (predict-writes
+       gated by mode multiplier). Skip the dirty store under CONFIRMED to
+       avoid a load+OR+store of zero per write_mask tree per L1/L2 step. */
+    int predict = (it->mode == ECS_MODE_PREDICT);
 
 advance_l2:
     {
         uint32_t wm  = it->write_mask;
         uint32_t bit = (uint32_t)it->l2_idx;
-        while (wm) {
-            uint32_t t = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
-            ecs_l1_t* l1 = it->l1[t];
-            ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
-            l2->dirty   |= (uint64_t)(l1->dirty   != 0) << bit;
-            l2->changed |= (uint64_t)(l1->changed != 0) << bit;
+        if (predict) {
+            while (wm) {
+                uint32_t t = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
+                ecs_l1_t* l1 = it->l1[t];
+                ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
+                l2->dirty   |= (uint64_t)(l1->dirty   != 0) << bit;
+                l2->changed |= (uint64_t)(l1->changed != 0) << bit;
+            }
+        } else {
+            while (wm) {
+                uint32_t t = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
+                ecs_l1_t* l1 = it->l1[t];
+                ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
+                l2->changed |= (uint64_t)(l1->changed != 0) << bit;
+            }
         }
     }
 
@@ -216,12 +229,21 @@ next_l2:
     {
         uint32_t wm  = it->write_mask;
         uint32_t bit = (uint32_t)it->l3_idx;
-        while (wm) {
-            uint32_t t = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
-            const ecs_l2_t* l2 = it->l2[t];
-            ecs_l3_t* l3 = (ecs_l3_t*)it->l3[t];
-            l3->dirty   |= (uint64_t)(l2->dirty   != 0) << bit;
-            l3->changed |= (uint64_t)(l2->changed != 0) << bit;
+        if (predict) {
+            while (wm) {
+                uint32_t t = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
+                const ecs_l2_t* l2 = it->l2[t];
+                ecs_l3_t* l3 = (ecs_l3_t*)it->l3[t];
+                l3->dirty   |= (uint64_t)(l2->dirty   != 0) << bit;
+                l3->changed |= (uint64_t)(l2->changed != 0) << bit;
+            }
+        } else {
+            while (wm) {
+                uint32_t t = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
+                const ecs_l2_t* l2 = it->l2[t];
+                ecs_l3_t* l3 = (ecs_l3_t*)it->l3[t];
+                l3->changed |= (uint64_t)(l2->changed != 0) << bit;
+            }
         }
     }
 
