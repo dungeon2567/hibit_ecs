@@ -696,7 +696,7 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
     assert(tree_idx < it->query->tree_count);
     ecs_l1_t* l1   = it->l1[tree_idx];
     size_t    ds   = it->data_size[tree_idx];
-    if (ds == 0) return;                                          /* tag component, no-op */
+    assert(ds > 0 && "ecs_iterator_set called on tag component (data_size == 0)");
 
     uint64_t  bit  = 1ULL << it->l1_idx;
     char*     base = (char*)it->l1_data[tree_idx];
