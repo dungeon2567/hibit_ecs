@@ -115,6 +115,10 @@ static inline void iter_load_l1(ecs_iterator_t* it, uint32_t tree_count) {
         ecs_l1_t* l1 = (ecs_l1_t*)it->l2[i]->children[it->l2_idx];
         it->l1[i]      = l1;
         it->l1_data[i] = (char*)l1 + sizeof(ecs_l1_t);
+        /* Prefetch slot[0] cache line — caller's first ecs_iterator_get/set
+           after this load lands here. l1 header itself is already touched by
+           iter_compute_l1_mask reading predicted_mask_any. */
+        ECS_PREFETCH(it->l1_data[i]);
     }
 }
 
@@ -263,7 +267,7 @@ void ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value) {
             uint64_t    dirty_hi = (l1s_existing->dirty >> l1_idx) & 1ULL;
             const char* cur      = (char*)l1s_existing + sizeof(ecs_l1_t)
                                  + (size_t)(l1_idx + 64 * (int)dirty_hi) * ds;
-            if (memcmp(cur, new_value, ds) == 0) return;
+            if (ECS_UNLIKELY(memcmp(cur, new_value, ds) == 0)) return;
         }
     }
 

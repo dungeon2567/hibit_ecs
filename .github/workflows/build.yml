@@ -76,6 +76,29 @@ jobs:
         run: .\build\Debug\ecs.exe
 
   # ---------------------------------------------------------------------------
+  # wasm — Emscripten Debug build. Sanity-check that the engine compiles to
+  # WebAssembly. ECS_ARCH_X86 is false on wasm32, so SIMD backends fall back
+  # to the scalar path in fixed.h. mimalloc 2.1.7 supports the emscripten
+  # port. Build-only — running tests under Node needs pthread + SAB plumbing
+  # the harness doesn't set up yet.
+  # ---------------------------------------------------------------------------
+  wasm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.64
+
+      - name: Configure (Debug, Emscripten)
+        run: emcmake cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build (ecs only)
+        run: cmake --build build --config Debug --target ecs --parallel
+
+  # ---------------------------------------------------------------------------
   # bench — Release, single pinned runner. Runs ecs_bench under Google
   # Benchmark, then feeds JSON to github-action-benchmark for regression
   # detection. Pinned to ubuntu-22.04 (cold runner) so the baseline stored in

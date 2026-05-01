@@ -15,11 +15,15 @@ static inline int ecs_ctz64(uint64_t x) { unsigned long i; _BitScanForward64(&i,
 static inline int ecs_ctz32(uint32_t x) { unsigned long i; _BitScanForward(&i, x); return (int)i; }
 static inline int ecs_popcount64(uint64_t x) { return (int)__popcnt64(x); }
 #define ECS_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#define ECS_LIKELY(x)   (x)
+#define ECS_UNLIKELY(x) (x)
 #else
 static inline int ecs_ctz64(uint64_t x) { return __builtin_ctzll(x); }
 static inline int ecs_ctz32(uint32_t x) { return __builtin_ctz(x); }
 static inline int ecs_popcount64(uint64_t x) { return __builtin_popcountll(x); }
 #define ECS_PREFETCH(p) __builtin_prefetch((p), 0, 3)
+#define ECS_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define ECS_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
 /* mimalloc wrappers. 'x' prefix = abort on OOM (xmalloc convention) â€” every
@@ -722,7 +726,7 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
         /* POD: visible value is predicted when dirty, else confirmed. */
         uint64_t  dirty_hi = (l1->dirty >> it->l1_idx) & 1ULL;
         const char* cur    = conf + (size_t)64 * ds * (size_t)dirty_hi;
-        if (memcmp(cur, new_value, ds) == 0) return;              /* no change, skip all work */
+        if (ECS_UNLIKELY(memcmp(cur, new_value, ds) == 0)) return; /* no change, skip all work */
         memcpy(dst, new_value, ds);
     }
 
