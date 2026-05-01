@@ -2,7 +2,7 @@
 
 | Bench | Median |
 | --- | --- |
-| `BM_IntegrateSparse` | 9.41 µs |
-| `BM_IntegrateDense` | 149.18 µs |
-| `BM_RandomAccess10k` | 33.23 µs |
-| `BM_RandomAccess100k` | 356.22 µs |
+| `BM_IntegrateSparse` | 8.55 µs |
+| `BM_IntegrateDense` | 142.18 µs |
+| `BM_RandomAccess10k` | 21.77 µs |
+| `BM_RandomAccess100k` | 302.01 µs |
