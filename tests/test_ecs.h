@@ -226,7 +226,7 @@ static void test_crc64_position_sensitive(void) {
     free_tree(t2);
 }
 
-/* Predict-then-rollback restores CRC to last confirmed. */
+/* CRC is view-aware: predicted writes shift it, rollback restores it. */
 static void test_crc64_rollback_restores_predicted(void) {
     ecs_tree_t* t = make_tree();
 
@@ -236,13 +236,12 @@ static void test_crc64_rollback_restores_predicted(void) {
 
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
     set_val(t, 0, 99);
-    /* CRC still reflects confirmed (CRC reads confirmed only). */
-    EXPECT(ecs_tree_crc64(t) == crc_confirmed,
-           "CRC stable across predicted writes (only confirmed crc'd)");
+    EXPECT(ecs_tree_crc64(t) != crc_confirmed,
+           "CRC tracks predicted writes (view-aware)");
 
     ecs_tree_rollback(t);
     EXPECT(ecs_tree_crc64(t) == crc_confirmed,
-           "CRC stable after rollback (confirmed unchanged)");
+           "rollback discards predicted → CRC back to confirmed");
     EXPECT(get_current_val(t, 0) == 42, "value restored to 42");
 
     free_tree(t);
@@ -385,8 +384,8 @@ static void test_world_predict_rollback(void) {
     world_set_val(w, 1, ENT(0, 0, 2), 30);
     world_set_val(w, 0, ENT(0, 0, 1), 11);
     world_remove(w, 2, ENT(1, 0, 0));
-    EXPECT(ecs_world_crc64(w) == crc_confirmed,
-           "world CRC stable across predicted writes");
+    EXPECT(ecs_world_crc64(w) != crc_confirmed,
+           "world CRC tracks predicted writes (view-aware)");
 
     /* Rollback discards predicted state. */
     ecs_world_rollback(w);

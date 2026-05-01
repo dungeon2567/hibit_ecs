@@ -498,6 +498,12 @@ int      ecs_tree_remove(ecs_tree_t* tree, int index);
 
 void     ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query);
 int      ecs_iterator_next_slow(ecs_iterator_t* it);
+/* View-aware CRC. Alive set = predicted_mask_any (mirrors confirmed in
+   CONFIRMED mode, is the live speculative set in PREDICT). Per-slot bytes:
+   predicted bytes when dirty bit set, else confirmed bytes. Tick excluded
+   so a confirmed-tick-N state and a predict-on-tick-M state with identical
+   alive masks + view bytes hash equal — enabling determinism checks between
+   predicted simulation and confirmed replay. */
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
 

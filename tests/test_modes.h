@@ -240,6 +240,52 @@ static void test_mode_repeat_write_short_circuits(void) {
     free_tree(t);
 }
 
+/* ---- determinism: predicted simulation must reproduce confirmed simulation.
+   3 confirmed integration ticks, capture view CRC. Then 3 predicted "ticks"
+   on the predicted overlay running same integration logic — view CRC at this
+   point is the would-be tick-6 fingerprint. Rollback discards predicted ⇒
+   view collapses to confirmed-tick-3. Replaying the same 3 steps in CONFIRMED
+   mode must land on the predicted result. View CRC excludes tick by design,
+   so predict-on-tick-3 vs confirmed-at-tick-6 hash equal when state matches.
+   ---- */
+static void test_mode_predict_matches_confirmed_simulation(void) {
+    ecs_tree_t* t = make_tree();
+
+    /* Phase A: 3 confirmed ticks. Integration logic = slot 0 := tick. */
+    set_val(t, 0, 1); ecs_tree_rollback(t);
+    set_val(t, 0, 2); ecs_tree_rollback(t);
+    set_val(t, 0, 3); ecs_tree_rollback(t);
+    EXPECT(t->tick == 3, "tick=3 after 3 confirmed integration ticks");
+    uint64_t crc_tick_3 = ecs_tree_crc64(t);
+
+    /* Phase B: 3 predicted ticks — same logic, predicted slot. No rollback
+       between steps; each predict-write reads previous predicted (dirty). */
+    ecs_tree_set_mode(t, ECS_MODE_PREDICT);
+    set_val(t, 0, 4);
+    set_val(t, 0, 5);
+    set_val(t, 0, 6);
+    uint64_t crc_tick_6 = ecs_tree_crc64(t);
+    EXPECT(crc_tick_6 != crc_tick_3, "predicted view diverges from confirmed");
+    EXPECT(get_current_val(t, 0) == 6, "predicted value = 6");
+
+    /* Rollback discards predicted overlay → view = confirmed = crc_tick_3. */
+    ecs_tree_rollback(t);
+    EXPECT(ecs_tree_crc64(t) == crc_tick_3,
+           "post-rollback view CRC matches confirmed-tick-3");
+    EXPECT(get_current_val(t, 0) == 3, "value restored to confirmed 3");
+
+    /* Phase C: 3 confirmed ticks replay → must reach crc_tick_6. */
+    ecs_tree_set_mode(t, ECS_MODE_CONFIRMED);
+    set_val(t, 0, 4); ecs_tree_rollback(t);
+    set_val(t, 0, 5); ecs_tree_rollback(t);
+    set_val(t, 0, 6); ecs_tree_rollback(t);
+    EXPECT(t->tick == 6, "tick=6 after 3 more confirmed ticks");
+    EXPECT(ecs_tree_crc64(t) == crc_tick_6,
+           "confirmed-replay view CRC matches predicted result");
+
+    free_tree(t);
+}
+
 static int test_modes_all(void) {
     int before = g_failed;
     printf("=== mode / phase tests ===\n\n");
@@ -253,6 +299,7 @@ static int test_modes_all(void) {
     test_mode_predict_multi_tick_lifecycle();
     test_mode_first_write_no_short_circuit();
     test_mode_repeat_write_short_circuits();
+    test_mode_predict_matches_confirmed_simulation();
     int failed = g_failed - before;
     printf("\nmodes: %d failed\n", failed);
     return failed ? 1 : 0;

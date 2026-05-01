@@ -496,25 +496,27 @@ static uint64_t ecs_crc64_feed(uint64_t crc, const void* data, size_t len) {
 
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree) {
     uint64_t crc = ~0ULL;
-    crc = ecs_crc64_feed(crc, &tree->tick, 8);
     const ecs_l3_t* l3 = tree->root;
-    crc = ecs_crc64_feed(crc, &l3->confirmed_mask_any, 8);
-    uint64_t visit3 = l3->confirmed_mask_any;
+    crc = ecs_crc64_feed(crc, &l3->predicted_mask_any, 8);
+    uint64_t visit3 = l3->predicted_mask_any;
     while (visit3) {
         int i = ecs_ctz64(visit3); visit3 &= visit3 - 1;
         const ecs_l2_t* l2 = l3->children[i];
-        crc = ecs_crc64_feed(crc, &l2->confirmed_mask_any, 8);
-        uint64_t visit2 = l2->confirmed_mask_any;
+        crc = ecs_crc64_feed(crc, &l2->predicted_mask_any, 8);
+        uint64_t visit2 = l2->predicted_mask_any;
         while (visit2) {
             int j = ecs_ctz64(visit2); visit2 &= visit2 - 1;
             const ecs_l1_t* l1 = l2->children[j];
-            crc = ecs_crc64_feed(crc, &l1->confirmed_mask_any, 8);
+            crc = ecs_crc64_feed(crc, &l1->predicted_mask_any, 8);
             if (tree->data_size > 0) {
-                const char* data = (const char*)ecs_l1_data(l1);
-                uint64_t alive = l1->confirmed_mask_any;
+                uint64_t alive = l1->predicted_mask_any;
+                uint64_t dirty = l1->dirty;
                 while (alive) {
                     int k = ecs_ctz64(alive); alive &= alive - 1;
-                    crc = ecs_crc64_feed(crc, data + (size_t)k * tree->data_size, tree->data_size);
+                    const void* slot = (dirty & (1ULL << k))
+                        ? ecs_l1_predicted(l1, k, tree->data_size)
+                        : ecs_l1_confirmed(l1, k, tree->data_size);
+                    crc = ecs_crc64_feed(crc, slot, tree->data_size);
                 }
             }
         }
@@ -524,7 +526,6 @@ uint64_t ecs_tree_crc64(const ecs_tree_t* tree) {
 
 uint64_t ecs_world_crc64(const ecs_world_t* world) {
     uint64_t crc = ~0ULL;
-    crc = ecs_crc64_feed(crc, &world->tick, 8);
     crc = ecs_crc64_feed(crc, &world->mask, 8);
     uint64_t mask = world->mask;
     while (mask) {

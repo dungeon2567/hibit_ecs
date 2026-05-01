@@ -86,12 +86,12 @@ static void test_predict_rollback(void) {
     ecs_tree_set(&tree, 7, &(Vec2){ 9.f, 9.f });
     ecs_tree_remove(&tree, 3);
 
-    /* CRC reads confirmed only — stable across predicted writes. */
-    CHECK(ecs_tree_crc64(&tree) == crc1);
+    /* CRC is view-aware — predicted writes shift it. */
+    CHECK(ecs_tree_crc64(&tree) != crc1);
 
     ecs_tree_rollback(&tree);
     CHECK(tree.tick == 1);                    /* predict-only rollback doesn't advance tick */
-    CHECK(ecs_tree_crc64(&tree) == crc1);
+    CHECK(ecs_tree_crc64(&tree) == crc1);     /* rollback restores view to confirmed */
     const Vec2* cur = (const Vec2*)ecs_tree_get(&tree, 3);
     CHECK(cur->x == 1.f && cur->y == 2.f);
     CHECK(!entity_exists_confirmed(&tree, 7));
