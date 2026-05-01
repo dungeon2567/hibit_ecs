@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777602215136,
+  "lastUpdate": 1777602854474,
   "repoUrl": "https://github.com/dungeon2567/hibit_ecs",
   "entries": {
     "HibitEcs Benchmarks": [
@@ -120,6 +120,126 @@ window.BENCHMARK_DATA = {
             "value": 0.01906707037794943,
             "unit": "us/iter",
             "extra": "iterations: 3\ncpu: 0.019043499061718178 us\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "31074903+dungeon2567@users.noreply.github.com",
+            "name": "Diego Guedes",
+            "username": "dungeon2567"
+          },
+          "committer": {
+            "email": "31074903+dungeon2567@users.noreply.github.com",
+            "name": "Diego Guedes",
+            "username": "dungeon2567"
+          },
+          "distinct": true,
+          "id": "3872c9be38352a738390966987352a155b562c00",
+          "message": "fixes",
+          "timestamp": "2026-04-30T23:36:55-03:00",
+          "tree_id": "89461d36fbce55def2f60ef83ccb4d6314db433e",
+          "url": "https://github.com/dungeon2567/hibit_ecs/commit/3872c9be38352a738390966987352a155b562c00"
+        },
+        "date": 1777602853986,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_IntegrateSparse_mean",
+            "value": 9.449551433019723,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 9.441240615748963 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateSparse_median",
+            "value": 9.259443812906929,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 9.255665574633248 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateSparse_stddev",
+            "value": 0.3335960176342297,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.3235362663611687 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateSparse_cv",
+            "value": 0.03530284162151228,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.03426840597849787 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateDense_mean",
+            "value": 142.612592293906,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 142.50259091535702 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateDense_median",
+            "value": 142.40312179487142,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 142.35091459884205 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateDense_stddev",
+            "value": 0.4994245306062137,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.37167041753966973 us\nthreads: 1"
+          },
+          {
+            "name": "BM_IntegrateDense_cv",
+            "value": 0.0035019665695225897,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.0026081660351034088 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess10k_mean",
+            "value": 33.778471570185566,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 33.77347715474839 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess10k_median",
+            "value": 33.560597593643706,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 33.553717185017014 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess10k_stddev",
+            "value": 0.4242296548404931,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.4229035893166439 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess10k_cv",
+            "value": 0.012559172606700704,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.012521766336907528 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess100k_mean",
+            "value": 362.6128730894727,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 362.55364640219796 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess100k_median",
+            "value": 362.4487882534786,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 362.4088871715607 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess100k_stddev",
+            "value": 2.974153492428307,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 2.9320154725801117 us\nthreads: 1"
+          },
+          {
+            "name": "BM_RandomAccess100k_cv",
+            "value": 0.008202007466222664,
+            "unit": "us/iter",
+            "extra": "iterations: 3\ncpu: 0.008087121731296802 us\nthreads: 1"
           }
         ]
       }
