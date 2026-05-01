@@ -1,0 +1,220 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  # github-action-benchmark needs write access to the gh-pages branch where
+  # the benchmark history + dashboard live, plus PR comment write for alerts.
+  contents: write
+  pull-requests: write
+  deployments: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # tests — Debug only, multi-OS. Runs the `ecs` binary (tests + asserts on).
+  # ---------------------------------------------------------------------------
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm covers the NEON backend in fixed.h; macos-latest is
+        # already arm64 (Apple Silicon) so it covers NEON on Darwin.
+        # Linux pinned to 22.04 (cold runner) to keep tooling stable.
+        os: [ubuntu-22.04, ubuntu-24.04-arm, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      # ASAN + UBSAN on Linux/macOS only — sub-ms NtDelayExecution sleeps on
+      # Windows trip ASAN's hooking, and ASAN doesn't ship for clang-cl out of
+      # the box anyway.
+      SAN_FLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Linux/macOS, sanitized)
+        if: runner.os != 'Windows'
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS="${{ env.SAN_FLAGS }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ env.SAN_FLAGS }}"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build (ecs only)
+        run: cmake --build build --config Debug --target ecs --parallel
+
+      - name: Run tests (Linux/macOS)
+        if: runner.os != 'Windows'
+        env:
+          ASAN_OPTIONS: "abort_on_error=1:halt_on_error=1:strict_string_checks=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          MI_STAT:  "1"
+          MI_DEBUG: "1"
+          # Disable mimalloc's 1GB arena pre-reserve. CI VMs (esp. ubuntu-arm)
+          # don't have contiguous 32MB-aligned VA, triggering the
+          # "unable to allocate aligned OS memory" warning + over-allocation
+          # fallback. Lazy allocation is fine for our test sizes.
+          MI_ARENA_RESERVE: "0"
+        run: ./build/ecs
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        env:
+          MI_STAT:  "1"
+          MI_DEBUG: "1"
+          MI_ARENA_RESERVE: "0"
+        run: .\build\Debug\ecs.exe
+
+  # ---------------------------------------------------------------------------
+  # bench — Release, single pinned runner. Runs ecs_bench under Google
+  # Benchmark, then feeds JSON to github-action-benchmark for regression
+  # detection. Pinned to ubuntu-22.04 (cold runner) so the baseline stored in
+  # gh-pages compares apples-to-apples across runs.
+  # ---------------------------------------------------------------------------
+  bench:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build ecs_bench
+        run: cmake --build build --config Release --target ecs_bench --parallel
+
+      - name: Run benchmark (JSON output)
+        env:
+          MI_ARENA_RESERVE: "0"
+        run: |
+          ./build/ecs_bench \
+            --benchmark_format=json \
+            --benchmark_out=bench.json \
+            --benchmark_out_format=json \
+            --benchmark_repetitions=3 \
+            --benchmark_report_aggregates_only=true \
+            --benchmark_min_time=0.5s
+          cat bench.json
+
+      - name: Store + alert on regression
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: HibitEcs Benchmarks
+          tool: 'googlecpp'
+          output-file-path: bench.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Push history to gh-pages on main pushes; PRs only diff against
+          # the stored baseline and comment.
+          auto-push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+          alert-threshold: '130%'
+          comment-on-alert: true
+          fail-on-alert: ${{ github.event_name == 'pull_request' }}
+          summary-always: true
+
+      - name: Generate badges + SUMMARY.md
+        run: |
+          mkdir -p gh-pages-extra
+          python3 scripts/bench_to_badges.py bench.json gh-pages-extra
+          ls -R gh-pages-extra
+          cat gh-pages-extra/SUMMARY.md
+
+      - name: Publish badges + summary to gh-pages
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./gh-pages-extra
+          destination_dir: dev/bench
+          keep_files: true
+          commit_message: "chore(bench): refresh badges + SUMMARY"
+
+      - name: Upload bench JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-json
+          path: bench.json
+
+  # ---------------------------------------------------------------------------
+  # tsan — Linux Debug only. TSan catches data races in jobs.c work-stealing
+  # deques and pipeline.c atomic dep counting. x86 + arm64 to catch
+  # arch-specific memory ordering bugs.
+  # ---------------------------------------------------------------------------
+  tsan:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04-arm]
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      TSAN_FLAGS: "-fsanitize=thread -fno-omit-frame-pointer -g"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS="${{ env.TSAN_FLAGS }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ env.TSAN_FLAGS }}"
+
+      - name: Build (ecs only)
+        run: cmake --build build --config Debug --target ecs --parallel
+
+      - name: Run tests
+        env:
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:history_size=7"
+          MI_STAT:  "1"
+          MI_DEBUG: "1"
+          MI_ARENA_RESERVE: "0"
+        run: ./build/ecs
+
+  # ---------------------------------------------------------------------------
+  # valgrind — Debug Linux. Memcheck catches owned-component lifecycle bugs
+  # ASan often misses (uninitialized reads, leak kinds=all). Tests only.
+  # ---------------------------------------------------------------------------
+  valgrind:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind libc6-dbg
+
+      - name: Configure (Debug)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS="-O1 -g -fno-omit-frame-pointer"
+
+      - name: Build (ecs only)
+        run: cmake --build build --config Debug --target ecs --parallel
+
+      - name: Run under valgrind (fail on any error or leak)
+        timeout-minutes: 30
+        run: >
+          valgrind
+          --tool=memcheck
+          --error-exitcode=1
+          --errors-for-leak-kinds=all
+          --leak-check=full
+          --show-leak-kinds=all
+          --track-origins=yes
+          --track-fds=yes
+          --num-callers=32
+          --child-silent-after-fork=no
+          --gen-suppressions=all
+          ./build/ecs
+
