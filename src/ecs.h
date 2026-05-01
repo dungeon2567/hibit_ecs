@@ -299,7 +299,11 @@ typedef struct ecs_iterator_t {
     const ecs_l2_t* l2[ECS_QUERY_MAX_TERMS];
     ecs_l1_t*       l1[ECS_QUERY_MAX_TERMS];
     void*           l1_data[ECS_QUERY_MAX_TERMS];   /* inline data base = confirmed[0] */
-    size_t          data_size[ECS_QUERY_MAX_TERMS];
+    /* const so compiler can hoist size loads across iterator_set's writes
+       through l1->dirty/changed (uint64 stores into l1, same type as size_t,
+       would otherwise force reloads each call). Written once via cast in
+       ecs_iterator_init. Never modified after that. */
+    const size_t    data_size[ECS_QUERY_MAX_TERMS];
 } ecs_iterator_t;
 
 struct ecs_world_t {
@@ -730,9 +734,12 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
         memcpy(dst, new_value, ds);
     }
 
-    uint64_t conf_set = bit & -(uint64_t)(1ULL - m);              /* bit when m=0, 0 when m=1 */
-    l1->dirty              |= bit * m;
-    l1->changed            |= bit;
-    l1->predicted_mask_any |= bit;
-    l1->confirmed_mask_any |= conf_set;
+    /* Eager: l1->changed must reflect writes immediately (read between iter
+       steps). Deferred: dirty / predicted_mask_any / confirmed_mask_any are
+       only consumed by L1->L2 propagation at block boundary in
+       ecs_iterator_next_slow — derive them there from l1->changed (matches
+       per-element semantics: predicted_mask_any always tracks changed,
+       dirty = changed in PREDICT mode, confirmed_mask_any = changed in
+       CONFIRMED mode; OR is idempotent against bits set by prior blocks). */
+    l1->changed |= bit;
 }

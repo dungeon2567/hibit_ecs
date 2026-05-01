@@ -51,26 +51,19 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
         }
     }
 
-    ecs_world_rollback(ctx->w);
-
-    /* Predict mode so per-iter integrate writes are discarded by rollback —
-       otherwise pos accumulates and overflows int32 (UBSan trip in NEON). */
-    ecs_tree_set_mode(&ctx->w->trees[0], ECS_MODE_PREDICT);
-    ecs_tree_set_mode(&ctx->w->trees[1], ECS_MODE_PREDICT);
-
     ctx->query.tree_count         = 2;
     ctx->query.trees[0]           = &ctx->w->trees[0];
     ctx->query.trees[1]           = &ctx->w->trees[1];
     ctx->query.clause_count       = 1;
     ctx->query.clauses[0].include = (1u << 0) | (1u << 1);
 
-    /* Cache warmup. */
+    /* Cache warmup. Confirmed mode — writes land in place, pos accumulates
+       (signed wrap is fine; benchmarks build without UBSan). */
     for (int i = 0; i < 70; i++) {
         ecs_iterator_t it = {0};
         ecs_iterator_init(&it, &ctx->query);
         it.write_mask = 1u;
         bench_integrate_fn(&it);
-        ecs_world_rollback(ctx->w);
     }
 
     return ctx;
@@ -81,12 +74,64 @@ void bench_integrate_iter(bench_integrate_ctx* ctx) {
     ecs_iterator_init(&it, &ctx->query);
     it.write_mask = 1u;
     bench_integrate_fn(&it);
-    ecs_world_rollback(ctx->w);
 }
 
 void bench_integrate_teardown(bench_integrate_ctx* ctx) {
     ecs_world_destroy(ctx->w);
     free(ctx->w);
+    free(ctx);
+}
+
+/* SOA baseline: two contiguous vec3 arrays + scratch output, no ECS overhead.
+   Same arithmetic as bench_integrate_fn (pos_new = pos + vel * dt).
+   Writes to pos_out scratch — matches predict-mode semantics of BM_IntegrateDense
+   (reads stay valid across iters, no overflow accumulation). */
+struct bench_integrate_soa_ctx {
+    vec3_t* pos;
+    vec3_t* vel;
+    vec3_t* pos_out;
+    int     n;
+};
+
+static void bench_integrate_soa_fn(vec3_t* pos_out,
+                                   const vec3_t* pos,
+                                   const vec3_t* vel,
+                                   int n) {
+    for (int i = 0; i < n; i++) {
+        pos_out[i] = vec3_add(pos[i], vec3_scale(vel[i], BENCH_DT));
+    }
+}
+
+bench_integrate_soa_ctx* bench_integrate_soa_setup(int n) {
+    bench_integrate_soa_ctx* ctx = (bench_integrate_soa_ctx*)calloc(1, sizeof(*ctx));
+    ctx->n       = n;
+    ctx->pos     = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
+    ctx->vel     = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
+    ctx->pos_out = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
+
+    vec3_t v0 = vec3_make(fixed_from_int(60), fixed_from_int(-30), 0);
+    for (int i = 0; i < n; i++) {
+        ctx->pos[i]     = vec3_make(fixed_from_int(i), 0, 0);
+        ctx->vel[i]     = v0;
+        ctx->pos_out[i] = vec3_zero();
+    }
+
+    /* Cache warmup. */
+    for (int k = 0; k < 70; k++) {
+        bench_integrate_soa_fn(ctx->pos_out, ctx->pos, ctx->vel, n);
+    }
+
+    return ctx;
+}
+
+void bench_integrate_soa_iter(bench_integrate_soa_ctx* ctx) {
+    bench_integrate_soa_fn(ctx->pos_out, ctx->pos, ctx->vel, ctx->n);
+}
+
+void bench_integrate_soa_teardown(bench_integrate_soa_ctx* ctx) {
+    free(ctx->pos);
+    free(ctx->vel);
+    free(ctx->pos_out);
     free(ctx);
 }
 

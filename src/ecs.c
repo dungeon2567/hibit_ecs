@@ -164,7 +164,7 @@ void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query) {
         it->l2[i]        = &ecs_default_l2;
         it->l1[i]        = &ecs_default_l1;
         it->l1_data[i]   = NULL;
-        it->data_size[i] = query->trees[i]->data_size;
+        ((size_t*)it->data_size)[i] = query->trees[i]->data_size;  /* field is const after init */
     }
     it->l3_mask = iter_compute_l3_mask(query, it->l3);
 
@@ -189,7 +189,27 @@ int ecs_iterator_next_slow(ecs_iterator_t* it) {
     /* CONFIRMED mode invariant: l*->dirty == 0 everywhere (predict-writes
        gated by mode multiplier). Skip the dirty store under CONFIRMED to
        avoid a load+OR+store of zero per write_mask tree per L1/L2 step. */
-    int predict = (it->mode == ECS_MODE_PREDICT);
+    int predict = it->mode;
+
+    /* Block-boundary flush of mask updates that ecs_iterator_set deferred:
+       dirty / predicted_mask_any / confirmed_mask_any. Derived from
+       l1->changed (which set updates eagerly). OR is idempotent — bits set
+       by prior blocks/ticks are already in the targets, so re-OR'ing is a
+       no-op. Must run BEFORE the L1->L2 dirty propagation below. */
+    {
+        uint32_t wm = it->write_mask;
+        uint64_t m  = (uint64_t)it->mode;
+        uint64_t conf_mul = 1ULL - m;                          /* 1 in CONFIRMED, 0 in PREDICT */
+        while (wm) {
+            uint32_t  t  = (uint32_t)ecs_ctz32(wm); wm &= wm - 1;
+            ecs_l1_t* l1 = it->l1[t];
+            uint64_t  ch = l1->changed;
+            //if (!ch) continue;
+            l1->dirty              |= ch * m;                  /* zero in CONFIRMED */
+            l1->predicted_mask_any |= ch;
+            l1->confirmed_mask_any |= ch * conf_mul;           /* zero in PREDICT */
+        }
+    }
 
 advance_l2:
     {
