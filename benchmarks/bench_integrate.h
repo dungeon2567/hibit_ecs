@@ -4,7 +4,6 @@ typedef struct bench_integrate_ctx bench_integrate_ctx;
 
 bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match);
 void                 bench_integrate_iter(bench_integrate_ctx* ctx);
-void                 bench_integrate_iter_block(bench_integrate_ctx* ctx);
 void                 bench_integrate_teardown(bench_integrate_ctx* ctx);
 
 typedef struct bench_integrate_soa_ctx bench_integrate_soa_ctx;

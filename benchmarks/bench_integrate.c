@@ -76,37 +76,6 @@ void bench_integrate_iter(bench_integrate_ctx* ctx) {
     bench_integrate_fn(&it);
 }
 
-/* Block-API kernel. Same arithmetic as bench_integrate_fn — pos += vel * dt
-   over every live slot — but using ecs_iterator_next_block to expose
-   contiguous L1 base ptrs. Inner loop branches on full-mask vs sparse so the
-   dense path becomes a flat counted loop the compiler can vectorize, while
-   sparse falls back to mask-pop iteration. */
-static void bench_integrate_block_fn(ecs_iterator_t* it) {
-    ecs_block_t b;
-    while (ecs_iterator_next_block(it, &b)) {
-        vec3_t*       pos = (vec3_t*)      b.data[0];
-        const vec3_t* vel = (const vec3_t*)b.data[1];
-        if (b.mask == ~0ULL) {
-            for (int k = 0; k < 64; k++)
-                pos[k] = vec3_add(pos[k], vec3_scale(vel[k], BENCH_DT));
-        } else {
-            uint64_t m = b.mask;
-            while (m) {
-                int k = ecs_ctz64(m); m &= m - 1;
-                pos[k] = vec3_add(pos[k], vec3_scale(vel[k], BENCH_DT));
-            }
-        }
-        ecs_iterator_block_write(it, b.mask);
-    }
-}
-
-void bench_integrate_iter_block(bench_integrate_ctx* ctx) {
-    ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, &ctx->query);
-    it.write_mask = 1u;
-    bench_integrate_block_fn(&it);
-}
-
 void bench_integrate_teardown(bench_integrate_ctx* ctx) {
     ecs_world_destroy(ctx->w);
     free(ctx->w);

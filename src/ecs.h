@@ -286,9 +286,6 @@ typedef struct ecs_iterator_t {
     int      l1_idx;
     uint32_t write_mask;
     ecs_mode_t mode;           /* cached from query trees at iterator_init */
-    int        block_yielded;  /* block-API state: 1 between next_block returning 1
-                                  and the next next_block call (signals "flush + advance
-                                  before emitting again"). Per-elem path leaves this 0. */
 
     ecs_world_t* world;
     uint8_t      world_tree_idx[ECS_QUERY_MAX_TERMS];
@@ -503,29 +500,6 @@ void     ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query
 int      ecs_iterator_next_slow(ecs_iterator_t* it);
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
-
-/* ==========================================================================
-   Block iteration — yields one ecs_block_t per non-empty L1, exposing the
-   live mask + per-term contiguous data base pointers. User runs the inner
-   loop directly through typed pointers; the engine pays per-L1 cost only.
-   Reaches SOA-class throughput on dense L1s (`mask == ~0ULL` → flat loop).
-
-   POD-only: asserts no LIST term is in the query. ecs_iterator_block_write
-   ORs `touched_lanes` into l1->changed for every term in `it->write_mask`,
-   matching the per-elem ecs_iterator_set's eager-changed semantics.
-   Caller passes the precise touched mask (typically `b.mask` for "wrote
-   everything", a subset for skip-equal kernels).
-
-   PREDICT mode: not yet supported by block API — assert. Use per-elem path. */
-typedef struct ecs_block_t {
-    uint64_t mask;                                 /* live slot bits this L1 */
-    uint32_t base_index;                           /* (l3<<12)|(l2<<6) — slot 0 entity index */
-    uint32_t _pad;
-    void*    data[ECS_QUERY_MAX_TERMS];            /* slot 0 ptr per term; stride = sizeof(T) */
-} ecs_block_t;
-
-int      ecs_iterator_next_block (ecs_iterator_t* it, ecs_block_t* out);
-void     ecs_iterator_block_write(ecs_iterator_t* it, uint64_t touched_lanes);
 
 /* ecs_list_t deep-copy. Caller MUST ensure dst is empty (dst->h == NULL or
    dst->h freed already). Used by ecs_tree_set on LIST trees. */
