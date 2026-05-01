@@ -220,21 +220,18 @@ typedef void (*ecs_deserialize_batch_fn)(void* l1_data,
                                          uint64_t    mask,
                                          ecs_deserializer_t* d);
 
-/* Element lifecycle hooks. All default to NULL — NULL means the engine does
-   the trivial thing (memcpy for copy, no-op for destroy). Override post-init
-   when slots own external memory (e.g. ecs_list_t inside a slot needs a
-   destroy hook to free its heap, and a copy hook to deep-clone on forward).
+/* Tree flags. Encodes component kind + future bools.
+   Component lifecycle is fully determined by the LIST flag — no user-supplied
+   destroy hook. POD = trivial copy + no destroy. LIST = ecs_list_assign deep-
+   copy + ecs_free(slot->h) destroy. Components requiring per-element teardown
+   beyond list-header free are not supported; model heap as ecs_list_t and
+   keep elements POD.
 
-   destroy_component_fn       — per-slot destroy, fired on single-element
-                                removals (ecs_tree_remove).
-   destroy_component_batch_fn — per-L1 destroy with a slot bitmask, fired
-                                during bulk teardown (ecs_tree_destroy walk).
-                                Same shape as serialize/deserialize batch
-                                hooks. Preferred for bulk because it lets the
-                                hook coalesce work across runs of set bits. */
-typedef void (*ecs_element_copy_fn)         (void* dst, const void* src, size_t data_size);
-typedef void (*ecs_element_destroy_fn)      (void* element, size_t data_size);
-typedef void (*ecs_destroy_batch_fn)        (void* l1_data, size_t block_size, uint64_t mask);
+   ECS_TREE_FLAG_LIST: slot type is ecs_list_t. tree_set deep-copies via
+                       ecs_list_assign; tree_remove / rollback / tree_destroy
+                       free slot->h. ecs_iterator_set asserts this flag clear
+                       (POD-only). */
+#define ECS_TREE_FLAG_LIST (1u << 0)
 
 typedef struct ecs_tree_t {
     const char* name;          /* may be NULL */
@@ -245,9 +242,7 @@ typedef struct ecs_tree_t {
                                       iterator asserts equality when query has changed-clause */
     ecs_l3_t*   root;
     ecs_mode_t  mode;          /* CONFIRMED or PREDICT — set via ecs_world_set_mode */
-    ecs_element_copy_fn      copy_element;                /* NULL = plain memcpy */
-    ecs_element_destroy_fn   destroy_component_fn;        /* NULL = no-op */
-    ecs_destroy_batch_fn     destroy_component_batch_fn;  /* NULL = no-op */
+    uint32_t    flags;         /* ECS_TREE_FLAG_* bitset */
     ecs_serialize_batch_fn   serialize_batch;             /* set by ecs_tree_init to raw default */
     ecs_deserialize_batch_fn deserialize_batch;           /* set by ecs_tree_init to raw default */
 } ecs_tree_t;
@@ -291,6 +286,9 @@ typedef struct ecs_iterator_t {
     int      l1_idx;
     uint32_t write_mask;
     ecs_mode_t mode;           /* cached from query trees at iterator_init */
+    int        block_yielded;  /* block-API state: 1 between next_block returning 1
+                                  and the next next_block call (signals "flush + advance
+                                  before emitting again"). Per-elem path leaves this 0. */
 
     ecs_world_t* world;
     uint8_t      world_tree_idx[ECS_QUERY_MAX_TERMS];
@@ -492,32 +490,59 @@ void     ecs_tree_destroy(ecs_tree_t* tree);
 void     ecs_world_destroy(ecs_world_t* world);
 void     ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value);
 
-/* Remove a slot. Fires `destroy_component_fn` on the live slot (if hook set)
-   before clearing presence -- so heap-owning components free correctly.
-   In CONFIRMED mode that's the confirmed slot; in PREDICT mode it's the
-   predicted clone, but only when (predicted_mask & dirty) is set for that bit
-   (i.e. a live predict-set this cycle). Plain predict-remove on a confirmed-
-   only slot leaves predicted bytes as stale-POD, no destroy needed.
+/* Remove a slot. For LIST trees frees the live slot's heap (ecs_free on its
+   list header) before clearing presence. In CONFIRMED mode that's the
+   confirmed slot; in PREDICT mode the predicted clone iff (predicted_mask &
+   dirty) bit is set (i.e. a live predict-set this cycle). Plain predict-
+   remove on a confirmed-only slot leaves predicted bytes as stale-POD, no
+   free needed. POD trees: trivial mask clear, no free.
    Returns 1 if a slot was actually removed, 0 if it wasn't present. */
 int      ecs_tree_remove(ecs_tree_t* tree, int index);
 
-/* Dispatcher -- calls tree->destroy_component_fn(element, data_size) if hook set,
-   else no-op. Safe to call on any slot ptr. */
-static inline void ecs_element_destroy(ecs_tree_t* tree, void* element) {
-    assert(tree);
-    if (tree->destroy_component_fn && element) tree->destroy_component_fn(element, tree->data_size);
-}
-
-/* Dispatcher -- calls tree->copy_element(dst, src) if hook set, else memcpy. */
-static inline void ecs_element_copy(ecs_tree_t* tree, void* dst, const void* src) {
-    assert(tree && dst && src);
-    if (tree->copy_element) tree->copy_element(dst, src, tree->data_size);
-    else if (tree->data_size) memcpy(dst, src, tree->data_size);
-}
 void     ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query);
 int      ecs_iterator_next_slow(ecs_iterator_t* it);
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
+
+/* ==========================================================================
+   Block iteration — yields one ecs_block_t per non-empty L1, exposing the
+   live mask + per-term contiguous data base pointers. User runs the inner
+   loop directly through typed pointers; the engine pays per-L1 cost only.
+   Reaches SOA-class throughput on dense L1s (`mask == ~0ULL` → flat loop).
+
+   POD-only: asserts no LIST term is in the query. ecs_iterator_block_write
+   ORs `touched_lanes` into l1->changed for every term in `it->write_mask`,
+   matching the per-elem ecs_iterator_set's eager-changed semantics.
+   Caller passes the precise touched mask (typically `b.mask` for "wrote
+   everything", a subset for skip-equal kernels).
+
+   PREDICT mode: not yet supported by block API — assert. Use per-elem path. */
+typedef struct ecs_block_t {
+    uint64_t mask;                                 /* live slot bits this L1 */
+    uint32_t base_index;                           /* (l3<<12)|(l2<<6) — slot 0 entity index */
+    uint32_t _pad;
+    void*    data[ECS_QUERY_MAX_TERMS];            /* slot 0 ptr per term; stride = sizeof(T) */
+} ecs_block_t;
+
+int      ecs_iterator_next_block (ecs_iterator_t* it, ecs_block_t* out);
+void     ecs_iterator_block_write(ecs_iterator_t* it, uint64_t touched_lanes);
+
+/* ecs_list_t deep-copy. Caller MUST ensure dst is empty (dst->h == NULL or
+   dst->h freed already). Used by ecs_tree_set on LIST trees. */
+static inline void ecs_list_assign(ecs_list_t* dst, const ecs_list_t* src) {
+    assert(dst);
+    if (src && src->h && src->h->size > 0u) {
+        uint32_t cap = src->h->capacity;
+        ecs_list_header_t* nh = (ecs_list_header_t*)ecs_xmalloc_aligned(
+            sizeof(ecs_list_header_t) + (size_t)cap, 8);
+        nh->size     = src->h->size;
+        nh->capacity = cap;
+        memcpy(nh->data, src->h->data, src->h->size);
+        dst->h = nh;
+    } else {
+        dst->h = NULL;
+    }
+}
 
 #ifdef __cplusplus
 }
@@ -536,17 +561,18 @@ static inline void* ecs_l1_predicted(const ecs_l1_t* n, int i, size_t data_size)
     return ecs_l1_data(n) + (size_t)(i + 64) * data_size;
 }
 
-static inline void ecs_tree_init(ecs_tree_t* tree, size_t data_size) {
+static inline void ecs_tree_init(ecs_tree_t* tree, size_t data_size, uint32_t flags) {
     assert(tree);
+    /* LIST trees must use sizeof(ecs_list_t) — engine reinterprets slot bytes
+       as an ecs_list_t for assign/destroy. */
+    assert(!(flags & ECS_TREE_FLAG_LIST) || data_size == sizeof(ecs_list_t));
     tree->name             = NULL;
     tree->data_size        = data_size;
     tree->data_mask        = (uint64_t)-(int64_t)(data_size != 0);
     tree->tick             = 0;
     tree->tick_id_at_begin = 0;
     tree->mode             = ECS_MODE_CONFIRMED;
-    tree->copy_element                = NULL;
-    tree->destroy_component_fn        = NULL;
-    tree->destroy_component_batch_fn  = NULL;
+    tree->flags            = flags;
     tree->serialize_batch             = ecs_serialize_batch_raw;
     tree->deserialize_batch           = ecs_deserialize_batch_raw;
     tree->root             = (ecs_l3_t*)ecs_xmalloc_aligned(sizeof(ecs_l3_t), 64);
@@ -589,6 +615,11 @@ static inline ecs_l1_t* ecs_l1_acquire(ecs_tree_t* tree) {
     node->predicted_mask_any = 0;
     node->dirty              = 0;
     node->changed            = 0;
+    /* Zero the data tail so LIST slots start with NULL header pointers.
+       POD trees don't depend on initial bytes (mask gates access), but the
+       cost is a single memset at acquire which is rare. Keeps the LIST path
+       branch-free in tree_set / rollback (always a valid ecs_list_t header). */
+    if (data_size) memset((char*)node + sizeof(ecs_l1_t), 0, 128 * data_size);
     return node;
 }
 
@@ -697,16 +728,23 @@ static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx
     return (char*)it->l1_data[tree_idx] + off * it->data_size[tree_idx];
 }
 
-/* Branchless mode-multiplexed write. Caller supplies full slot value -- no
-   seed/RMW. Short-circuits via memcmp against the current visible value: if
-   bytes match, skip memcpy AND mask/dirty updates entirely (avoids spurious
-   dirty in PREDICT, avoids redundant memcpy in CONFIRMED). Slot bit is
-   assumed already present (iterator only visits live slots); L2/L3 dirty
-   propagation happens via the slow-path walk (no-op in confirmed mode). */
+/* Branchless mode-multiplexed write. POD-only — asserts the term's tree is
+   not LIST. Always memcpy, conditionally skip the mask update via memcmp
+   against the current visible value: if bytes match, the predicted slot
+   doesn't get promoted (dirty/changed unchanged → reader still sees conf).
+   Wasted store on equal case is one cache-line write; the elimination of
+   the eq-vs-neq branch on the I-cache hot path pays for it.
+
+   Mask propagation: only l1->changed is touched eagerly. dirty /
+   predicted_mask_any / confirmed_mask_any get derived from changed at the
+   L1 block boundary in ecs_iterator_next_slow / ecs_iterator_next_block. */
 static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const void* new_value) {
     assert(it);
     assert(new_value);
     assert(tree_idx < it->query->tree_count);
+    assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_LIST) &&
+           "ecs_iterator_set: LIST components not supported on iterator path; use ecs_tree_set");
+
     ecs_l1_t* l1   = it->l1[tree_idx];
     size_t    ds   = it->data_size[tree_idx];
     assert(ds > 0 && "ecs_iterator_set called on tag component (data_size == 0)");
@@ -716,34 +754,12 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
     uint64_t  m    = (uint64_t)it->mode;                          /* 0 or 1 */
     char*     dst  = conf + (size_t)64 * ds * (size_t)m;          /* conf when 0, pred when 1 */
 
-    ecs_tree_t* tree  = it->query->trees[tree_idx];
-    int         owned = tree->copy_element != NULL;
+    /* Visible value = predicted when dirty, else confirmed. */
+    uint64_t    dirty_hi = (l1->dirty >> it->l1_idx) & 1ULL;
+    const char* cur      = conf + (size_t)64 * ds * (size_t)dirty_hi;
+    int eq = (memcmp(cur, new_value, ds) == 0);
 
-    if (owned) {
-        /* Heap-owning: skip memcmp short-circuit (alias would still need
-           deep-clone), destroy victim if live, then deep-copy. CONFIRMED
-           victim = confirmed slot (iterator only visits live slots, so conf
-           bit is set). PREDICT victim = predicted slot iff (predicted_mask
-           & dirty) bit set -- same "predicted owns heap" rule as tree_set,
-           safe against prior predict-remove this cycle. */
-        uint64_t victim_live = (m == 0) ? bit : (l1->predicted_mask_any & l1->dirty & bit);
-        if (victim_live && tree->destroy_component_fn)
-            tree->destroy_component_fn(dst, ds);
-        tree->copy_element(dst, new_value, ds);
-    } else {
-        /* POD: visible value is predicted when dirty, else confirmed. */
-        uint64_t  dirty_hi = (l1->dirty >> it->l1_idx) & 1ULL;
-        const char* cur    = conf + (size_t)64 * ds * (size_t)dirty_hi;
-        if (ECS_UNLIKELY(memcmp(cur, new_value, ds) == 0)) return;
-        memcpy(dst, new_value, ds);
-    }
-
-    /* Eager: l1->changed must reflect writes immediately (read between iter
-       steps). Deferred: dirty / predicted_mask_any / confirmed_mask_any are
-       only consumed by L1->L2 propagation at block boundary in
-       ecs_iterator_next_slow — derive them there from l1->changed (matches
-       per-element semantics: predicted_mask_any always tracks changed,
-       dirty = changed in PREDICT mode, confirmed_mask_any = changed in
-       CONFIRMED mode; OR is idempotent against bits set by prior blocks). */
+    memcpy(dst, new_value, ds);
+    if (eq) return;
     l1->changed |= bit;
 }

@@ -27,7 +27,7 @@ static void ts_round_trip(ecs_tree_t* src, const char* tag) {
 
     /* Decode into a fresh tree of matching data_size. */
     ecs_tree_t* dst = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
-    ecs_tree_init(dst, src->data_size);
+    ecs_tree_init(dst, src->data_size, 0);
 
     ecs_deserializer_t d;
     ecs_deserializer_init(&d, buf, ((bytes + 7) / 8) * 8);
@@ -94,7 +94,7 @@ static void test_serialize_multi_l2(void) {
 static void test_serialize_tag_tree(void) {
     /* data_size == 0: presence-only, payload pass entirely skipped. */
     ecs_tree_t* t = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
-    ecs_tree_init(t, 0);
+    ecs_tree_init(t, 0, 0);
     /* Tag trees can't store data â€” flip presence bits via set + remove. */
     ecs_tree_set(t, 7,    NULL);
     ecs_tree_set(t, 200,  NULL);
@@ -221,7 +221,7 @@ typedef uint16_t comp_b_t;   /* second component type with different size */
 static ecs_world_t* ts_make_world(int n_trees, const size_t* sizes) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     for (int i = 0; i < n_trees; i++) {
-        ecs_tree_init(&w->trees[i], sizes[i]);
+        ecs_tree_init(&w->trees[i], sizes[i], 0);
         w->mask |= (uint64_t)1 << i;
     }
     return w;
@@ -271,9 +271,9 @@ static void test_world_serialize_multi_tree_mixed_sizes(void) {
     /* Trees at slots 0, 2, 5 with different data sizes â€” exercises
        tree mask sparsity + per-tree data_size round-trip. */
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));      /* 4 bytes */
-    ecs_tree_init(&w->trees[2], sizeof(comp_b_t));    /* 2 bytes */
-    ecs_tree_init(&w->trees[5], 0);                    /* tag tree */
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);      /* 4 bytes */
+    ecs_tree_init(&w->trees[2], sizeof(comp_b_t), 0);    /* 2 bytes */
+    ecs_tree_init(&w->trees[5], 0, 0);                    /* tag tree */
     w->mask = (1ULL << 0) | (1ULL << 2) | (1ULL << 5);
 
     set_val(&w->trees[0], 1,    0x1111);
@@ -293,8 +293,8 @@ static void test_world_serialize_multi_tree_mixed_sizes(void) {
 static void test_world_serialize_override(void) {
     /* Source world: trees at slots {0, 3} */
     ecs_world_t* src = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&src->trees[0], sizeof(comp_t));
-    ecs_tree_init(&src->trees[3], sizeof(comp_t));
+    ecs_tree_init(&src->trees[0], sizeof(comp_t), 0);
+    ecs_tree_init(&src->trees[3], sizeof(comp_t), 0);
     src->mask = (1ULL << 0) | (1ULL << 3);
     set_val(&src->trees[0], 10, 0xA1);
     set_val(&src->trees[3], 50, 0xB2);
@@ -311,9 +311,9 @@ static void test_world_serialize_override(void) {
 
     /* Destination: trees at slots {0, 1, 7} â€” overlap at 0, drop 1+7, add 3 */
     ecs_world_t* dst = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&dst->trees[0], sizeof(comp_t));
-    ecs_tree_init(&dst->trees[1], sizeof(comp_t));
-    ecs_tree_init(&dst->trees[7], sizeof(comp_t));
+    ecs_tree_init(&dst->trees[0], sizeof(comp_t), 0);
+    ecs_tree_init(&dst->trees[1], sizeof(comp_t), 0);
+    ecs_tree_init(&dst->trees[7], sizeof(comp_t), 0);
     dst->mask = (1ULL << 0) | (1ULL << 1) | (1ULL << 7);
     set_val(&dst->trees[0], 99, 0xFF);
     set_val(&dst->trees[1], 1,  0x01);

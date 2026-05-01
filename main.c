@@ -50,7 +50,7 @@ static int entity_exists_confirmed(const ecs_tree_t* tree, int index) {
 
 static void test_promote(void) {
     ecs_tree_t tree = {0};
-    ecs_tree_init(&tree, sizeof(Vec2));
+    ecs_tree_init(&tree, sizeof(Vec2), 0);
 
     ecs_tree_set(&tree, 3, &(Vec2){ 1.f, 2.f });
     ecs_tree_set(&tree, 7, &(Vec2){ 3.f, 4.f });
@@ -69,7 +69,7 @@ static void test_promote(void) {
 
 static void test_predict_rollback(void) {
     ecs_tree_t tree = {0};
-    ecs_tree_init(&tree, sizeof(Vec2));
+    ecs_tree_init(&tree, sizeof(Vec2), 0);
 
     uint64_t crc0 = ecs_tree_crc64(&tree);
 
@@ -104,7 +104,7 @@ static void test_predict_rollback(void) {
 
 static void test_predict_rollback_mixed(void) {
     ecs_tree_t tree = {0};
-    ecs_tree_init(&tree, sizeof(Vec2));
+    ecs_tree_init(&tree, sizeof(Vec2), 0);
 
     /* Seed confirmed via CONFIRMED writes. */
     ecs_tree_set(&tree,  3, &(Vec2){ 1.f, 2.f });

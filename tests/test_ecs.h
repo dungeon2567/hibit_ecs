@@ -21,7 +21,7 @@ typedef uint32_t comp_t;
 
 static inline ecs_tree_t* make_tree(void) {
     ecs_tree_t* t = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
-    ecs_tree_init(t, sizeof(comp_t));
+    ecs_tree_init(t, sizeof(comp_t), 0);
     return t;
 }
 
@@ -52,7 +52,7 @@ static ecs_l1_t* l1_of(ecs_tree_t* t, int l3_idx, int l2_idx) {
 static ecs_world_t* make_world(int n_trees) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     for (int i = 0; i < n_trees; i++) {
-        ecs_tree_init(&w->trees[i], sizeof(comp_t));
+        ecs_tree_init(&w->trees[i], sizeof(comp_t), 0);
         w->mask |= (1ULL << i);
     }
     return w;
@@ -274,7 +274,7 @@ static void test_world_crc64_changes_on_promote(void) {
 static ecs_world_t* make_named_world(const char** names, int n) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     for (int i = 0; i < n; i++) {
-        ecs_tree_init(&w->trees[i], sizeof(comp_t));
+        ecs_tree_init(&w->trees[i], sizeof(comp_t), 0);
         w->trees[i].name = names[i];
         w->mask |= (1ULL << i);
     }

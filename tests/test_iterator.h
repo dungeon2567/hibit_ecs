@@ -13,8 +13,8 @@
 static ecs_world_t* iter_make_world(void) {
     const char* names[] = { "Pos", "Vel" };
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));
-    ecs_tree_init(&w->trees[1], sizeof(comp_t));
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
+    ecs_tree_init(&w->trees[1], sizeof(comp_t), 0);
     w->trees[0].name = names[0];
     w->trees[1].name = names[1];
     w->mask = 0x3;

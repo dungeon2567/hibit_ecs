@@ -21,7 +21,7 @@ static void pipe_record(ecs_world_t* w, void* user) {
 
 static void test_pipeline_empty_runs_begin_tick(void) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
     w->mask = 1;
     set_val(&w->trees[0], 0, 1);
 
@@ -38,7 +38,7 @@ static void test_pipeline_empty_runs_begin_tick(void) {
 
 static void test_pipeline_runs_single_system_once(void) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
     w->mask = 1;
 
     int counter = 0;
@@ -59,7 +59,7 @@ static void test_pipeline_runs_single_system_once(void) {
 
 static void test_pipeline_preserves_registration_order(void) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
     w->mask = 1;
 
     int counter = 0;
@@ -85,9 +85,9 @@ static void test_pipeline_preserves_registration_order(void) {
 
 static void test_pipeline_tick_id_synced_across_trees(void) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));
-    ecs_tree_init(&w->trees[3], sizeof(comp_t));
-    ecs_tree_init(&w->trees[7], sizeof(comp_t));
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
+    ecs_tree_init(&w->trees[3], sizeof(comp_t), 0);
+    ecs_tree_init(&w->trees[7], sizeof(comp_t), 0);
     w->mask = (1ULL << 0) | (1ULL << 3) | (1ULL << 7);
 
     ecs_pipeline_t p; ecs_pipeline_init(&p);

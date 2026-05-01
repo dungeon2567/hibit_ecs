@@ -38,6 +38,41 @@ static void BM_IntegrateDense100k(benchmark::State& state) {
 }
 BENCHMARK(BM_IntegrateDense100k)->Unit(benchmark::kMicrosecond);
 
+/* Block-API integrate. Same setup as BM_IntegrateDense but kernel uses
+   ecs_iterator_next_block to expose contiguous L1 base ptrs + mask. */
+static void BM_IntegrateDenseBlock(benchmark::State& state) {
+    bench_integrate_ctx* ctx = bench_integrate_setup(10000, 9500);
+    for (auto _ : state) {
+        bench_integrate_iter_block(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 9500);
+    bench_integrate_teardown(ctx);
+}
+BENCHMARK(BM_IntegrateDenseBlock)->Unit(benchmark::kMicrosecond);
+
+static void BM_IntegrateDenseBlock100k(benchmark::State& state) {
+    bench_integrate_ctx* ctx = bench_integrate_setup(100000, 95000);
+    for (auto _ : state) {
+        bench_integrate_iter_block(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 95000);
+    bench_integrate_teardown(ctx);
+}
+BENCHMARK(BM_IntegrateDenseBlock100k)->Unit(benchmark::kMicrosecond);
+
+static void BM_IntegrateSparseBlock(benchmark::State& state) {
+    bench_integrate_ctx* ctx = bench_integrate_setup(10000, 500);
+    for (auto _ : state) {
+        bench_integrate_iter_block(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 500);
+    bench_integrate_teardown(ctx);
+}
+BENCHMARK(BM_IntegrateSparseBlock)->Unit(benchmark::kMicrosecond);
+
 /* SOA baseline: same N as BM_IntegrateDense, no ECS — pure two-array vec3 loop.
    Lower bound for what the integrate kernel could ever cost. */
 static void BM_IntegrateDenseSOA(benchmark::State& state) {

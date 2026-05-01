@@ -80,7 +80,7 @@ static void test_changed_rollback_clears_on_dirty_walk(void) {
 
 static void test_changed_iter_set_propagates(void) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t));
+    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
     w->trees[0].name = "Pos";
     w->mask = 1;
 
