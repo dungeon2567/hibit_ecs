@@ -297,8 +297,12 @@ typedef struct ecs_iterator_t {
 
     const ecs_l3_t* l3[ECS_QUERY_MAX_TERMS];
     const ecs_l2_t* l2[ECS_QUERY_MAX_TERMS];
-    ecs_l1_t*       l1[ECS_QUERY_MAX_TERMS];
-    void*           l1_data[ECS_QUERY_MAX_TERMS];   /* inline data base = confirmed[0] */
+    /* Pointer arrays are const-after-block-load so the compiler can hoist
+       loads across ecs_iterator_set's memcpy (which writes through l1_data,
+       not to it). Pointees are still mutable — l1->changed |= bit works.
+       Updated via cast in iter_load_l1 / ecs_iterator_init only. */
+    ecs_l1_t* const l1[ECS_QUERY_MAX_TERMS];
+    void*     const l1_data[ECS_QUERY_MAX_TERMS];   /* inline data base = confirmed[0] */
     /* const so compiler can hoist size loads across iterator_set's writes
        through l1->dirty/changed (uint64 stores into l1, same type as size_t,
        would otherwise force reloads each call). Written once via cast in

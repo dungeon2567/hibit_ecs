@@ -120,8 +120,8 @@ static inline void iter_load_l1(ecs_iterator_t* it, uint32_t tree_count) {
            Issuing N prefetches here lets the misses fetch concurrently via
            LFBs instead of serializing. */
         ECS_PREFETCH(l1);
-        it->l1[i]      = l1;
-        it->l1_data[i] = (char*)l1 + sizeof(ecs_l1_t);
+        ((ecs_l1_t**)it->l1)[i]  = l1;                                /* fields const post-init */
+        ((void**)it->l1_data)[i] = (char*)l1 + sizeof(ecs_l1_t);
     }
 }
 
@@ -162,9 +162,9 @@ void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query) {
                "ecs_iterator_init: all query trees must share VM mode");
         it->l3[i]        = query->trees[i]->root;
         it->l2[i]        = &ecs_default_l2;
-        it->l1[i]        = &ecs_default_l1;
-        it->l1_data[i]   = NULL;
-        ((size_t*)it->data_size)[i] = query->trees[i]->data_size;  /* field is const after init */
+        ((ecs_l1_t**)it->l1)[i]  = &ecs_default_l1;                   /* fields const post-init */
+        ((void**)it->l1_data)[i] = NULL;
+        ((size_t*)it->data_size)[i] = query->trees[i]->data_size;     /* field is const after init */
     }
     it->l3_mask = iter_compute_l3_mask(query, it->l3);
 

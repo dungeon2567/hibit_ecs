@@ -27,6 +27,17 @@ static void BM_IntegrateDense(benchmark::State& state) {
 }
 BENCHMARK(BM_IntegrateDense)->Unit(benchmark::kMicrosecond);
 
+static void BM_IntegrateDense100k(benchmark::State& state) {
+    bench_integrate_ctx* ctx = bench_integrate_setup(100000, 95000);
+    for (auto _ : state) {
+        bench_integrate_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 95000);
+    bench_integrate_teardown(ctx);
+}
+BENCHMARK(BM_IntegrateDense100k)->Unit(benchmark::kMicrosecond);
+
 /* SOA baseline: same N as BM_IntegrateDense, no ECS — pure two-array vec3 loop.
    Lower bound for what the integrate kernel could ever cost. */
 static void BM_IntegrateDenseSOA(benchmark::State& state) {
@@ -39,6 +50,17 @@ static void BM_IntegrateDenseSOA(benchmark::State& state) {
     bench_integrate_soa_teardown(ctx);
 }
 BENCHMARK(BM_IntegrateDenseSOA)->Unit(benchmark::kMicrosecond);
+
+static void BM_IntegrateDenseSOA100k(benchmark::State& state) {
+    bench_integrate_soa_ctx* ctx = bench_integrate_soa_setup(95000);
+    for (auto _ : state) {
+        bench_integrate_soa_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 95000);
+    bench_integrate_soa_teardown(ctx);
+}
+BENCHMARK(BM_IntegrateDenseSOA100k)->Unit(benchmark::kMicrosecond);
 
 static void BM_RandomAccess10k(benchmark::State& state) {
     bench_random_access_ctx* ctx = bench_random_access_setup(100000, 10000);
