@@ -24,17 +24,19 @@
 #define BROADPHASE_NODE_CAP   8
 
 /* SoA so the per-axis min/max load lands in one fixed8 register and the
-   overlap test is six compares + five ANDs. __declspec(align(32)) keeps fixed8_load_aligned
-   legal on AVX2; on NEON/scalar the alignment is harmless. */
-typedef struct __declspec(align(32)) broadphase_node_t {
-    fixed_t min_x[BROADPHASE_NODE_CAP];
+   overlap test is six compares + five ANDs. _Alignas(32) on the first
+   field promotes whole-struct alignment to 32 bytes (C11 rule: struct
+   alignment >= max member alignment), keeping fixed8_load_aligned legal
+   on AVX2 across MSVC/clang/gcc; NEON and scalar are unaffected. */
+typedef struct broadphase_node_t {
+    _Alignas(32) fixed_t min_x[BROADPHASE_NODE_CAP];
     fixed_t max_x[BROADPHASE_NODE_CAP];
     fixed_t min_y[BROADPHASE_NODE_CAP];
     fixed_t max_y[BROADPHASE_NODE_CAP];
     fixed_t min_z[BROADPHASE_NODE_CAP];
     fixed_t max_z[BROADPHASE_NODE_CAP];
     uint32_t ids[BROADPHASE_NODE_CAP];
-    vec3_t positions[BROADPHASE_NODE_CAP];
+    transform_t transforms[BROADPHASE_NODE_CAP];
     uint8_t  presence_mask;            /* bit i set iff slot i occupied */
     struct broadphase_node_t* next;
 } broadphase_node_t;

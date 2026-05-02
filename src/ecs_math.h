@@ -280,3 +280,68 @@ static inline quat_t quat_nlerp(quat_t a, quat_t b, fixed_t t) {
                                              fixed4_set1(t)));
     return quat_normalize(r);
 }
+
+/* ============================================================
+   transform — TRS (translation, rotation, non-uniform scale)
+   ============================================================ */
+
+/* Apply order is scale -> rotate -> translate, matching the convention
+   `world = parent * local`. Non-uniform scale composes lossily under
+   rotation (introduces shear); transform_mul therefore stays in TRS form
+   only when child rotation is axis-aligned with parent scale -- callers
+   that need exact composition under arbitrary rotation should bake to a
+   matrix. For uniform scale the composition is exact. */
+typedef struct {
+    vec3_t position;
+    quat_t rotation;
+    vec3_t scale;       /* per-axis */
+} transform_t;
+
+static inline transform_t transform_identity(void) {
+    transform_t t = {
+        vec3_zero(),
+        quat_identity(),
+        vec3_make(FIXED_ONE, FIXED_ONE, FIXED_ONE),
+    };
+    return t;
+}
+
+static inline transform_t transform_make(vec3_t position, quat_t rotation, vec3_t scale) {
+    transform_t t = { position, rotation, scale };
+    return t;
+}
+
+/* World point from local point: p_w = R * (S ⊙ p_l) + T. */
+static inline vec3_t transform_point(transform_t t, vec3_t p) {
+    return vec3_add(t.position, quat_rotate_vec3(t.rotation, vec3_hadamard(t.scale, p)));
+}
+
+/* Direction transform: ignores translation, applies scale + rotation.
+   For a unit normal under non-uniform scale callers should renormalise. */
+static inline vec3_t transform_dir(transform_t t, vec3_t d) {
+    return quat_rotate_vec3(t.rotation, vec3_hadamard(t.scale, d));
+}
+
+/* Compose: out(v) = a(b(v)). Position is a's TRS applied to b.position. */
+static inline transform_t transform_mul(transform_t a, transform_t b) {
+    transform_t r;
+    r.scale    = vec3_hadamard(a.scale, b.scale);
+    r.rotation = quat_mul(a.rotation, b.rotation);
+    r.position = vec3_add(a.position,
+                          quat_rotate_vec3(a.rotation, vec3_hadamard(a.scale, b.position)));
+    return r;
+}
+
+/* Inverse, valid for any non-zero scale. Order: undo translation, undo
+   rotation, undo scale. Per-axis reciprocal of scale uses fixed_div, so
+   precision degrades for very small components. */
+static inline transform_t transform_inverse(transform_t t) {
+    vec3_t inv_scale = vec3_make(fixed_div(FIXED_ONE, t.scale.x),
+                                 fixed_div(FIXED_ONE, t.scale.y),
+                                 fixed_div(FIXED_ONE, t.scale.z));
+    quat_t inv_rot = quat_conjugate(t.rotation);
+    vec3_t inv_pos = vec3_hadamard(inv_scale,
+                                   quat_rotate_vec3(inv_rot, vec3_neg(t.position)));
+    transform_t r = { inv_pos, inv_rot, inv_scale };
+    return r;
+}
