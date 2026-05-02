@@ -1,4 +1,4 @@
-﻿#include "ecs.h"
+#include "ecs.h"
 #include "test_ecs.h"
 #include "test_fixed.h"
 #include "test_math.h"
@@ -8,7 +8,7 @@
 #include "test_pipeline.h"
 #include "test_modes.h"
 #include "test_owned.h"
-#include "test_list.h"
+#include "test_buffer.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -80,13 +80,13 @@ static void test_predict_rollback(void) {
     uint64_t crc1 = ecs_tree_crc64(&tree);
     CHECK(crc1 != crc0);
 
-    /* Switch to PREDICT — modifications are speculative. */
+    /* Switch to PREDICT â€” modifications are speculative. */
     ecs_tree_set_mode(&tree, ECS_MODE_PREDICT);
     *(Vec2*)ecs_tree_get_mut(&tree, 3) = (Vec2){ 5.f, 6.f };
     *(Vec2*)ecs_tree_get_mut(&tree, 7) = (Vec2){ 9.f, 9.f };
     ecs_tree_remove(&tree, 3);
 
-    /* CRC is view-aware — predicted writes shift it. */
+    /* CRC is view-aware â€” predicted writes shift it. */
     CHECK(ecs_tree_crc64(&tree) != crc1);
 
     ecs_tree_rollback(&tree);
@@ -168,7 +168,7 @@ int main(void) {
                | test_pipeline_all()
                | test_modes_all()
                | test_owned_all()
-               | test_list_all()
+               | test_buffer_all()
                | (failures ? 1 : 0);
 
     return result;

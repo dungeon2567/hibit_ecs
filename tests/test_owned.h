@@ -7,104 +7,100 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* LIST-component lifecycle tests. Verifies ecs_tree_set_list / ecs_tree_remove /
-   ecs_tree_rollback / ecs_tree_destroy correctly deep-copy ecs_list_t slots
-   and free their headers on destroy/discard, with no leaks or double-frees.
+/* BUFFER-component lifecycle tests. Verifies element-level ecs_tree_buffer_push/
+   pop/clear + ecs_tree_remove / ecs_tree_rollback / ecs_tree_destroy correctly
+   manage slot buffers across CONFIRMED + PREDICT modes with no leaks /
+   double-frees.
 
-   Engine semantics under test:
-     - ecs_tree_set_list → frees old slot's h then ecs_list_assign clones src.
-     - ecs_tree_remove           → ecs_free(slot->h) + clear presence (CONFIRMED).
-     - ecs_tree_remove           → ecs_free(predicted slot->h) iff (predicted_mask
-                                    & dirty) bit set (PREDICT mode owned-clone rule).
-     - ecs_tree_rollback         → frees every (predicted_mask & dirty) victim then
-                                    resets predicted to confirmed.
-     - ecs_tree_destroy          → frees every live confirmed slot's h, then frees
-                                    L1/L2/root nodes.
+   COW model under test:
+     - CONFIRMED push: mutates confirmed buffer in place. Survives across ticks
+                       (no free-on-tick).
+     - PREDICT first push on confirmed-alive slot: deep-copies confirmed bytes
+                       into predicted slot ONCE, then mutates predicted in place.
+                       Subsequent pushes/pops in same tick: zero copies.
+     - PREDICT first push on virgin slot: predicted slot allocs fresh buffer.
+     - PREDICT clear: drops predicted buffer (does not seed from confirmed).
+     - ecs_tree_remove (CONFIRMED) : ecs_free(slot->h) + clear presence.
+     - ecs_tree_remove (PREDICT)   : ecs_free(predicted slot->h) iff
+                                     (predicted_mask & dirty) bit set.
+     - ecs_tree_rollback           : frees every (predicted_mask & dirty) clone,
+                                     resets predicted = confirmed.
+     - ecs_tree_destroy            : frees every live confirmed slot's h.
 
-   Verification = read-back content + mask state at each step. Heap leak
-   detection relies on mimalloc's process-exit reporting (ECS_DEBUG_LEAKS or
-   MIMALLOC_VERBOSE) plus the structural assertions below — every test that
-   sets a slot must end in a state where remove/rollback/destroy has been
-   called for every live slot. */
+   Heap leak detection relies on mimalloc's process-exit reporting + the
+   structural assertions below Ã¢â‚¬â€ every test that touches a slot ends with
+   remove/rollback/destroy reaching every live buffer. */
 
-typedef struct {
-    int seed;
-    uint32_t cap;
-} list_recipe_t;
-
-/* Build an ecs_list_t holding `cap` ints filled (seed + i). Caller owns the
-   returned list (must ecs_list_destroy after passing into a tree — engine
-   deep-copies on assign). */
-static ecs_list_t make_int_list_(int seed, uint32_t cap) {
-    ecs_list_t l = {0};
-    for (uint32_t i = 0; i < cap; i++) {
-        int v = seed + (int)i;
-        ecs_list_push(&l, sizeof(int), &v);
-    }
-    return l;
-}
-
-static int list_int_at_(const ecs_list_t* l, uint32_t i) {
-    return *(const int*)ecs_list_at(*l, sizeof(int), i);
-}
-
-static int lists_equal_(const ecs_list_t* a, const ecs_list_t* b) {
-    uint32_t na = ecs_list_size(*a) / (uint32_t)sizeof(int);
-    uint32_t nb = ecs_list_size(*b) / (uint32_t)sizeof(int);
-    if (na != nb) return 0;
-    for (uint32_t i = 0; i < na; i++)
-        if (list_int_at_(a, i) != list_int_at_(b, i)) return 0;
-    return 1;
-}
-
-static ecs_tree_t* make_list_tree_(void) {
+static ecs_tree_t* make_buffer_tree_(void) {
     ecs_tree_t* t = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
-    ecs_tree_init(t, sizeof(ecs_list_t), ECS_TREE_FLAG_LIST);
+    ecs_tree_init(t, sizeof(ecs_buffer_t), ECS_TREE_FLAG_BUFFER);
     return t;
 }
 
-/* ---- 1. CONFIRMED-mode set on empty slot, content survives ---- */
-static void test_owned_confirmed_set_empty(void) {
-    ecs_tree_t* t = make_list_tree_();
+static void push_ints_(ecs_tree_t* t, int idx, int seed, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        int v = seed + (int)i;
+        ecs_tree_buffer_push(t, idx, sizeof(int), &v);
+    }
+}
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
+static uint32_t slot_count_(const ecs_tree_t* t, int idx) {
+    const ecs_buffer_t* slot = (const ecs_buffer_t*)ecs_tree_get(t, idx);
+    return ecs_buffer_size(*slot) / (uint32_t)sizeof(int);
+}
 
-    const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(lists_equal_(slot, &a), "tree slot deep-clones source list");
-    /* Mutating the local source must not affect the tree slot (deep-copy). */
-    int extra = 999; ecs_list_push(&a, sizeof(int), &extra);
-    EXPECT(ecs_list_size(*slot) != ecs_list_size(a), "tree slot independent of source");
+static int slot_at_(const ecs_tree_t* t, int idx, uint32_t i) {
+    const ecs_buffer_t* slot = (const ecs_buffer_t*)ecs_tree_get(t, idx);
+    return *(const int*)ecs_buffer_at(*slot, sizeof(int), i);
+}
 
-    ecs_list_destroy(&a);
+/* ---- 1. CONFIRMED-mode push grows confirmed buffer in place ---- */
+static void test_owned_confirmed_push(void) {
+    ecs_tree_t* t = make_buffer_tree_();
+
+    push_ints_(t, 0, 100, 4);
+    EXPECT(slot_count_(t, 0) == 4u, "slot has 4 elems");
+    EXPECT(slot_at_(t, 0, 0) == 100 && slot_at_(t, 0, 3) == 103, "elements 100..103");
+
+    /* CONFIRMED push survives across rollback (rollback only discards
+       predicted; confirmed buffer keeps its allocation). */
+    ecs_tree_rollback(t);
+    EXPECT(slot_count_(t, 0) == 4u, "confirmed buffer survives rollback");
+
+    /* Further pushes append to the same buffer (no churn). */
+    push_ints_(t, 0, 200, 2);
+    EXPECT(slot_count_(t, 0) == 6u, "confirmed buffer extended in place");
+    EXPECT(slot_at_(t, 0, 5) == 201, "tail = 201");
+
     free_tree(t);
 }
 
-/* ---- 2. CONFIRMED-mode overwrite — old slot freed before new assign ---- */
-static void test_owned_confirmed_overwrite(void) {
-    ecs_tree_t* t = make_list_tree_();
+/* ---- 2. CONFIRMED-mode clear zeroes size, keeps capacity ---- */
+static void test_owned_confirmed_clear(void) {
+    ecs_tree_t* t = make_buffer_tree_();
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);
+    const ecs_buffer_t* before = (const ecs_buffer_t*)ecs_tree_get(t, 0);
+    uint32_t cap_before = ecs_buffer_capacity(*before);
+    EXPECT(cap_before > 0u, "capacity allocated post-push");
 
-    ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set_list(t, 0, &b);
-    const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(lists_equal_(slot, &b), "overwritten slot reflects B");
-    EXPECT(ecs_list_size(*slot) == 8u * sizeof(int), "size matches B (old A header freed)");
-    ecs_list_destroy(&b);
+    ecs_tree_buffer_clear(t, 0);
+    EXPECT(slot_count_(t, 0) == 0u, "post-clear size 0");
+    const ecs_buffer_t* after = (const ecs_buffer_t*)ecs_tree_get(t, 0);
+    EXPECT(ecs_buffer_capacity(*after) == cap_before, "capacity preserved across clear");
+
+    /* Push again Ã¢â‚¬â€ should reuse the buffer (cap unchanged for small refills). */
+    push_ints_(t, 0, 999, 2);
+    EXPECT(slot_count_(t, 0) == 2u, "refill after clear");
 
     free_tree(t);
 }
 
 /* ---- 3. CONFIRMED-mode remove clears slot + frees header ---- */
 static void test_owned_confirmed_remove(void) {
-    ecs_tree_t* t = make_list_tree_();
+    ecs_tree_t* t = make_buffer_tree_();
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);
 
     int rc = ecs_tree_remove(t, 0);
     EXPECT(rc == 1, "remove returned 1");
@@ -115,16 +111,15 @@ static void test_owned_confirmed_remove(void) {
     free_tree(t);
 }
 
-/* ---- 4. PREDICT-mode set on empty + rollback discards predicted clone ---- */
-static void test_owned_predict_set_empty_rollback(void) {
-    ecs_tree_t* t = make_list_tree_();
+/* ---- 4. PREDICT-mode push on virgin slot + rollback discards clone ---- */
+static void test_owned_predict_push_empty_rollback(void) {
+    ecs_tree_t* t = make_buffer_tree_();
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);
     EXPECT(l1_of(t, 0, 0)->predicted_mask_any == 1ULL, "slot present in predicted");
     EXPECT(l1_of(t, 0, 0)->dirty             == 1ULL, "dirty bit set");
+    EXPECT(slot_count_(t, 0) == 4u, "pred slot has 4 elems");
 
     ecs_tree_rollback(t);
     EXPECT(l1_of(t, 0, 0) == &ecs_default_l1, "predicted-only slot reclaimed on rollback");
@@ -132,105 +127,89 @@ static void test_owned_predict_set_empty_rollback(void) {
     free_tree(t);
 }
 
-/* ---- 5. PREDICT-mode set on confirmed-alive + rollback ----
-   Confirmed slot must survive intact; predicted clone must be freed. */
-static void test_owned_predict_set_alive_rollback(void) {
-    ecs_tree_t* t = make_list_tree_();
+/* ---- 5. PREDICT-mode push extends confirmed (one COW) + rollback restores ----
+   First predict push deep-copies confirmed Ã¢â€ â€™ predicted (4 elems), then appends.
+   Rollback frees predicted clone, confirmed buffer survives intact. */
+static void test_owned_predict_push_alive_rollback(void) {
+    ecs_tree_t* t = make_buffer_tree_();
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);                              /* CONFIRMED: A at conf slot */
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);                                 /* CONFIRMED: A = [100..103] */
+    ecs_tree_rollback(t);                                     /* finalize confirmed tick */
 
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
-    ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set_list(t, 0, &b);                              /* PREDICT: B at pred slot */
-    ecs_list_destroy(&b);
+    push_ints_(t, 0, 200, 8);                                 /* PREDICT: COW + append B = [200..207] */
 
-    const ecs_list_t* visible_pre = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(ecs_list_size(*visible_pre) == 8u * sizeof(int), "pre-rollback visible = B");
+    EXPECT(slot_count_(t, 0) == 12u, "pred slot = A (4) + B (8)");
+    EXPECT(slot_at_(t, 0, 0)  == 100, "head still A[0]");
+    EXPECT(slot_at_(t, 0, 4)  == 200, "B starts at idx 4");
+    EXPECT(slot_at_(t, 0, 11) == 207, "B tail at idx 11");
 
     ecs_tree_rollback(t);
-    const ecs_list_t* visible_post = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(ecs_list_size(*visible_post) == 4u * sizeof(int), "post-rollback visible = A");
-    EXPECT(list_int_at_(visible_post, 0) == 100, "A content intact");
+    EXPECT(slot_count_(t, 0) == 4u, "post-rollback = confirmed (A only)");
+    EXPECT(slot_at_(t, 0, 0) == 100 && slot_at_(t, 0, 3) == 103,
+           "A content intact post-rollback");
 
     free_tree(t);
 }
 
-/* ---- 6. PREDICT-mode set then set again on same slot ----
-   First clone must be freed before second deep-copy. No leak, no double-free. */
-static void test_owned_predict_set_set(void) {
-    ecs_tree_t* t = make_list_tree_();
+/* ---- 6. PREDICT push then push: only one COW, no leak ---- */
+static void test_owned_predict_push_push(void) {
+    ecs_tree_t* t = make_buffer_tree_();
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);                                 /* virgin: alloc fresh pred buffer */
+    push_ints_(t, 0, 200, 8);                                 /* dirty=1: extend in place */
 
-    ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set_list(t, 0, &b);                              /* frees A clone, clones B */
-    ecs_list_destroy(&b);
+    EXPECT(slot_count_(t, 0) == 12u, "12 elems after two pushes");
+    EXPECT(slot_at_(t, 0, 4) == 200, "second push appended");
 
-    const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(ecs_list_size(*slot) == 8u * sizeof(int), "slot reflects B");
-    EXPECT(list_int_at_(slot, 0) == 200, "B content");
-
-    ecs_tree_rollback(t);                                /* frees B clone */
+    ecs_tree_rollback(t);                                     /* frees predicted clone */
     free_tree(t);
 }
 
-/* ---- 7. PREDICT-mode set then predict-remove + rollback ----
+/* ---- 7. PREDICT push then predict-remove + rollback ----
    Predicted clone freed inline at remove. Rollback must NOT double-free. */
-static void test_owned_predict_set_remove(void) {
-    ecs_tree_t* t = make_list_tree_();
+static void test_owned_predict_push_remove(void) {
+    ecs_tree_t* t = make_buffer_tree_();
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);
 
     int rc = ecs_tree_remove(t, 0);
     EXPECT(rc == 1, "predict-remove returned 1");
 
     ecs_tree_rollback(t);
-    /* Predicted-only add removed → slot reclaimed. */
-    EXPECT(l1_of(t, 0, 0) == &ecs_default_l1, "L1 reclaimed (predicted-only set+remove)");
+    EXPECT(l1_of(t, 0, 0) == &ecs_default_l1, "L1 reclaimed (predicted-only push+remove)");
 
     free_tree(t);
 }
 
-/* ---- 8. PREDICT-mode set, predict-remove, predict-set again ----
-   Both clones must be freed exactly once. */
-static void test_owned_predict_set_remove_set(void) {
-    ecs_tree_t* t = make_list_tree_();
+/* ---- 8. PREDICT push, predict-remove, predict-push again ----
+   Both clones freed exactly once. */
+static void test_owned_predict_push_remove_push(void) {
+    ecs_tree_t* t = make_buffer_tree_();
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);                                 /* alloc clone A */
+    ecs_tree_remove(t, 0);                                    /* frees clone A inline */
 
-    ecs_tree_remove(t, 0);                               /* frees A clone inline */
+    push_ints_(t, 0, 200, 8);                                 /* fresh clone B */
 
-    ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set_list(t, 0, &b);                              /* fresh predict-set, no double-destroy */
-    ecs_list_destroy(&b);
+    EXPECT(slot_count_(t, 0) == 8u, "slot now B (8 elems)");
+    EXPECT(slot_at_(t, 0, 0) == 200, "B content");
 
-    const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(ecs_list_size(*slot) == 8u * sizeof(int), "slot now B");
-
-    ecs_tree_rollback(t);                                /* frees B clone */
+    ecs_tree_rollback(t);                                     /* frees clone B */
     free_tree(t);
 }
 
-/* ---- 9. PREDICT-mode predict-remove on confirmed-alive (no prior predict-set) + rollback ----
-   No inline free (predicted slot bytes were stale POD), no rollback free.
-   Slot resurrects with confirmed clone intact. */
+/* ---- 9. PREDICT-mode predict-remove on confirmed-alive (no prior predict-push) + rollback ----
+   No inline free (predicted slot bytes were stale POD post-remove), no rollback free.
+   Slot resurrects with confirmed buffer intact. */
 static void test_owned_predict_remove_confirmed_rollback(void) {
-    ecs_tree_t* t = make_list_tree_();
+    ecs_tree_t* t = make_buffer_tree_();
 
-    ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set_list(t, 0, &a);                              /* CONFIRMED: A at conf slot */
-    ecs_list_destroy(&a);
+    push_ints_(t, 0, 100, 4);                                 /* CONFIRMED: A at conf slot */
+    ecs_tree_rollback(t);
 
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
     int rc = ecs_tree_remove(t, 0);
@@ -238,23 +217,44 @@ static void test_owned_predict_remove_confirmed_rollback(void) {
 
     ecs_tree_rollback(t);
     EXPECT(l1_of(t, 0, 0)->predicted_mask_any == 1ULL, "slot resurrected after rollback");
-    const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
-    EXPECT(ecs_list_size(*slot) == 4u * sizeof(int) && list_int_at_(slot, 0) == 100,
+    EXPECT(slot_count_(t, 0) == 4u && slot_at_(t, 0, 0) == 100,
            "A content intact after predict-remove + rollback");
 
     free_tree(t);
 }
 
-/* ---- 10. tree_destroy walks live confirmed slots and frees headers ---- */
+/* ---- 10. PREDICT-mode clear drops predicted buffer (no COW) + rollback restores ----
+   Clear in PREDICT first-touch must NOT seed from confirmed. Rollback restores
+   confirmed view intact. */
+static void test_owned_predict_clear_alive_rollback(void) {
+    ecs_tree_t* t = make_buffer_tree_();
+
+    push_ints_(t, 0, 100, 4);                                 /* CONFIRMED A */
+    ecs_tree_rollback(t);
+
+    ecs_tree_set_mode(t, ECS_MODE_PREDICT);
+    ecs_tree_buffer_clear(t, 0);                                /* pred->h = NULL */
+    EXPECT(slot_count_(t, 0) == 0u, "pred view empty post-clear");
+
+    push_ints_(t, 0, 999, 2);                                 /* push on cleared pred */
+    EXPECT(slot_count_(t, 0) == 2u, "post-clear push starts fresh");
+    EXPECT(slot_at_(t, 0, 0) == 999, "fresh content (no A inheritance)");
+
+    ecs_tree_rollback(t);
+    EXPECT(slot_count_(t, 0) == 4u, "post-rollback = confirmed A");
+    EXPECT(slot_at_(t, 0, 0) == 100, "A content restored");
+
+    free_tree(t);
+}
+
+/* ---- 11. tree_destroy walks live confirmed slots and frees headers ---- */
 static void test_owned_destroy_walk(void) {
-    ecs_tree_t* t = make_list_tree_();
+    ecs_tree_t* t = make_buffer_tree_();
 
-    ecs_list_t a = make_int_list_(100, 4); ecs_tree_set_list(t, 0, &a);    ecs_list_destroy(&a);
-    ecs_list_t b = make_int_list_(200, 4); ecs_tree_set_list(t, 1, &b);    ecs_list_destroy(&b);
-    ecs_list_t c = make_int_list_(300, 4); ecs_tree_set_list(t, 4096, &c); ecs_list_destroy(&c);  /* L2 != 0 */
+    push_ints_(t, 0,    100, 4);
+    push_ints_(t, 1,    200, 4);
+    push_ints_(t, 4096, 300, 4);                              /* L2 != 0 */
 
-    /* Implicit verification: free_tree → ecs_tree_destroy frees A_h, B_h, C_h.
-       Leak detection via mimalloc process-exit; functional check below. */
     EXPECT(l1_of(t, 0, 0)->predicted_mask_any & 0x3, "slots 0+1 in same L1");
     EXPECT(l1_of(t, 1, 0)->predicted_mask_any & 0x1, "slot 4096 in (l3=1, l2=0)");
     free_tree(t);
@@ -262,18 +262,19 @@ static void test_owned_destroy_walk(void) {
 
 static int test_owned_all(void) {
     setvbuf(stdout, NULL, _IOFBF, 65536);
-    printf("=== LIST-component lifecycle tests ===\n\n");
+    printf("=== BUFFER-component lifecycle tests ===\n\n");
 
     int before = g_failed;
-    test_owned_confirmed_set_empty();
-    test_owned_confirmed_overwrite();
+    test_owned_confirmed_push();
+    test_owned_confirmed_clear();
     test_owned_confirmed_remove();
-    test_owned_predict_set_empty_rollback();
-    test_owned_predict_set_alive_rollback();
-    test_owned_predict_set_set();
-    test_owned_predict_set_remove();
-    test_owned_predict_set_remove_set();
+    test_owned_predict_push_empty_rollback();
+    test_owned_predict_push_alive_rollback();
+    test_owned_predict_push_push();
+    test_owned_predict_push_remove();
+    test_owned_predict_push_remove_push();
     test_owned_predict_remove_confirmed_rollback();
+    test_owned_predict_clear_alive_rollback();
     test_owned_destroy_walk();
 
     int local_failed = g_failed - before;

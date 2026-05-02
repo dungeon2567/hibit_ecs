@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <stdint.h>
 #include <stdio.h>
@@ -52,85 +52,85 @@ static inline void* ecs_xrealloc_aligned(void* p, size_t size, size_t align) {
 }
 
 /* ==========================================================================
-   ecs_list_t -- typed dynamic array. Wraps a single `ecs_list_header_t*`
+   ecs_buffer_t -- typed dynamic array. Wraps a single `ecs_buffer_header_t*`
    that owns size + capacity + flexible-array data in one allocation. Both
    `size` and `capacity` are byte counts (NOT element counts) -- the list is
    element-size-agnostic at the storage level. Caller passes elem_size to
    every op that needs to address elements; the same value must be used for
-   every call on a given list (no runtime check). Wrapper makes
-   `ecs_list_t l = {0};` a valid empty list (h == NULL) and keeps the public
-   type stable as a value type. Mutating ops take `ecs_list_t*` because
+   every call on a given buffer (no runtime check). Wrapper makes
+   `ecs_buffer_t l = {0};` a valid empty buffer (h == NULL) and keeps the public
+   type stable as a value type. Mutating ops take `ecs_buffer_t*` because
    growth may reallocate the header.
-   Growth: 1.5Ã— from base 8 bytes. push memcpy's the value (or leaves the
+   Growth: 1.5Ãƒâ€” from base 8 bytes. push memcpy's the value (or leaves the
    slot uninitialized when value == NULL, returning the slot ptr).
 
    Usage:
-       ecs_list_t xs = {0};
-       ecs_list_push(&xs, sizeof(int), &(int){42});
-       int* p = (int*)ecs_list_at(xs, sizeof(int), 0);
-       ecs_list_destroy(&xs);
+       ecs_buffer_t xs = {0};
+       ecs_buffer_push(&xs, sizeof(int), &(int){42});
+       int* p = (int*)ecs_buffer_at(xs, sizeof(int), 0);
+       ecs_buffer_destroy(&xs);
    ========================================================================== */
 /* _Alignas(8) on size forces 8-byte alignment on the whole struct, which
    guarantees the FAM `data` (sitting at offset 8) is also 8-byte aligned --
    safe for any element up to 8-byte natural alignment without padding. */
-typedef struct ecs_list_header_t {
+typedef struct ecs_buffer_header_t {
     _Alignas(8) uint32_t size;              /* bytes used */
     uint32_t capacity;                      /* bytes allocated for data */
     char     data[];                        /* flexible array -- element bytes inline */
-} ecs_list_header_t;
+} ecs_buffer_header_t;
 
-typedef struct ecs_list_t {
-    ecs_list_header_t* h;                   /* NULL = empty */
-} ecs_list_t;
+typedef struct ecs_buffer_t {
+    ecs_buffer_header_t* h;                   /* NULL = empty */
+} ecs_buffer_t;
 
-static inline uint32_t ecs_list_size    (ecs_list_t l) { return l.h ? l.h->size     : 0u; }
-static inline uint32_t ecs_list_capacity(ecs_list_t l) { return l.h ? l.h->capacity : 0u; }
+static inline uint32_t ecs_buffer_size    (ecs_buffer_t l) { return l.h ? l.h->size     : 0u; }
+static inline uint32_t ecs_buffer_capacity(ecs_buffer_t l) { return l.h ? l.h->capacity : 0u; }
 
-static inline void ecs_list_destroy(ecs_list_t* l) {
+static inline void ecs_buffer_destroy(ecs_buffer_t* l) {
     assert(l);
     if (l->h) ecs_free(l->h);
     l->h = NULL;
 }
 
 /* Reserve at least min_cap_bytes of data capacity. */
-static inline void ecs_list_reserve(ecs_list_t* l, uint32_t min_cap_bytes) {
+static inline void ecs_buffer_reserve(ecs_buffer_t* l, uint32_t min_cap_bytes) {
     assert(l);
     uint32_t cap = l->h ? l->h->capacity : 0u;
     if (min_cap_bytes <= cap) return;
     uint32_t newcap = cap ? cap : 8u;
-    while (newcap < min_cap_bytes) newcap = newcap + (newcap >> 1) + 1u;  /* 1.5Ã— */
-    ecs_list_header_t* nh = (ecs_list_header_t*)ecs_xrealloc_aligned(
-        l->h, sizeof(ecs_list_header_t) + (size_t)newcap, 8);
+    while (newcap < min_cap_bytes) newcap = newcap + (newcap >> 1) + 1u;  /* 1.5Ãƒâ€” */
+    ecs_buffer_header_t* nh = (ecs_buffer_header_t*)ecs_xrealloc_aligned(
+        l->h, sizeof(ecs_buffer_header_t) + (size_t)newcap, 8);
     if (!l->h) nh->size = 0u;               /* fresh alloc -- size was uninitialized */
     nh->capacity = newcap;
     l->h = nh;
 }
 
-static inline void ecs_list_clear(ecs_list_t l) { if (l.h) l.h->size = 0u; }
+static inline void ecs_buffer_clear(ecs_buffer_t l) { if (l.h) l.h->size = 0u; }
 
-static inline void* ecs_list_at(ecs_list_t l, size_t elem_size, uint32_t i) {
+static inline void* ecs_buffer_at(ecs_buffer_t l, size_t elem_size, uint32_t i) {
     assert(l.h && elem_size && (size_t)i * elem_size < l.h->size);
     return (char*)l.h->data + (size_t)i * elem_size;
 }
 
-static inline void* ecs_list_push(ecs_list_t* l, size_t elem_size, const void* value) {
+static inline void* ecs_buffer_push(ecs_buffer_t* l, size_t elem_size, const void* value) {
     assert(l && elem_size);
     uint32_t cur_size = l->h ? l->h->size : 0u;
     uint32_t need     = cur_size + (uint32_t)elem_size;
-    if (!l->h || need > l->h->capacity) ecs_list_reserve(l, need);
+    if (!l->h || need > l->h->capacity) ecs_buffer_reserve(l, need);
     void* dst = (char*)l->h->data + cur_size;
     if (value) memcpy(dst, value, elem_size);
     l->h->size = need;
     return dst;
 }
 
-static inline void ecs_list_pop(ecs_list_t l, size_t elem_size) {
+static inline void ecs_buffer_pop(ecs_buffer_t l, size_t elem_size) {
     assert(l.h && elem_size && l.h->size >= elem_size);
     l.h->size -= (uint32_t)elem_size;
 }
 
 /* O(1) unordered remove: copy last element over slot i, shrink size. */
-static inline void ecs_list_swap_remove(ecs_list_t l, size_t elem_size, uint32_t i) {
+static inline void ecs_buffer_swap_remove(ecs_buffer_t l, size_t elem_size, uint32_t i) {
     assert(l.h && elem_size);
     uint32_t off = (uint32_t)((size_t)i * elem_size);
     assert(off < l.h->size);
@@ -140,7 +140,7 @@ static inline void ecs_list_swap_remove(ecs_list_t l, size_t elem_size, uint32_t
 }
 
 /* ==========================================================================
-   Predict-mode ECS — two buffers per L1 (confirmed + predicted), no undo log.
+   Predict-mode ECS â€” two buffers per L1 (confirmed + predicted), no undo log.
 
      confirmed_mask_any  = authoritative presence (advances only via CONFIRMED writes)
      predicted_mask_any  = live working-set this frame (predicted is ALWAYS speculative)
@@ -221,17 +221,18 @@ typedef void (*ecs_deserialize_batch_fn)(void* l1_data,
                                          ecs_deserializer_t* d);
 
 /* Tree flags. Encodes component kind + future bools.
-   Component lifecycle is fully determined by the LIST flag — no user-supplied
-   destroy hook. POD = trivial copy + no destroy. LIST = ecs_list_assign deep-
-   copy + ecs_free(slot->h) destroy. Components requiring per-element teardown
-   beyond list-header free are not supported; model heap as ecs_list_t and
-   keep elements POD.
+   Component lifecycle is fully determined by the BUFFER flag â€” no user-supplied
+   destroy hook. POD = trivial copy + no destroy. LIST = element-level mutation
+   via ecs_tree_buffer_push/pop/clear + ecs_free(slot->h) destroy.
 
-   ECS_TREE_FLAG_LIST: slot type is ecs_list_t. ecs_tree_set_list deep-copies
-                       via ecs_list_assign; tree_remove / rollback /
+   ECS_TREE_FLAG_BUFFER: slot type is ecs_buffer_t. Mutation goes through
+                       ecs_tree_buffer_push/pop/clear (or iterator mirrors).
+                       PREDICT mode COWs confirmedâ†’predicted on first dirty
+                       this tick (single deep-copy), then mutates the
+                       predicted buffer in place. tree_remove / rollback /
                        tree_destroy free slot->h. ecs_tree_get_mut and
                        ecs_iterator_get_mut assert this flag clear (POD-only). */
-#define ECS_TREE_FLAG_LIST (1u << 0)
+#define ECS_TREE_FLAG_BUFFER (1u << 0)
 
 typedef struct ecs_tree_t {
     const char* name;          /* may be NULL */
@@ -241,7 +242,7 @@ typedef struct ecs_tree_t {
     uint64_t    tick_id_at_begin;  /* world->tick_id snapshot at last ecs_tree_begin_tick;
                                       iterator asserts equality when query has changed-clause */
     ecs_l3_t*   root;
-    ecs_mode_t  mode;          /* CONFIRMED or PREDICT — set via ecs_world_set_mode */
+    ecs_mode_t  mode;          /* CONFIRMED or PREDICT â€” set via ecs_world_set_mode */
     uint32_t    flags;         /* ECS_TREE_FLAG_* bitset */
     ecs_serialize_batch_fn   serialize_batch;             /* set by ecs_tree_init to raw default */
     ecs_deserialize_batch_fn deserialize_batch;           /* set by ecs_tree_init to raw default */
@@ -293,7 +294,7 @@ typedef struct ecs_iterator_t {
     const ecs_l2_t* l2[ECS_QUERY_MAX_TERMS];
     /* Pointer arrays are const-after-block-load so the compiler can hoist
        loads across ecs_iterator_get_mut's memcpy (which writes through l1_data,
-       not to it). Pointees are still mutable — l1->changed |= bit works.
+       not to it). Pointees are still mutable â€” l1->changed |= bit works.
        Updated via cast in iter_load_l1 / ecs_iterator_init only. */
     ecs_l1_t* const l1[ECS_QUERY_MAX_TERMS];
     void*     const l1_data[ECS_QUERY_MAX_TERMS];   /* inline data base = confirmed[0] */
@@ -328,7 +329,7 @@ void                  ecs_world_begin_tick(ecs_world_t* world);
 void     ecs_crc64_init(void);
 
 /* ==========================================================================
-   Pipeline — ordered list of systems run once per tick. Single-threaded.
+   Pipeline â€” ordered list of systems run once per tick. Single-threaded.
    Mode-agnostic: same pipeline runs in CONFIRMED and PREDICT ticks; the
    world's current mode dictates write semantics. Caller drives promote /
    rollback around ecs_pipeline_run.
@@ -487,25 +488,37 @@ void     ecs_world_destroy(ecs_world_t* world);
 
 /* Get mutable pointer to slot, marking it as written-this-frame. Acquires
    L2/L1 if absent. Sets predicted/confirmed/dirty/changed masks
-   unconditionally — caller asserts the slot is changing (no eq-check).
+   unconditionally â€” caller asserts the slot is changing (no eq-check).
    Caller writes through the returned pointer.
 
    POD trees: returns ptr to writable slot (predicted slot in PREDICT mode,
    confirmed slot in CONFIRMED mode).
    Tag trees (data_size == 0): returns NULL but masks are still updated.
-   LIST trees: must use ecs_tree_set_list (asserts).
+   BUFFER trees: must use ecs_tree_buffer_push/pop/clear (asserts).
 
-   Caller should only call when value is actually changing — calling on an
+   Caller should only call when value is actually changing â€” calling on an
    unchanged slot will spuriously promote dirty/changed bits, defeating
    prediction-mode rollback semantics. */
 void*    ecs_tree_get_mut(ecs_tree_t* tree, int index);
 
-/* LIST tree write. Frees victim slot's list header if live, then deep-copies
-   src via ecs_list_assign. Asserts ECS_TREE_FLAG_LIST. */
-void     ecs_tree_set_list(ecs_tree_t* tree, int index, const ecs_list_t* src);
+/* BUFFER tree element-level mutation. PREDICT mode COWs confirmedâ†’predicted on
+   first dirty bit this tick (one deep-copy of confirmed bytes), then mutates
+   the predicted slot's buffer in place. CONFIRMED mode mutates the confirmed
+   buffer directly; the buffer survives across ticks (realloc on grow only).
+   All assert ECS_TREE_FLAG_BUFFER + tree->data_size == sizeof(ecs_buffer_t).
 
-/* Remove a slot. For LIST trees frees the live slot's heap (ecs_free on its
-   list header) before clearing presence. In CONFIRMED mode that's the
+   ecs_tree_buffer_push  : append elem_size bytes pointed by value to slot's buffer.
+                         Allocates the slot's buffer header on first push.
+   ecs_tree_buffer_pop   : drop the last elem_size-sized element. Asserts non-empty.
+   ecs_tree_buffer_clear : zero the slot's buffer size (keeps capacity in CONFIRMED;
+                         drops the predicted buffer entirely on PREDICT first
+                         touch so the next push starts fresh). */
+void     ecs_tree_buffer_push (ecs_tree_t* tree, int index, size_t elem_size, const void* value);
+void     ecs_tree_buffer_pop  (ecs_tree_t* tree, int index, size_t elem_size);
+void     ecs_tree_buffer_clear(ecs_tree_t* tree, int index);
+
+/* Remove a slot. For BUFFER trees frees the live slot's heap (ecs_free on its
+   buffer header) before clearing presence. In CONFIRMED mode that's the
    confirmed slot; in PREDICT mode the predicted clone iff (predicted_mask &
    dirty) bit is set (i.e. a live predict-set this cycle). Plain predict-
    remove on a confirmed-only slot leaves predicted bytes as stale-POD, no
@@ -519,27 +532,10 @@ int      ecs_iterator_next_slow(ecs_iterator_t* it);
    CONFIRMED mode, is the live speculative set in PREDICT). Per-slot bytes:
    predicted bytes when dirty bit set, else confirmed bytes. Tick excluded
    so a confirmed-tick-N state and a predict-on-tick-M state with identical
-   alive masks + view bytes hash equal — enabling determinism checks between
+   alive masks + view bytes hash equal â€” enabling determinism checks between
    predicted simulation and confirmed replay. */
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
-
-/* ecs_list_t deep-copy. Caller MUST ensure dst is empty (dst->h == NULL or
-   dst->h freed already). Used by ecs_tree_set_list. */
-static inline void ecs_list_assign(ecs_list_t* dst, const ecs_list_t* src) {
-    assert(dst);
-    if (src && src->h && src->h->size > 0u) {
-        uint32_t cap = src->h->capacity;
-        ecs_list_header_t* nh = (ecs_list_header_t*)ecs_xmalloc_aligned(
-            sizeof(ecs_list_header_t) + (size_t)cap, 8);
-        nh->size     = src->h->size;
-        nh->capacity = cap;
-        memcpy(nh->data, src->h->data, src->h->size);
-        dst->h = nh;
-    } else {
-        dst->h = NULL;
-    }
-}
 
 #ifdef __cplusplus
 }
@@ -560,9 +556,9 @@ static inline void* ecs_l1_predicted(const ecs_l1_t* n, int i, size_t data_size)
 
 static inline void ecs_tree_init(ecs_tree_t* tree, size_t data_size, uint32_t flags) {
     assert(tree);
-    /* LIST trees must use sizeof(ecs_list_t) — engine reinterprets slot bytes
-       as an ecs_list_t for assign/destroy. */
-    assert(!(flags & ECS_TREE_FLAG_LIST) || data_size == sizeof(ecs_list_t));
+    /* BUFFER trees must use sizeof(ecs_buffer_t) â€” engine reinterprets slot bytes
+       as an ecs_buffer_t for assign/destroy. */
+    assert(!(flags & ECS_TREE_FLAG_BUFFER) || data_size == sizeof(ecs_buffer_t));
     tree->name             = NULL;
     tree->data_size        = data_size;
     tree->data_mask        = (uint64_t)-(int64_t)(data_size != 0);
@@ -612,10 +608,10 @@ static inline ecs_l1_t* ecs_l1_acquire(ecs_tree_t* tree) {
     node->predicted_mask_any = 0;
     node->dirty              = 0;
     node->changed            = 0;
-    /* Zero the data tail so LIST slots start with NULL header pointers.
+    /* Zero the data tail so BUFFER slots start with NULL header pointers.
        POD trees don't depend on initial bytes (mask gates access), but the
-       cost is a single memset at acquire which is rare. Keeps the LIST path
-       branch-free in tree_set / rollback (always a valid ecs_list_t header). */
+       cost is a single memset at acquire which is rare. Keeps the BUFFER path
+       branch-free in tree_set / rollback (always a valid ecs_buffer_t header). */
     if (data_size) memset((char*)node + sizeof(ecs_l1_t), 0, 128 * data_size);
     return node;
 }
@@ -703,7 +699,7 @@ static inline int ecs_tree_no_dirty(const ecs_tree_t* tree) {
 
 /* Fast path: pop next entity from current L1 block. Returns slot idx (0..63)
    on success, -1 when iteration done. Caller passes returned slot into get/
-   set/remove — exposes ILP by letting hot loops hold multiple in-flight slots
+   set/remove â€” exposes ILP by letting hot loops hold multiple in-flight slots
    simultaneously (no aliasing through iterator state). Slow path (L1 exhausted
    -> advance L2/L3 + dirty propagation) lives in ecs.c. */
 static inline int ecs_iterator_next(ecs_iterator_t* it) {
@@ -732,7 +728,7 @@ static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx
    the returned ptr; engine assumes bytes are changing (no eq-check). Sets
    l1->changed bit eagerly; dirty / predicted_mask_any / confirmed_mask_any
    get derived from changed at the L1 block boundary in
-   ecs_iterator_next_slow. POD only — LIST/tag use the tree-level API.
+   ecs_iterator_next_slow. POD only â€” BUFFER/tag use the tree-level API.
 
    Caller should only call when the value is actually changing (calling on
    an unchanged slot spuriously promotes dirty/changed bits, breaking
@@ -741,8 +737,8 @@ static inline void* ecs_iterator_get_mut(ecs_iterator_t* it, uint32_t tree_idx, 
     assert(it);
     assert(tree_idx < it->query->tree_count);
     assert(slot >= 0 && slot < 64);
-    assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_LIST) &&
-           "ecs_iterator_get_mut: LIST components not supported on iterator path");
+    assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_BUFFER) &&
+           "ecs_iterator_get_mut: BUFFER components not supported on iterator path");
 
     ecs_l1_t* l1   = it->l1[tree_idx];
     size_t    ds   = it->data_size[tree_idx];
@@ -758,22 +754,22 @@ static inline void* ecs_iterator_get_mut(ecs_iterator_t* it, uint32_t tree_idx, 
 /* Iterator-side remove. Mode-dispatched like ecs_iterator_get_mut:
      PREDICT   -> clear predicted_mask, set dirty (rolled back on rollback).
      CONFIRMED -> clear both confirmed_mask and predicted_mask in lockstep.
-   Eager mask propagation up to L2/L3 — does not piggyback the deferred flush
+   Eager mask propagation up to L2/L3 â€” does not piggyback the deferred flush
    in ecs_iterator_next_slow because that flush is OR-only and would re-add
    the cleared bit. Clears the slot's bit in l1->changed for the same reason
    (so a same-block iterator_set followed by iterator_remove on this slot
    leaves predicted_mask clear after the next L1 boundary). Trade-off: the
    removed slot does NOT register in changed-clauses for this tree (the slot
    wouldn't iterate post-remove anyway since predicted_mask_any cleared).
-   POD-only; LIST trees must use ecs_tree_remove. Empty L1/L2 nodes are NOT
-   released here — done by ecs_tree_rollback / ecs_tree_destroy.
+   POD-only; BUFFER trees must use ecs_tree_remove. Empty L1/L2 nodes are NOT
+   released here â€” done by ecs_tree_rollback / ecs_tree_destroy.
    Returns 1 if a slot was present and removed, 0 otherwise. */
 static inline int ecs_iterator_remove(ecs_iterator_t* it, uint32_t tree_idx, int slot) {
     assert(it);
     assert(tree_idx < it->query->tree_count);
     assert(slot >= 0 && slot < 64);
-    assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_LIST) &&
-           "ecs_iterator_remove: LIST components not supported on iterator path; use ecs_tree_remove");
+    assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_BUFFER) &&
+           "ecs_iterator_remove: BUFFER components not supported on iterator path; use ecs_tree_remove");
 
     ecs_l1_t* l1   = it->l1[tree_idx];
     uint64_t  bit1 = 1ULL << slot;
@@ -822,4 +818,128 @@ static inline int ecs_iterator_remove(ecs_iterator_t* it, uint32_t tree_idx, int
     l3->confirmed_mask_any &= ~(conf_bit3 & l2_empty);
 
     return (int)was_present;
+}
+
+/* ==========================================================================
+   LIST iterator-side push/pop/clear. PREDICT mode COWs confirmedâ†’predicted
+   on first dirty bit this tick (one deep-copy), then mutates in place.
+   CONFIRMED mode mutates the confirmed buffer directly.
+
+   Mask propagation: l1->changed and l1->dirty are set inline (dirty drives
+   the COW guard). predicted_mask_any/confirmed_mask_any propagation uses the
+   same deferred flush that iterator_get_mut relies on (ecs_iterator_next_slow
+   ORs l1->changed into them at the L1 boundary). Iterator only visits slots
+   already in predicted_mask_any, so re-OR'ing is a no-op for these ops.
+
+   Caller must set it->write_mask to cover this tree before the iteration.
+   Returned writes go through the slot's ecs_buffer_t header. POD-only ops like
+   ecs_iterator_get_mut still assert non-BUFFER. */
+static inline void ecs_iterator_buffer_push(ecs_iterator_t* it, uint32_t tree_idx,
+                                          int slot, size_t elem_size, const void* value) {
+    assert(it && elem_size && value);
+    assert(tree_idx < it->query->tree_count);
+    assert(slot >= 0 && slot < 64);
+    assert((it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_BUFFER) &&
+           "ecs_iterator_buffer_push: tree must be BUFFER-flagged");
+
+    ecs_l1_t* l1   = it->l1[tree_idx];
+    char*     base = (char*)it->l1_data[tree_idx];
+    uint64_t  bit  = 1ULL << slot;
+    uint64_t  m    = (uint64_t)it->mode;
+
+    ecs_buffer_t* live;
+    if (m == 1) {
+        ecs_buffer_t* pred = (ecs_buffer_t*)(base + (size_t)(slot + 64) * sizeof(ecs_buffer_t));
+        if (!(l1->dirty & bit)) {
+            ecs_buffer_t* conf = (ecs_buffer_t*)(base + (size_t)slot * sizeof(ecs_buffer_t));
+            pred->h = NULL;
+            if ((l1->confirmed_mask_any & bit) && conf->h && conf->h->size > 0u) {
+                uint32_t cap = conf->h->capacity;
+                ecs_buffer_header_t* nh = (ecs_buffer_header_t*)ecs_xmalloc_aligned(
+                    sizeof(ecs_buffer_header_t) + (size_t)cap, 8);
+                nh->size     = conf->h->size;
+                nh->capacity = cap;
+                memcpy(nh->data, conf->h->data, conf->h->size);
+                pred->h = nh;
+            }
+        }
+        live = pred;
+    } else {
+        live = (ecs_buffer_t*)(base + (size_t)slot * sizeof(ecs_buffer_t));
+    }
+
+    l1->changed |= bit;
+    l1->dirty   |= bit * m;
+
+    ecs_buffer_push(live, elem_size, value);
+}
+
+static inline void ecs_iterator_buffer_pop(ecs_iterator_t* it, uint32_t tree_idx,
+                                         int slot, size_t elem_size) {
+    assert(it && elem_size);
+    assert(tree_idx < it->query->tree_count);
+    assert(slot >= 0 && slot < 64);
+    assert((it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_BUFFER) &&
+           "ecs_iterator_buffer_pop: tree must be BUFFER-flagged");
+
+    ecs_l1_t* l1   = it->l1[tree_idx];
+    char*     base = (char*)it->l1_data[tree_idx];
+    uint64_t  bit  = 1ULL << slot;
+    uint64_t  m    = (uint64_t)it->mode;
+
+    ecs_buffer_t* live;
+    if (m == 1) {
+        ecs_buffer_t* pred = (ecs_buffer_t*)(base + (size_t)(slot + 64) * sizeof(ecs_buffer_t));
+        if (!(l1->dirty & bit)) {
+            ecs_buffer_t* conf = (ecs_buffer_t*)(base + (size_t)slot * sizeof(ecs_buffer_t));
+            pred->h = NULL;
+            if ((l1->confirmed_mask_any & bit) && conf->h && conf->h->size > 0u) {
+                uint32_t cap = conf->h->capacity;
+                ecs_buffer_header_t* nh = (ecs_buffer_header_t*)ecs_xmalloc_aligned(
+                    sizeof(ecs_buffer_header_t) + (size_t)cap, 8);
+                nh->size     = conf->h->size;
+                nh->capacity = cap;
+                memcpy(nh->data, conf->h->data, conf->h->size);
+                pred->h = nh;
+            }
+        }
+        live = pred;
+    } else {
+        live = (ecs_buffer_t*)(base + (size_t)slot * sizeof(ecs_buffer_t));
+    }
+
+    l1->changed |= bit;
+    l1->dirty   |= bit * m;
+
+    ecs_buffer_pop(*live, elem_size);
+}
+
+static inline void ecs_iterator_buffer_clear(ecs_iterator_t* it, uint32_t tree_idx, int slot) {
+    assert(it);
+    assert(tree_idx < it->query->tree_count);
+    assert(slot >= 0 && slot < 64);
+    assert((it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_BUFFER) &&
+           "ecs_iterator_buffer_clear: tree must be BUFFER-flagged");
+
+    ecs_l1_t* l1   = it->l1[tree_idx];
+    char*     base = (char*)it->l1_data[tree_idx];
+    uint64_t  bit  = 1ULL << slot;
+    uint64_t  m    = (uint64_t)it->mode;
+
+    if (m == 1) {
+        ecs_buffer_t* pred = (ecs_buffer_t*)(base + (size_t)(slot + 64) * sizeof(ecs_buffer_t));
+        if (!(l1->dirty & bit)) {
+            /* First predict touch: skip COW entirely (clear discards confirmed
+               contents). Pred slot bytes were NULLed at acquire / prior rollback. */
+            pred->h = NULL;
+        } else if (pred->h) {
+            pred->h->size = 0u;                             /* keep capacity */
+        }
+    } else {
+        ecs_buffer_t* conf = (ecs_buffer_t*)(base + (size_t)slot * sizeof(ecs_buffer_t));
+        if (conf->h) conf->h->size = 0u;
+    }
+
+    l1->changed |= bit;
+    l1->dirty   |= bit * m;
 }

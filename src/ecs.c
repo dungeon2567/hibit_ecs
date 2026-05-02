@@ -1,4 +1,4 @@
-﻿#include "ecs.h"
+#include "ecs.h"
 #include <stddef.h>
 
 ecs_l1_t ecs_default_l1 = {
@@ -138,7 +138,7 @@ void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query) {
 #ifndef NDEBUG
     /* `changed` clauses read tree->changed bitmap, which is per-tick. Require
        ecs_world_begin_tick (or ecs_tree_begin_tick on every involved tree) to
-       have run this tick — i.e. tree->tick_id_at_begin == world->tick_id.
+       have run this tick â€” i.e. tree->tick_id_at_begin == world->tick_id.
        Debug-only: hot path skips the scan in Release. */
     {
         uint32_t changed_terms = 0;
@@ -192,7 +192,7 @@ int ecs_iterator_next_slow(ecs_iterator_t* it) {
 
     /* Block-boundary flush of mask updates that ecs_iterator_get_mut deferred:
        dirty / predicted_mask_any / confirmed_mask_any. Derived from
-       l1->changed (which set updates eagerly). OR is idempotent — bits set
+       l1->changed (which set updates eagerly). OR is idempotent â€” bits set
        by prior blocks/ticks are already in the targets, so re-OR'ing is a
        no-op. Must run BEFORE the L1->L2 dirty propagation below. */
     {
@@ -282,9 +282,9 @@ next_l2:
    ========================================================================== */
 
 /* Internal: acquire L2/L1 + propagate masks for a write at `index`. Sets all
-   masks (predicted/confirmed/dirty/changed) unconditionally — caller is
+   masks (predicted/confirmed/dirty/changed) unconditionally â€” caller is
    asserting that the slot is being written this frame, no eq-check. Returns
-   l1s (used by ecs_tree_set_list for direct slot access pre-write). */
+   l1s (used by ecs_tree_buffer_push for direct slot access pre-write). */
 static ecs_l1_t* tree_acquire_and_mark_(ecs_tree_t* tree, int index,
                                         int* out_l1_idx) {
     int l3_idx = (index >> 12) & 0x3F;
@@ -342,12 +342,12 @@ static ecs_l1_t* tree_acquire_and_mark_(ecs_tree_t* tree, int index,
 
    No eq-check: engine assumes caller is writing different bytes. Caller
    should only call when it knows the value is changing (skip when value
-   would be identical). LIST trees must use ecs_tree_set_list. */
+   would be identical). BUFFER trees must use ecs_tree_buffer_push/pop/clear. */
 void* ecs_tree_get_mut(ecs_tree_t* tree, int index) {
     assert(tree);
     assert(index >= 0 && index < (1 << 18));
-    assert(!(tree->flags & ECS_TREE_FLAG_LIST) &&
-           "ecs_tree_get_mut: LIST trees must use ecs_tree_set_list");
+    assert(!(tree->flags & ECS_TREE_FLAG_BUFFER) &&
+           "ecs_tree_get_mut: BUFFER trees must use ecs_tree_buffer_push/pop/clear");
 
     int l1_idx;
     ecs_l1_t* l1s = tree_acquire_and_mark_(tree, index, &l1_idx);
@@ -359,40 +359,85 @@ void* ecs_tree_get_mut(ecs_tree_t* tree, int index) {
     return (char*)l1s + sizeof(ecs_l1_t) + (size_t)(l1_idx + 64 * (int)m) * ds;
 }
 
-/* LIST tree write. Frees the victim slot's list header if live, then
-   ecs_list_assign deep-copies src. Asserts LIST flag (POD/tag use
-   ecs_tree_get_mut). Mask propagation is identical to ecs_tree_get_mut
-   (no eq-skip — list deep-equality would cost more than the mask update). */
-void ecs_tree_set_list(ecs_tree_t* tree, int index, const ecs_list_t* src) {
-    assert(tree);
-    assert(index >= 0 && index < (1 << 18));
-    assert(src);
-    assert((tree->flags & ECS_TREE_FLAG_LIST) &&
-           "ecs_tree_set_list: non-LIST trees must use ecs_tree_get_mut");
-    assert(tree->data_size == sizeof(ecs_list_t));
+/* ==========================================================================
+   LIST element-level mutation. Single COW point: when in PREDICT mode and the
+   target slot's dirty bit is unset (first predict touch this tick), deep-copy
+   the confirmed slot's buffer into the predicted slot. Subsequent ops in the
+   same tick mutate the predicted buffer in place (realloc only on grow inside
+   ecs_buffer_push). Confirmed buffer survives across CONFIRMED ticks (no free
+   on overwrite).
+   ========================================================================== */
 
-    /* Capture victim_live BEFORE marking (mark would set the bit and break
-       the test). CONFIRMED: victim = confirmed slot when conf bit set.
-       PREDICT: victim = predicted slot iff (predicted_mask & dirty) bit set. */
+/* Internal: returns the live ecs_buffer_t* for index, performing the COW if
+   needed. Marks all masks (predicted/confirmed/dirty/changed) hierarchically
+   via tree_acquire_and_mark_. `wants_confirmed_seed` controls whether the
+   COW seeds the predicted buffer from the confirmed buffer (push/pop) or
+   leaves it empty (clear). */
+static ecs_buffer_t* buffer_live_(ecs_tree_t* tree, int index, int wants_confirmed_seed) {
+    assert(tree && (tree->flags & ECS_TREE_FLAG_BUFFER));
+    assert(index >= 0 && index < (1 << 18));
+    assert(tree->data_size == sizeof(ecs_buffer_t));
+
     int l3_idx = (index >> 12) & 0x3F;
     int l2_idx = (index >>  6) & 0x3F;
     int l1_idx =  index        & 0x3F;
     uint64_t m    = (uint64_t)tree->mode;
     uint64_t bit1 = 1ULL << l1_idx;
+
+    /* Pre-mark snapshot â€” tree_acquire_and_mark_ would set dirty unconditionally
+       and break the COW test. */
     ecs_l2_t* pre_l2 = tree->root->children[l3_idx];
-    ecs_l1_t* pre_l1 = (pre_l2 == &ecs_default_l2) ? &ecs_default_l1 : pre_l2->children[l2_idx];
-    uint64_t victim_live = (m == 0)
-        ? (pre_l1->confirmed_mask_any & bit1)
-        : (pre_l1->predicted_mask_any & pre_l1->dirty & bit1);
+    ecs_l1_t* pre_l1 = (pre_l2 == &ecs_default_l2) ? &ecs_default_l1
+                                                    : pre_l2->children[l2_idx];
+    int need_cow = (m == 1) && !(pre_l1->dirty & bit1);
+    int conf_live = (pre_l1->confirmed_mask_any & bit1) != 0;
 
     int marked_idx;
-    ecs_l1_t* l1s = tree_acquire_and_mark_(tree, index, &marked_idx);
+    ecs_l1_t* l1 = tree_acquire_and_mark_(tree, index, &marked_idx);
 
-    size_t ds  = tree->data_size;
-    char*  dst = (char*)l1s + sizeof(ecs_l1_t) + (size_t)(marked_idx + 64 * (int)m) * ds;
-    ecs_list_t* dl = (ecs_list_t*)dst;
-    if (victim_live && dl->h) { ecs_free(dl->h); dl->h = NULL; }
-    ecs_list_assign(dl, src);
+    char* data = (char*)l1 + sizeof(ecs_l1_t);
+    ecs_buffer_t* conf = (ecs_buffer_t*)(data + (size_t)marked_idx * sizeof(ecs_buffer_t));
+    ecs_buffer_t* pred = (ecs_buffer_t*)(data + (size_t)(marked_idx + 64) * sizeof(ecs_buffer_t));
+
+    if (m == 1) {
+        if (need_cow) {
+            /* Pred slot bytes are NULL post-acquire (memset) or post-rollback
+               (rollback NULLs them). Either way, no live header to free here. */
+            pred->h = NULL;
+            if (wants_confirmed_seed && conf_live && conf->h && conf->h->size > 0u) {
+                uint32_t cap = conf->h->capacity;
+                ecs_buffer_header_t* nh = (ecs_buffer_header_t*)ecs_xmalloc_aligned(
+                    sizeof(ecs_buffer_header_t) + (size_t)cap, 8);
+                nh->size     = conf->h->size;
+                nh->capacity = cap;
+                memcpy(nh->data, conf->h->data, conf->h->size);
+                pred->h = nh;
+            }
+        }
+        return pred;
+    }
+    return conf;
+}
+
+void ecs_tree_buffer_push(ecs_tree_t* tree, int index, size_t elem_size, const void* value) {
+    assert(elem_size && value);
+    ecs_buffer_t* live = buffer_live_(tree, index, /*wants_confirmed_seed=*/1);
+    ecs_buffer_push(live, elem_size, value);
+}
+
+void ecs_tree_buffer_pop(ecs_tree_t* tree, int index, size_t elem_size) {
+    assert(elem_size);
+    ecs_buffer_t* live = buffer_live_(tree, index, /*wants_confirmed_seed=*/1);
+    ecs_buffer_pop(*live, elem_size);
+}
+
+void ecs_tree_buffer_clear(ecs_tree_t* tree, int index) {
+    /* Skip seeding; clear discards confirmed contents conceptually. CONFIRMED
+       mode keeps the buffer (size=0, capacity preserved). PREDICT first touch
+       leaves pred->h = NULL â€” next push allocs fresh. PREDICT subsequent
+       touch on already-COWed pred buffer just zeroes size. */
+    ecs_buffer_t* live = buffer_live_(tree, index, /*wants_confirmed_seed=*/0);
+    if (live->h) live->h->size = 0u;
 }
 
 /* Remove a slot. Mode-dispatched branchlessly:
@@ -400,8 +445,8 @@ void ecs_tree_set_list(ecs_tree_t* tree, int index, const ecs_list_t* src) {
                   applied on promote).
      CONFIRMED -> clear both confirmed_mask and predicted_mask in lockstep, no
                   dirty. Releases L1/L2 nodes inline when emptied (no promote
-                  walk to do it later). For LIST trees frees the live slot's
-                  heap (ecs_free on its list header) before clearing presence.
+                  walk to do it later). For BUFFER trees frees the live slot's
+                  heap (ecs_free on its buffer header) before clearing presence.
    Returns 1 if a slot was present and removed, 0 otherwise. */
 int ecs_tree_remove(ecs_tree_t* tree, int index) {
     assert(tree);
@@ -421,24 +466,24 @@ int ecs_tree_remove(ecs_tree_t* tree, int index) {
 
     uint64_t m         = (uint64_t)tree->mode;          /* 0 = CONFIRMED, 1 = PREDICT */
     uint64_t conf_mask = -(uint64_t)(1ULL - m);         /* ~0 in CONFIRMED, 0 in PREDICT */
-    int      is_list   = (tree->flags & ECS_TREE_FLAG_LIST) != 0;
+    int      is_buffer   = (tree->flags & ECS_TREE_FLAG_BUFFER) != 0;
 
-    /* CONFIRMED + LIST: free the live confirmed slot's list header now (no
+    /* CONFIRMED + BUFFER: free the live confirmed slot's buffer header now (no
        promote will see it). */
-    if (is_list && m == 0 && tree->data_size) {
-        ecs_list_t* slot = (ecs_list_t*)((char*)l1s + sizeof(ecs_l1_t)
+    if (is_buffer && m == 0 && tree->data_size) {
+        ecs_buffer_t* slot = (ecs_buffer_t*)((char*)l1s + sizeof(ecs_l1_t)
                           + (size_t)l1_idx * tree->data_size);
         if (slot->h) { ecs_free(slot->h); slot->h = NULL; }
     }
 
-    /* PREDICT + LIST: if predicted slot currently holds a live this-cycle
+    /* PREDICT + BUFFER: if predicted slot currently holds a live this-cycle
        write (predicted_mask & dirty bit set), free it inline. After this,
        predicted bytes are stale; rollback uses the same (predicted_mask &
        dirty) test to avoid double-free. Plain predict-remove on a confirmed-
        only slot (dirty was 0) leaves predicted bytes stale-POD; no free. */
-    if (is_list && m == 1 && tree->data_size
+    if (is_buffer && m == 1 && tree->data_size
         && (l1s->predicted_mask_any & l1s->dirty & bit1)) {
-        ecs_list_t* pslot = (ecs_list_t*)((char*)l1s + sizeof(ecs_l1_t)
+        ecs_buffer_t* pslot = (ecs_buffer_t*)((char*)l1s + sizeof(ecs_l1_t)
                            + (size_t)(l1_idx + 64) * tree->data_size);
         if (pslot->h) { ecs_free(pslot->h); pslot->h = NULL; }
     }
@@ -556,7 +601,7 @@ uint64_t ecs_world_crc64(const ecs_world_t* world) {
 }
 
 /* ==========================================================================
-   Rollback / tick-end — discard predicted, clear changed, release empty nodes.
+   Rollback / tick-end â€” discard predicted, clear changed, release empty nodes.
    Predicted state is always speculative; confirmed state advances only via
    CONFIRMED-mode writes. Walks union of dirty + changed: dirty drives
    predicted-bytes invalidation, changed drives per-tick reset. Predicted-only
@@ -566,7 +611,7 @@ uint64_t ecs_world_crc64(const ecs_world_t* world) {
 void ecs_tree_rollback(ecs_tree_t* tree) {
     assert(tree);
     ecs_l3_t* l3s   = tree->root;
-    if ((l3s->dirty | l3s->changed) == 0) return;     /* idle tick — no advance */
+    if ((l3s->dirty | l3s->changed) == 0) return;     /* idle tick â€” no advance */
     uint64_t visit3 = l3s->dirty | l3s->changed;
 
     /* Confirmed state advanced iff any slot has changed&~dirty (CONFIRMED-mode
@@ -586,17 +631,17 @@ void ecs_tree_rollback(ecs_tree_t* tree) {
 
             if (l1s->changed & ~l1s->dirty) confirmed_advanced = 1;
 
-            /* LIST: predicted slot bytes hold a live this-cycle list header
-               iff (predicted_mask_any & dirty) bit set — predict-set this
+            /* BUFFER: predicted slot bytes hold a live this-cycle buffer header
+               iff (predicted_mask_any & dirty) bit set â€” predict-set this
                cycle that wasn't subsequently predict-removed (which would
                have freed inline and cleared predicted_mask). Free live
                clones before mask reset, otherwise rollback leaks them. POD
                trees skip the walk via the flag check. */
-            if ((tree->flags & ECS_TREE_FLAG_LIST) && tree->data_size) {
+            if ((tree->flags & ECS_TREE_FLAG_BUFFER) && tree->data_size) {
                 uint64_t victims = l1s->predicted_mask_any & l1s->dirty;
                 while (victims) {
                     int k = ecs_ctz64(victims); victims &= victims - 1;
-                    ecs_list_t* pslot = (ecs_list_t*)((char*)l1s + sizeof(ecs_l1_t)
+                    ecs_buffer_t* pslot = (ecs_buffer_t*)((char*)l1s + sizeof(ecs_l1_t)
                                        + (size_t)(k + 64) * tree->data_size);
                     if (pslot->h) { ecs_free(pslot->h); pslot->h = NULL; }
                 }
@@ -634,7 +679,7 @@ void ecs_tree_rollback(ecs_tree_t* tree) {
 }
 
 /* ==========================================================================
-   Begin-tick — clears `changed` hierarchy. Walks `changed` mask sparsely.
+   Begin-tick â€” clears `changed` hierarchy. Walks `changed` mask sparsely.
    `changed` is system-facing per-tick delta; lifetime independent of dirty.
    Default-pointer children are skipped (they may be empty stubs left after
    removal that still carry parent-bit set in `changed`).
@@ -662,7 +707,7 @@ void ecs_tree_begin_tick(ecs_tree_t* tree) {
 
 /* Bumps world->tick_id, clears `changed` everywhere, snapshots tick_id onto
    each populated tree. Pairs with the changed-clause invariant in
-   ecs_iterator_init. Mode-agnostic — same call for CONFIRMED + PREDICT ticks. */
+   ecs_iterator_init. Mode-agnostic â€” same call for CONFIRMED + PREDICT ticks. */
 void ecs_world_begin_tick(ecs_world_t* world) {
     assert(world);
     world->tick_id++;
@@ -1165,13 +1210,13 @@ int ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d) {
 void ecs_tree_destroy(ecs_tree_t* tree) {
     assert(tree);
     if (tree->root) {
-        /* Tree must be at rest — predicted == confirmed everywhere, dirty=0.
+        /* Tree must be at rest â€” predicted == confirmed everywhere, dirty=0.
            That collapses confirmed_mask_any and predicted_mask_any to the
            same "any present" mask, so we just iterate one of them with ctz
            (skipping all-zero L2/L1 subtrees outright). Heap-owning
            components must promote or rollback before destroy. */
         assert(ecs_tree_no_dirty(tree) &&
-               "ecs_tree_destroy: in-flight prediction — promote or rollback first");
+               "ecs_tree_destroy: in-flight prediction â€” promote or rollback first");
 
         uint64_t v3 = tree->root->confirmed_mask_any;
         while (v3) {
@@ -1182,12 +1227,12 @@ void ecs_tree_destroy(ecs_tree_t* tree) {
                 int j = ecs_ctz64(v2); v2 &= v2 - 1;
                 ecs_l1_t* l1   = l2->children[j];
                 uint64_t  mask = l1->confirmed_mask_any;
-                if ((tree->flags & ECS_TREE_FLAG_LIST) && tree->data_size && mask) {
-                    /* LIST teardown: free each live slot's list header. */
+                if ((tree->flags & ECS_TREE_FLAG_BUFFER) && tree->data_size && mask) {
+                    /* BUFFER teardown: free each live slot's buffer header. */
                     uint64_t alive = mask;
                     while (alive) {
                         int k = ecs_ctz64(alive); alive &= alive - 1;
-                        ecs_list_t* slot = (ecs_list_t*)((char*)l1 + sizeof(ecs_l1_t)
+                        ecs_buffer_t* slot = (ecs_buffer_t*)((char*)l1 + sizeof(ecs_l1_t)
                                           + (size_t)k * tree->data_size);
                         if (slot->h) ecs_free(slot->h);
                     }
