@@ -21,23 +21,31 @@
 
 #define BROADPHASE_CELL_LOG2  2
 #define BROADPHASE_CELL_SIZE  (1 << BROADPHASE_CELL_LOG2)
-#define BROADPHASE_NODE_CAP   8
 
-/* SoA so the per-axis min/max load lands in one fixed8 register and the
-   overlap test is six compares + five ANDs. _Alignas(32) on the first
-   field promotes whole-struct alignment to 32 bytes (C11 rule: struct
-   alignment >= max member alignment), keeping fixed8_load_aligned legal
-   on AVX2 across MSVC/clang/gcc; NEON and scalar are unaffected. */
+/* fixed_8_t bundle plus an indexable view over the same 32 bytes. Loads
+   pick the .simd lane for the SIMD overlap test; insertion writes a
+   single slot through .e[i]. Backed by the same memory in every backend
+   (sizeof(fixed_8_t) == 32). */
+typedef union {
+    fixed_8_t simd;
+    fixed_t   e[8];
+} bp_lane8_t;
+
+/* SoA so each per-axis min/max occupies exactly one fixed8 register and
+   the overlap test is six compares + five ANDs. _Alignas(32) on the
+   first field promotes whole-struct alignment to 32 bytes (C11 rule:
+   struct alignment >= max member alignment), keeping aligned loads
+   legal on AVX2 across MSVC/clang/gcc; NEON and scalar are unaffected. */
 typedef struct broadphase_node_t {
-    _Alignas(32) fixed_t min_x[BROADPHASE_NODE_CAP];
-    fixed_t max_x[BROADPHASE_NODE_CAP];
-    fixed_t min_y[BROADPHASE_NODE_CAP];
-    fixed_t max_y[BROADPHASE_NODE_CAP];
-    fixed_t min_z[BROADPHASE_NODE_CAP];
-    fixed_t max_z[BROADPHASE_NODE_CAP];
-    uint32_t ids[BROADPHASE_NODE_CAP];
-    transform_t transforms[BROADPHASE_NODE_CAP];
-    uint8_t  presence_mask;            /* bit i set iff slot i occupied */
+    _Alignas(32) bp_lane8_t min_x;
+    bp_lane8_t max_x;
+    bp_lane8_t min_y;
+    bp_lane8_t max_y;
+    bp_lane8_t min_z;
+    bp_lane8_t max_z;
+    uint8_t  presence_mask;            /* bit i set iff slot i occupied; full = 0xFF */
+    uint32_t    ids[8];
+    transform_t transforms[8];
     struct broadphase_node_t* next;
 } broadphase_node_t;
 

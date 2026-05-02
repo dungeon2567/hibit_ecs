@@ -115,29 +115,24 @@ void broadphase_insert(broadphase_t* bp, uint32_t id, aabb_t aabb) {
        the node was guaranteed not-full above. */
     int i = ecs_ctz32((uint32_t)(uint8_t)~head->presence_mask);
     head->presence_mask |= (uint8_t)(1u << i);
-    head->min_x[i] = aabb.min.x; head->max_x[i] = aabb.max.x;
-    head->min_y[i] = aabb.min.y; head->max_y[i] = aabb.max.y;
-    head->min_z[i] = aabb.min.z; head->max_z[i] = aabb.max.z;
-    head->ids[i]   = id;
+    head->min_x.e[i] = aabb.min.x; head->max_x.e[i] = aabb.max.x;
+    head->min_y.e[i] = aabb.min.y; head->max_y.e[i] = aabb.max.y;
+    head->min_z.e[i] = aabb.min.z; head->max_z.e[i] = aabb.max.z;
+    head->ids[i]     = id;
 }
 
 /* SIMD overlap: 8 items vs 1 query AABB. Six fixed8 compares + five ANDs.
    AND with presence_mask zeros out unoccupied lanes so undefined slot data
-   cannot produce false hits. */
+   cannot produce false hits. The .simd union view is the lane storage --
+   no separate load is needed. */
 static inline uint8_t bp_overlap_mask(const broadphase_node_t* n, aabb_t q) {
-    fixed_8_t nmin_x = fixed8_load_aligned(n->min_x);
-    fixed_8_t nmax_x = fixed8_load_aligned(n->max_x);
-    fixed_8_t nmin_y = fixed8_load_aligned(n->min_y);
-    fixed_8_t nmax_y = fixed8_load_aligned(n->max_y);
-    fixed_8_t nmin_z = fixed8_load_aligned(n->min_z);
-    fixed_8_t nmax_z = fixed8_load_aligned(n->max_z);
     fixed_8_t qmin_x = fixed8_set1(q.min.x), qmax_x = fixed8_set1(q.max.x);
     fixed_8_t qmin_y = fixed8_set1(q.min.y), qmax_y = fixed8_set1(q.max.y);
     fixed_8_t qmin_z = fixed8_set1(q.min.z), qmax_z = fixed8_set1(q.max.z);
 
-    uint8_t m = fixed8_le(nmin_x, qmax_x) & fixed8_ge(nmax_x, qmin_x)
-              & fixed8_le(nmin_y, qmax_y) & fixed8_ge(nmax_y, qmin_y)
-              & fixed8_le(nmin_z, qmax_z) & fixed8_ge(nmax_z, qmin_z);
+    uint8_t m = fixed8_le(n->min_x.simd, qmax_x) & fixed8_ge(n->max_x.simd, qmin_x)
+              & fixed8_le(n->min_y.simd, qmax_y) & fixed8_ge(n->max_y.simd, qmin_y)
+              & fixed8_le(n->min_z.simd, qmax_z) & fixed8_ge(n->max_z.simd, qmin_z);
     return m & n->presence_mask;
 }
 
