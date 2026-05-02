@@ -31,7 +31,7 @@ static inline void free_tree(ecs_tree_t* t) {
 }
 
 static inline void set_val(ecs_tree_t* t, int idx, comp_t val) {
-    ecs_tree_set(t, idx, &val);
+    *(comp_t*)ecs_tree_get_mut(t, idx) = val;
 }
 
 /* Reads current-frame value (predicted if dirty, else confirmed). */
@@ -59,7 +59,7 @@ static ecs_world_t* make_world(int n_trees) {
 }
 
 static void world_set_val(ecs_world_t* w, int tree_i, int idx, comp_t v) {
-    ecs_tree_set(&w->trees[tree_i], idx, &v);
+    *(comp_t*)ecs_tree_get_mut(&w->trees[tree_i], idx) = v;
 }
 
 static void world_remove(ecs_world_t* w, int tree_i, int idx) {

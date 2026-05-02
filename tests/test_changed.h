@@ -98,8 +98,7 @@ static void test_changed_iter_set_propagates(void) {
     it.write_mask = 1u;
     int slot;
     while ((slot = ecs_iterator_next(&it)) >= 0) {
-        comp_t v = 0xBEEF;
-        ecs_iterator_set(&it, 0, slot, &v);
+        *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 0xBEEF;
     }
 
     /* l1 changed set directly by iter_set; l2 / l3 set by write_mask propagation. */

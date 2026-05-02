@@ -95,10 +95,10 @@ static void test_serialize_tag_tree(void) {
     /* data_size == 0: presence-only, payload pass entirely skipped. */
     ecs_tree_t* t = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
     ecs_tree_init(t, 0, 0);
-    /* Tag trees can't store data â€” flip presence bits via set + remove. */
-    ecs_tree_set(t, 7,    NULL);
-    ecs_tree_set(t, 200,  NULL);
-    ecs_tree_set(t, 4097, NULL);
+    /* Tag trees can't store data â€” flip presence bits via get_mut + remove. */
+    ecs_tree_get_mut(t, 7);
+    ecs_tree_get_mut(t, 200);
+    ecs_tree_get_mut(t, 4097);
     ecs_tree_rollback(t);
     ts_round_trip(t, "serialize tag tree round-trip");
     free_tree(t);
@@ -278,10 +278,10 @@ static void test_world_serialize_multi_tree_mixed_sizes(void) {
 
     set_val(&w->trees[0], 1,    0x1111);
     set_val(&w->trees[0], 2000, 0x2222);
-    ecs_tree_set(&w->trees[2], 9,    &(comp_b_t){0xABCD});
-    ecs_tree_set(&w->trees[2], 5000, &(comp_b_t){0xBEEF});
-    ecs_tree_set(&w->trees[5], 42,   NULL);
-    ecs_tree_set(&w->trees[5], 4096, NULL);
+    *(comp_b_t*)ecs_tree_get_mut(&w->trees[2], 9)    = (comp_b_t){0xABCD};
+    *(comp_b_t*)ecs_tree_get_mut(&w->trees[2], 5000) = (comp_b_t){0xBEEF};
+    ecs_tree_get_mut(&w->trees[5], 42);
+    ecs_tree_get_mut(&w->trees[5], 4096);
     ecs_world_rollback(w);
 
     ts_world_round_trip(w, "world serialize multi-tree mixed sizes");

@@ -22,8 +22,8 @@ static void test_destruction_basic_clear(void) {
     set_val(&w->trees[1], 3,   1);
     set_val(&w->trees[1], 5,   2);
     set_val(&w->trees[1], 100, 3);
-    ecs_tree_set(&w->trees[7], 3,   NULL);
-    ecs_tree_set(&w->trees[7], 100, NULL);
+    ecs_tree_get_mut(&w->trees[7], 3);
+    ecs_tree_get_mut(&w->trees[7], 100);
 
     ecs_pipeline_t p; ecs_pipeline_init(&p);
     ecs_pipeline_run(&p, w);
@@ -75,9 +75,9 @@ static void test_destruction_partial_membership(void) {
 
     set_val(&w->trees[0], 5, 100);    /* Only in tree 0 */
     set_val(&w->trees[1], 9, 200);    /* Only in tree 1 */
-    ecs_tree_set(&w->trees[2], 5, NULL);
-    ecs_tree_set(&w->trees[2], 9, NULL);
-    ecs_tree_set(&w->trees[2], 99, NULL);  /* Tagged but absent from data trees */
+    ecs_tree_get_mut(&w->trees[2], 5);
+    ecs_tree_get_mut(&w->trees[2], 9);
+    ecs_tree_get_mut(&w->trees[2], 99);  /* Tagged but absent from data trees */
 
     ecs_pipeline_t p; ecs_pipeline_init(&p);
     ecs_pipeline_run(&p, w);
@@ -142,9 +142,9 @@ static void test_destruction_multi_l2(void) {
     set_val(&w->trees[0], 4096,   3);    /* L3=1 L2=0 L1=0 */
     set_val(&w->trees[0], 100000, 4);    /* L3=24 L2=26 L1=32 */
     /* Mark all but slot 64 for destruction. */
-    ecs_tree_set(&w->trees[1], 0,      NULL);
-    ecs_tree_set(&w->trees[1], 4096,   NULL);
-    ecs_tree_set(&w->trees[1], 100000, NULL);
+    ecs_tree_get_mut(&w->trees[1], 0);
+    ecs_tree_get_mut(&w->trees[1], 4096);
+    ecs_tree_get_mut(&w->trees[1], 100000);
 
     ecs_pipeline_t p; ecs_pipeline_init(&p);
     ecs_pipeline_run(&p, w);
@@ -168,8 +168,8 @@ static int g_tag_system_calls;
 static void tag_destroy_3_and_5(ecs_world_t* w, void* ctx) {
     (void)ctx;
     g_tag_system_calls++;
-    ecs_tree_set(&w->trees[1], 3, NULL);
-    ecs_tree_set(&w->trees[1], 5, NULL);
+    ecs_tree_get_mut(&w->trees[1], 3);
+    ecs_tree_get_mut(&w->trees[1], 5);
 }
 
 static void test_destruction_via_system(void) {
@@ -209,7 +209,7 @@ static void test_destruction_disable(void) {
     ecs_world_set_destroyed_tag(w, -1);
 
     set_val(&w->trees[0], 3, 99);
-    ecs_tree_set(&w->trees[1], 3, NULL);
+    ecs_tree_get_mut(&w->trees[1], 3);
 
     ecs_pipeline_t p; ecs_pipeline_init(&p);
     ecs_pipeline_run(&p, w);

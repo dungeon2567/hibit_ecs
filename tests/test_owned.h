@@ -7,12 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* LIST-component lifecycle tests. Verifies ecs_tree_set / ecs_tree_remove /
+/* LIST-component lifecycle tests. Verifies ecs_tree_set_list / ecs_tree_remove /
    ecs_tree_rollback / ecs_tree_destroy correctly deep-copy ecs_list_t slots
    and free their headers on destroy/discard, with no leaks or double-frees.
 
    Engine semantics under test:
-     - ecs_tree_set  on LIST tree → frees old slot's h then ecs_list_assign clones src.
+     - ecs_tree_set_list → frees old slot's h then ecs_list_assign clones src.
      - ecs_tree_remove           → ecs_free(slot->h) + clear presence (CONFIRMED).
      - ecs_tree_remove           → ecs_free(predicted slot->h) iff (predicted_mask
                                     & dirty) bit set (PREDICT mode owned-clone rule).
@@ -68,7 +68,7 @@ static void test_owned_confirmed_set_empty(void) {
     ecs_tree_t* t = make_list_tree_();
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
 
     const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
     EXPECT(lists_equal_(slot, &a), "tree slot deep-clones source list");
@@ -85,11 +85,11 @@ static void test_owned_confirmed_overwrite(void) {
     ecs_tree_t* t = make_list_tree_();
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
     ecs_list_destroy(&a);
 
     ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set(t, 0, &b);
+    ecs_tree_set_list(t, 0, &b);
     const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
     EXPECT(lists_equal_(slot, &b), "overwritten slot reflects B");
     EXPECT(ecs_list_size(*slot) == 8u * sizeof(int), "size matches B (old A header freed)");
@@ -103,7 +103,7 @@ static void test_owned_confirmed_remove(void) {
     ecs_tree_t* t = make_list_tree_();
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
     ecs_list_destroy(&a);
 
     int rc = ecs_tree_remove(t, 0);
@@ -121,7 +121,7 @@ static void test_owned_predict_set_empty_rollback(void) {
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
     ecs_list_destroy(&a);
     EXPECT(l1_of(t, 0, 0)->predicted_mask_any == 1ULL, "slot present in predicted");
     EXPECT(l1_of(t, 0, 0)->dirty             == 1ULL, "dirty bit set");
@@ -138,12 +138,12 @@ static void test_owned_predict_set_alive_rollback(void) {
     ecs_tree_t* t = make_list_tree_();
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);                              /* CONFIRMED: A at conf slot */
+    ecs_tree_set_list(t, 0, &a);                              /* CONFIRMED: A at conf slot */
     ecs_list_destroy(&a);
 
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
     ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set(t, 0, &b);                              /* PREDICT: B at pred slot */
+    ecs_tree_set_list(t, 0, &b);                              /* PREDICT: B at pred slot */
     ecs_list_destroy(&b);
 
     const ecs_list_t* visible_pre = (const ecs_list_t*)ecs_tree_get(t, 0);
@@ -164,11 +164,11 @@ static void test_owned_predict_set_set(void) {
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
     ecs_list_destroy(&a);
 
     ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set(t, 0, &b);                              /* frees A clone, clones B */
+    ecs_tree_set_list(t, 0, &b);                              /* frees A clone, clones B */
     ecs_list_destroy(&b);
 
     const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
@@ -186,7 +186,7 @@ static void test_owned_predict_set_remove(void) {
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
     ecs_list_destroy(&a);
 
     int rc = ecs_tree_remove(t, 0);
@@ -206,13 +206,13 @@ static void test_owned_predict_set_remove_set(void) {
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);
+    ecs_tree_set_list(t, 0, &a);
     ecs_list_destroy(&a);
 
     ecs_tree_remove(t, 0);                               /* frees A clone inline */
 
     ecs_list_t b = make_int_list_(200, 8);
-    ecs_tree_set(t, 0, &b);                              /* fresh predict-set, no double-destroy */
+    ecs_tree_set_list(t, 0, &b);                              /* fresh predict-set, no double-destroy */
     ecs_list_destroy(&b);
 
     const ecs_list_t* slot = (const ecs_list_t*)ecs_tree_get(t, 0);
@@ -229,7 +229,7 @@ static void test_owned_predict_remove_confirmed_rollback(void) {
     ecs_tree_t* t = make_list_tree_();
 
     ecs_list_t a = make_int_list_(100, 4);
-    ecs_tree_set(t, 0, &a);                              /* CONFIRMED: A at conf slot */
+    ecs_tree_set_list(t, 0, &a);                              /* CONFIRMED: A at conf slot */
     ecs_list_destroy(&a);
 
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
@@ -249,9 +249,9 @@ static void test_owned_predict_remove_confirmed_rollback(void) {
 static void test_owned_destroy_walk(void) {
     ecs_tree_t* t = make_list_tree_();
 
-    ecs_list_t a = make_int_list_(100, 4); ecs_tree_set(t, 0, &a);    ecs_list_destroy(&a);
-    ecs_list_t b = make_int_list_(200, 4); ecs_tree_set(t, 1, &b);    ecs_list_destroy(&b);
-    ecs_list_t c = make_int_list_(300, 4); ecs_tree_set(t, 4096, &c); ecs_list_destroy(&c);  /* L2 != 0 */
+    ecs_list_t a = make_int_list_(100, 4); ecs_tree_set_list(t, 0, &a);    ecs_list_destroy(&a);
+    ecs_list_t b = make_int_list_(200, 4); ecs_tree_set_list(t, 1, &b);    ecs_list_destroy(&b);
+    ecs_list_t c = make_int_list_(300, 4); ecs_tree_set_list(t, 4096, &c); ecs_list_destroy(&c);  /* L2 != 0 */
 
     /* Implicit verification: free_tree → ecs_tree_destroy frees A_h, B_h, C_h.
        Leak detection via mimalloc process-exit; functional check below. */

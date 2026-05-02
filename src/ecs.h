@@ -227,10 +227,10 @@ typedef void (*ecs_deserialize_batch_fn)(void* l1_data,
    beyond list-header free are not supported; model heap as ecs_list_t and
    keep elements POD.
 
-   ECS_TREE_FLAG_LIST: slot type is ecs_list_t. tree_set deep-copies via
-                       ecs_list_assign; tree_remove / rollback / tree_destroy
-                       free slot->h. ecs_iterator_set asserts this flag clear
-                       (POD-only). */
+   ECS_TREE_FLAG_LIST: slot type is ecs_list_t. ecs_tree_set_list deep-copies
+                       via ecs_list_assign; tree_remove / rollback /
+                       tree_destroy free slot->h. ecs_tree_get_mut and
+                       ecs_iterator_get_mut assert this flag clear (POD-only). */
 #define ECS_TREE_FLAG_LIST (1u << 0)
 
 typedef struct ecs_tree_t {
@@ -292,7 +292,7 @@ typedef struct ecs_iterator_t {
     const ecs_l3_t* l3[ECS_QUERY_MAX_TERMS];
     const ecs_l2_t* l2[ECS_QUERY_MAX_TERMS];
     /* Pointer arrays are const-after-block-load so the compiler can hoist
-       loads across ecs_iterator_set's memcpy (which writes through l1_data,
+       loads across ecs_iterator_get_mut's memcpy (which writes through l1_data,
        not to it). Pointees are still mutable — l1->changed |= bit works.
        Updated via cast in iter_load_l1 / ecs_iterator_init only. */
     ecs_l1_t* const l1[ECS_QUERY_MAX_TERMS];
@@ -484,7 +484,25 @@ void     ecs_world_set_mode(ecs_world_t* world, ecs_mode_t mode);
 void     ecs_tree_set_mode(ecs_tree_t* tree, ecs_mode_t mode);
 void     ecs_tree_destroy(ecs_tree_t* tree);
 void     ecs_world_destroy(ecs_world_t* world);
-void     ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value);
+
+/* Get mutable pointer to slot, marking it as written-this-frame. Acquires
+   L2/L1 if absent. Sets predicted/confirmed/dirty/changed masks
+   unconditionally — caller asserts the slot is changing (no eq-check).
+   Caller writes through the returned pointer.
+
+   POD trees: returns ptr to writable slot (predicted slot in PREDICT mode,
+   confirmed slot in CONFIRMED mode).
+   Tag trees (data_size == 0): returns NULL but masks are still updated.
+   LIST trees: must use ecs_tree_set_list (asserts).
+
+   Caller should only call when value is actually changing — calling on an
+   unchanged slot will spuriously promote dirty/changed bits, defeating
+   prediction-mode rollback semantics. */
+void*    ecs_tree_get_mut(ecs_tree_t* tree, int index);
+
+/* LIST tree write. Frees victim slot's list header if live, then deep-copies
+   src via ecs_list_assign. Asserts ECS_TREE_FLAG_LIST. */
+void     ecs_tree_set_list(ecs_tree_t* tree, int index, const ecs_list_t* src);
 
 /* Remove a slot. For LIST trees frees the live slot's heap (ecs_free on its
    list header) before clearing presence. In CONFIRMED mode that's the
@@ -507,7 +525,7 @@ uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
 
 /* ecs_list_t deep-copy. Caller MUST ensure dst is empty (dst->h == NULL or
-   dst->h freed already). Used by ecs_tree_set on LIST trees. */
+   dst->h freed already). Used by ecs_tree_set_list. */
 static inline void ecs_list_assign(ecs_list_t* dst, const ecs_list_t* src) {
     assert(dst);
     if (src && src->h && src->h->size > 0u) {
@@ -710,44 +728,34 @@ static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx
     return (char*)it->l1_data[tree_idx] + off * it->data_size[tree_idx];
 }
 
-/* Branchless mode-multiplexed write. POD-only — asserts the term's tree is
-   not LIST. Always memcpy, conditionally skip the mask update via memcmp
-   against the current visible value: if bytes match, the predicted slot
-   doesn't get promoted (dirty/changed unchanged → reader still sees conf).
-   Wasted store on equal case is one cache-line write; the elimination of
-   the eq-vs-neq branch on the I-cache hot path pays for it.
+/* Get mutable pointer to slot for write-this-frame. Caller writes through
+   the returned ptr; engine assumes bytes are changing (no eq-check). Sets
+   l1->changed bit eagerly; dirty / predicted_mask_any / confirmed_mask_any
+   get derived from changed at the L1 block boundary in
+   ecs_iterator_next_slow. POD only — LIST/tag use the tree-level API.
 
-   Mask propagation: only l1->changed is touched eagerly. dirty /
-   predicted_mask_any / confirmed_mask_any get derived from changed at the
-   L1 block boundary in ecs_iterator_next_slow / ecs_iterator_next_block. */
-static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, int slot, const void* new_value) {
+   Caller should only call when the value is actually changing (calling on
+   an unchanged slot spuriously promotes dirty/changed bits, breaking
+   prediction-mode rollback semantics). */
+static inline void* ecs_iterator_get_mut(ecs_iterator_t* it, uint32_t tree_idx, int slot) {
     assert(it);
-    assert(new_value);
     assert(tree_idx < it->query->tree_count);
     assert(slot >= 0 && slot < 64);
     assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_LIST) &&
-           "ecs_iterator_set: LIST components not supported on iterator path; use ecs_tree_set");
+           "ecs_iterator_get_mut: LIST components not supported on iterator path");
 
     ecs_l1_t* l1   = it->l1[tree_idx];
     size_t    ds   = it->data_size[tree_idx];
-    assert(ds > 0 && "ecs_iterator_set called on tag component (data_size == 0)");
+    assert(ds > 0 && "ecs_iterator_get_mut called on tag component (data_size == 0)");
 
     uint64_t  bit  = 1ULL << slot;
     char*     conf = (char*)it->l1_data[tree_idx] + (size_t)slot * ds;
     uint64_t  m    = (uint64_t)it->mode;                          /* 0 or 1 */
-    char*     dst  = conf + (size_t)64 * ds * (size_t)m;          /* conf when 0, pred when 1 */
-
-    /* Visible value = predicted when dirty, else confirmed. */
-    uint64_t    dirty_hi = (l1->dirty >> slot) & 1ULL;
-    const char* cur      = conf + (size_t)64 * ds * (size_t)dirty_hi;
-    int eq = (memcmp(cur, new_value, ds) == 0);
-
-    memcpy(dst, new_value, ds);
-    if (eq) return;
     l1->changed |= bit;
+    return conf + (size_t)64 * ds * (size_t)m;                    /* conf when 0, pred when 1 */
 }
 
-/* Iterator-side remove. Mode-dispatched like ecs_iterator_set:
+/* Iterator-side remove. Mode-dispatched like ecs_iterator_get_mut:
      PREDICT   -> clear predicted_mask, set dirty (rolled back on rollback).
      CONFIRMED -> clear both confirmed_mask and predicted_mask in lockstep.
    Eager mask propagation up to L2/L3 — does not piggyback the deferred flush

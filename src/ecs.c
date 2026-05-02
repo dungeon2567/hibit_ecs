@@ -190,7 +190,7 @@ int ecs_iterator_next_slow(ecs_iterator_t* it) {
        avoid a load+OR+store of zero per write_mask tree per L1/L2 step. */
     int predict = it->mode;
 
-    /* Block-boundary flush of mask updates that ecs_iterator_set deferred:
+    /* Block-boundary flush of mask updates that ecs_iterator_get_mut deferred:
        dirty / predicted_mask_any / confirmed_mask_any. Derived from
        l1->changed (which set updates eagerly). OR is idempotent — bits set
        by prior blocks/ticks are already in the targets, so re-OR'ing is a
@@ -281,33 +281,20 @@ next_l2:
    Stage writes -- predicted side
    ========================================================================== */
 
-/* Write-only setter. Caller supplies full component value (no seed from
-   confirmed). Mode-dispatched branchlessly:
-     PREDICT   -> predicted slot, dirty bit set, only predicted_mask updated.
-     CONFIRMED -> confirmed slot, no dirty, both confirmed_mask and predicted_mask
-                  updated in lockstep so the at-rest invariant holds.
-   POD path: always memcpy, skip ONLY mask propagation when bytes equal (so
-   the predicted slot doesn't get spuriously promoted).
-   LIST path: ecs_free old slot heap if live, then ecs_list_assign for deep-
-   copy. No equality short-circuit — list deep-equality scan would cost more
-   than the mask update.
-   For tag components (data_size == 0), new_value may be NULL. */
-void ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value) {
-    assert(tree);
-    assert(index >= 0 && index < (1 << 18));
+/* Internal: acquire L2/L1 + propagate masks for a write at `index`. Sets all
+   masks (predicted/confirmed/dirty/changed) unconditionally — caller is
+   asserting that the slot is being written this frame, no eq-check. Returns
+   l1s (used by ecs_tree_set_list for direct slot access pre-write). */
+static ecs_l1_t* tree_acquire_and_mark_(ecs_tree_t* tree, int index,
+                                        int* out_l1_idx) {
     int l3_idx = (index >> 12) & 0x3F;
     int l2_idx = (index >>  6) & 0x3F;
     int l1_idx =  index        & 0x3F;
 
-    size_t   ds        = tree->data_size;
     uint64_t m         = (uint64_t)tree->mode;          /* 0 = CONFIRMED, 1 = PREDICT */
     uint64_t conf_mask = -(uint64_t)(1ULL - m);         /* ~0 in CONFIRMED, 0 in PREDICT */
     uint64_t bit1      = 1ULL << l1_idx;
-    int      is_list   = (tree->flags & ECS_TREE_FLAG_LIST) != 0;
 
-    /* Acquire L2/L1 if needed. POD eq-skip happens after acquire because the
-       eq-skip only fires when the slot is already present, which guarantees
-       L1 already exists — no wasted alloc. */
     ecs_l2_t* l2s = tree->root->children[l3_idx];
     if (l2s == &ecs_default_l2) {
         l2s = ecs_l2_acquire(tree);
@@ -319,43 +306,11 @@ void ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value) {
         l2s->children[l2_idx] = l1s;
     }
 
-    int eq = 0;
-    if (ds && new_value) {
-        char* dst = (char*)l1s + sizeof(ecs_l1_t)
-                  + (size_t)(l1_idx + 64 * (int)m) * ds;
-        if (is_list) {
-            /* CONFIRMED: victim = confirmed slot when conf bit set. PREDICT:
-               victim = predicted slot iff (predicted_mask & dirty) bit set —
-               canonical "predicted owns heap" indicator (excludes predict-
-               removed slots whose bytes were already freed). */
-            uint64_t victim_live = (m == 0)
-                ? (l1s->confirmed_mask_any & bit1)
-                : (l1s->predicted_mask_any & l1s->dirty & bit1);
-            ecs_list_t* dl = (ecs_list_t*)dst;
-            if (victim_live && dl->h) { ecs_free(dl->h); dl->h = NULL; }
-            ecs_list_assign(dl, (const ecs_list_t*)new_value);
-        } else {
-            /* POD: memcmp eq test only meaningful when slot present. */
-            if (l1s->predicted_mask_any & bit1) {
-                uint64_t    dirty_hi = (l1s->dirty >> l1_idx) & 1ULL;
-                const char* cur      = (char*)l1s + sizeof(ecs_l1_t)
-                                     + (size_t)(l1_idx + 64 * (int)dirty_hi) * ds;
-                eq = (memcmp(cur, new_value, ds) == 0);
-            }
-            memcpy(dst, new_value, ds);
-        }
-    }
-
-    if (eq) return;   /* slot present + same bytes → no promotion */
-
     l1s->predicted_mask_any |= bit1;
     l1s->confirmed_mask_any |= bit1 & conf_mask;
     l1s->dirty              |= bit1 * m;
     l1s->changed            |= bit1;
 
-    /* L1 fullness propagates to l2->mask_all bit l2_idx. We just OR'd a bit
-       into l1's any masks; if the resulting any is ~0ULL the L1 is full now,
-       so set mask_all bit. Idempotent: setting already-set bit is a no-op. */
     uint64_t bit2          = 1ULL << l2_idx;
     uint64_t l1_pred_full  = (uint64_t)(l1s->predicted_mask_any == ~0ULL) << l2_idx;
     uint64_t l1_conf_full  = (uint64_t)(l1s->confirmed_mask_any == ~0ULL) << l2_idx;
@@ -375,6 +330,69 @@ void ecs_tree_set(ecs_tree_t* tree, int index, const void* new_value) {
     tree->root->confirmed_mask_all |= l2_conf_full;
     tree->root->dirty              |= bit3 * m;
     tree->root->changed            |= bit3;
+
+    *out_l1_idx = l1_idx;
+    return l1s;
+}
+
+/* Get mutable pointer to slot, marking it as written-this-frame. Acquires
+   L2/L1 if absent. POD trees: returns pointer to writable slot (predicted
+   slot in PREDICT mode, confirmed slot in CONFIRMED mode). Tag trees
+   (data_size == 0): returns NULL but still updates masks.
+
+   No eq-check: engine assumes caller is writing different bytes. Caller
+   should only call when it knows the value is changing (skip when value
+   would be identical). LIST trees must use ecs_tree_set_list. */
+void* ecs_tree_get_mut(ecs_tree_t* tree, int index) {
+    assert(tree);
+    assert(index >= 0 && index < (1 << 18));
+    assert(!(tree->flags & ECS_TREE_FLAG_LIST) &&
+           "ecs_tree_get_mut: LIST trees must use ecs_tree_set_list");
+
+    int l1_idx;
+    ecs_l1_t* l1s = tree_acquire_and_mark_(tree, index, &l1_idx);
+
+    size_t ds = tree->data_size;
+    if (ds == 0) return NULL;     /* tag */
+
+    uint64_t m = (uint64_t)tree->mode;
+    return (char*)l1s + sizeof(ecs_l1_t) + (size_t)(l1_idx + 64 * (int)m) * ds;
+}
+
+/* LIST tree write. Frees the victim slot's list header if live, then
+   ecs_list_assign deep-copies src. Asserts LIST flag (POD/tag use
+   ecs_tree_get_mut). Mask propagation is identical to ecs_tree_get_mut
+   (no eq-skip — list deep-equality would cost more than the mask update). */
+void ecs_tree_set_list(ecs_tree_t* tree, int index, const ecs_list_t* src) {
+    assert(tree);
+    assert(index >= 0 && index < (1 << 18));
+    assert(src);
+    assert((tree->flags & ECS_TREE_FLAG_LIST) &&
+           "ecs_tree_set_list: non-LIST trees must use ecs_tree_get_mut");
+    assert(tree->data_size == sizeof(ecs_list_t));
+
+    /* Capture victim_live BEFORE marking (mark would set the bit and break
+       the test). CONFIRMED: victim = confirmed slot when conf bit set.
+       PREDICT: victim = predicted slot iff (predicted_mask & dirty) bit set. */
+    int l3_idx = (index >> 12) & 0x3F;
+    int l2_idx = (index >>  6) & 0x3F;
+    int l1_idx =  index        & 0x3F;
+    uint64_t m    = (uint64_t)tree->mode;
+    uint64_t bit1 = 1ULL << l1_idx;
+    ecs_l2_t* pre_l2 = tree->root->children[l3_idx];
+    ecs_l1_t* pre_l1 = (pre_l2 == &ecs_default_l2) ? &ecs_default_l1 : pre_l2->children[l2_idx];
+    uint64_t victim_live = (m == 0)
+        ? (pre_l1->confirmed_mask_any & bit1)
+        : (pre_l1->predicted_mask_any & pre_l1->dirty & bit1);
+
+    int marked_idx;
+    ecs_l1_t* l1s = tree_acquire_and_mark_(tree, index, &marked_idx);
+
+    size_t ds  = tree->data_size;
+    char*  dst = (char*)l1s + sizeof(ecs_l1_t) + (size_t)(marked_idx + 64 * (int)m) * ds;
+    ecs_list_t* dl = (ecs_list_t*)dst;
+    if (victim_live && dl->h) { ecs_free(dl->h); dl->h = NULL; }
+    ecs_list_assign(dl, src);
 }
 
 /* Remove a slot. Mode-dispatched branchlessly:
@@ -885,8 +903,8 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
 
     uint8_t version = 1;
     uint8_t flags   = (tree->data_size > 0) ? 1u : 0u;
-    ecs_serializer_write_bytes(s, &version, 1);
-    ecs_serializer_write_bytes(s, &flags,   1);
+    ecs_serializer_write_bits(s, version, 8);
+    ecs_serializer_write_bits(s, flags,   8);
 
     ecs_serialize_varint((uint64_t)tree->data_size, s);
     ecs_serialize_u64_(tree->tick, s);
@@ -981,9 +999,8 @@ static uint64_t ecs_deserialize_mask(ecs_deserializer_t* d) {
 int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
     assert(tree && d);
 
-    uint8_t version, flags;
-    ecs_deserializer_read_bytes(d, &version, 1);
-    ecs_deserializer_read_bytes(d, &flags,   1);
+    uint8_t version = (uint8_t)ecs_deserializer_read_bits(d, 8);
+    uint8_t flags   = (uint8_t)ecs_deserializer_read_bits(d, 8);
     if (version != 1) return -1;
     (void)flags;  /* bit0 is has_data; redundant with data_size */
 
@@ -1101,7 +1118,7 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
 void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
     assert(world && s);
     uint8_t version = 1;
-    ecs_serializer_write_bytes(s, &version, 1);
+    ecs_serializer_write_bits(s, version, 8);
     ecs_serializer_write_bits(s, world->tick, 64);
     ecs_serialize_mask(world->mask, s);
 
@@ -1114,8 +1131,7 @@ void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
 
 int ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d) {
     assert(world && d);
-    uint8_t version;
-    ecs_deserializer_read_bytes(d, &version, 1);
+    uint8_t version = (uint8_t)ecs_deserializer_read_bits(d, 8);
     if (version != 1) return -1;
 
     world->tick = ecs_deserializer_read_bits(d, 64);

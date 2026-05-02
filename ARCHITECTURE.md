@@ -46,7 +46,7 @@ L2 and L3 also carry `confirmed_mask_all` / `predicted_mask_all` to prune exclus
 
 Global VM mode is `ECS_MODE_CONFIRMED` (default) or `ECS_MODE_PREDICT`, set via `ecs_world_set_mode` / `ecs_tree_set_mode`. The mode dictates write semantics:
 
-- **CONFIRMED**: `ecs_tree_set` / `ecs_tree_remove` write directly to the confirmed slot, masks mirror, `dirty` stays 0. Used for server-acked state (or single-player authoritative sim).
+- **CONFIRMED**: `ecs_tree_get_mut` / `ecs_tree_remove` write directly to the confirmed slot, masks mirror, `dirty` stays 0. Used for server-acked state (or single-player authoritative sim).
 - **PREDICT**: writes go to the predicted slot, set the corresponding `dirty` bit, leave confirmed untouched. Used for speculative client-side simulation.
 
 Reads via `ecs_tree_get` / `ecs_iterator_get` use the "current frame" view — predicted bytes when `dirty` is set, confirmed bytes otherwise — branchless via the `+64` slot offset:
@@ -129,8 +129,8 @@ Header-only bitpacked writer/reader (`ecs_serializer_t` / `ecs_deserializer_t`).
 | `ecs_iterator_next` (per entity)| 2 ops: CTZ + AND                                |
 | `ecs_iterator_get` (per entity) | 1 shift, 1 mask, 1 add, 1 multiply, 1 load      |
 | Level transition                | CTZ on level mask, recompute next-level mask    |
-| `ecs_tree_set` (CONFIRMED mode) | 3 mask updates per level + node alloc on miss   |
-| `ecs_tree_set` (PREDICT mode)   | same + sets dirty/changed bits                  |
+| `ecs_tree_get_mut` (CONFIRMED)  | 3 mask updates per level + node alloc on miss   |
+| `ecs_tree_get_mut` (PREDICT)    | same + sets dirty/changed bits                  |
 | `ecs_tree_rollback`             | walks dirty hierarchy, releases empty L1/L2     |
 | Read of confirmed state         | 2 pointer loads + 1 indexed access (no branch)  |
 

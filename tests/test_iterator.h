@@ -119,8 +119,7 @@ static void test_iter_set_modifies_value(void) {
     it.write_mask = 1u;                /* tree 0 receives writes */
     int slot;
     while ((slot = ecs_iterator_next(&it)) >= 0) {
-        comp_t v = 999;
-        ecs_iterator_set(&it, 0, slot, &v);
+        *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 999;
     }
 
     /* Predict-mode write: dirty bit set, predicted slot holds 999, get reads
@@ -153,8 +152,7 @@ static void test_iter_write_mask_propagates(void) {
     it.write_mask = 1u;
     int slot;
     while ((slot = ecs_iterator_next(&it)) >= 0) {
-        comp_t v = 0xC0FFEE;
-        ecs_iterator_set(&it, 0, slot, &v);
+        *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 0xC0FFEE;
     }
 
     /* After exhausting iteration, l2->dirty must reflect both l1 buckets that
@@ -168,29 +166,6 @@ static void test_iter_write_mask_propagates(void) {
     ecs_world_destroy(w); ecs_free(w);
 }
 
-static void test_iter_set_memcmp_short_circuits(void) {
-    ecs_world_t* w = iter_make_world();
-    set_val(&w->trees[0], 7, 42);
-    ecs_world_rollback(w);
-    EXPECT(w->trees[0].root->dirty == 0, "post-promote dirty 0");
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
-    ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
-    it.write_mask = 1u;
-    int slot;
-    while ((slot = ecs_iterator_next(&it)) >= 0) {
-        comp_t same = 42;              /* identical bytes */
-        ecs_iterator_set(&it, 0, slot, &same);
-    }
-    /* memcmp short-circuit: no dirty, no changed, no mask churn. */
-    EXPECT(l1_of(&w->trees[0], 0, 0)->dirty   == 0, "no dirty for identical write");
-    EXPECT(l1_of(&w->trees[0], 0, 0)->changed == 0, "no changed for identical write");
-
-    ecs_free(q);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
 static int test_iterator_all(void) {
     int before = g_failed;
     printf("=== iterator tests ===\n\n");
@@ -200,7 +175,6 @@ static int test_iterator_all(void) {
     test_iter_get_reads_value();
     test_iter_set_modifies_value();
     test_iter_write_mask_propagates();
-    test_iter_set_memcmp_short_circuits();
     int failed = g_failed - before;
     printf("\niterator: %d failed\n", failed);
     return failed ? 1 : 0;

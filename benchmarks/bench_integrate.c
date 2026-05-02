@@ -18,8 +18,10 @@ static void bench_integrate_fn(ecs_iterator_t* it) {
     while ((slot = ecs_iterator_next(it)) >= 0) {
         const vec3_t* vel     = (const vec3_t*)ecs_iterator_get(it, 1, slot);
         const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(it, 0, slot);
-        vec3_t        pos_new = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
-        ecs_iterator_set(it, 0, slot, &pos_new);
+        vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
+        if (!vec3_eq(new_pos, *pos_cur)) {
+            *(vec3_t*)ecs_iterator_get_mut(it, 0, slot) = new_pos;
+        }
     }
 }
 
@@ -32,8 +34,8 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
     ctx->w->mask = 3;
 
     for (int i = 0; i < n_total; i++) {
-        vec3_t pos = vec3_make(fixed_from_int(i), 0, 0);
-        ecs_tree_set(&ctx->w->trees[0], i, &pos);
+        *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[0], i) =
+            vec3_make(fixed_from_int(i), 0, 0);
     }
 
     vec3_t vel = vec3_make(fixed_from_int(60), fixed_from_int(-30), 0);
@@ -41,14 +43,14 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
     if (n_match <= n_total / 2) {
         int step = n_total / n_match;
         for (int i = 0, got = 0; got < n_match; i += step, got++) {
-            ecs_tree_set(&ctx->w->trees[1], i, &vel);
+            *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
         }
     } else {
         int n_skip = n_total - n_match;
         int step   = n_total / n_skip;
         for (int i = 0; i < n_total; i++) {
             if (i % step == 0) continue;
-            ecs_tree_set(&ctx->w->trees[1], i, &vel);
+            *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
         }
     }
 
@@ -157,8 +159,8 @@ bench_random_access_ctx* bench_random_access_setup(int n_total, int n_access) {
     ctx->tree = (ecs_tree_t*)calloc(1, sizeof(ecs_tree_t));
     ecs_tree_init(ctx->tree, sizeof(vec3_t), 0);
     for (int i = 0; i < n_total; i++) {
-        vec3_t p = vec3_make(fixed_from_int(i), 0, 0);
-        ecs_tree_set(ctx->tree, i, &p);
+        *(vec3_t*)ecs_tree_get_mut(ctx->tree, i) =
+            vec3_make(fixed_from_int(i), 0, 0);
     }
     ecs_tree_rollback(ctx->tree);
 

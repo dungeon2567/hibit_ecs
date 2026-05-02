@@ -7,7 +7,7 @@
    contract: predicted writes land at slot+64, confirmed at slot+0; reads
    pick predicted iff dirty bit is set.
 
-   ecs_tree_set / ecs_tree_remove branch on tree->mode (0 = CONFIRMED,
+   ecs_tree_get_mut / ecs_tree_remove branch on tree->mode (0 = CONFIRMED,
    1 = PREDICT) — both halves must be exercised. ecs_tree_set_mode
    asserts no in-flight prediction (dirty == 0 everywhere). */
 
@@ -205,41 +205,6 @@ static void test_mode_predict_multi_tick_lifecycle(void) {
     free_tree(t);
 }
 
-/* ---- memcmp short-circuit on a fresh slot — first write must NOT be
-   short-circuited (slot bit is absent, so `cur` would alias uninitialized
-   bytes). Covers the guard at the top of ecs_tree_set. ---- */
-
-static void test_mode_first_write_no_short_circuit(void) {
-    ecs_tree_t* t = make_tree();
-    ecs_tree_set_mode(t, ECS_MODE_PREDICT);
-    /* First write to a fresh tree — slot bit absent. Even if the new value
-       happens to equal 0 (the uninitialized byte content), the write must
-       go through and set masks. */
-    comp_t zero = 0;
-    ecs_tree_set(t, 7, &zero);
-    EXPECT((l1_of(t, 0, 0)->predicted_mask_any & (1ULL << 7)) != 0,
-           "first write sets predicted mask even when value bytes equal 0");
-    EXPECT((l1_of(t, 0, 0)->dirty & (1ULL << 7)) != 0, "dirty set on fresh-slot write");
-    ecs_tree_rollback(t);   /* clear in-flight prediction so destroy is dirty-free */
-    free_tree(t);
-}
-
-/* ---- repeated identical write hits memcmp short-circuit (existing slot) ---- */
-
-static void test_mode_repeat_write_short_circuits(void) {
-    ecs_tree_t* t = make_tree();
-    set_val(t, 0, 42);
-    ecs_tree_rollback(t);
-    ecs_l1_t* l1 = l1_of(t, 0, 0);
-    EXPECT(l1->dirty == 0 && l1->changed == 0, "clean post-promote");
-
-    set_val(t, 0, 42);  /* identical to confirmed */
-    EXPECT(l1->dirty   == 0, "no dirty for identical predict write");
-    EXPECT(l1->changed == 0, "no changed for identical predict write");
-
-    free_tree(t);
-}
-
 /* ---- determinism: predicted simulation must reproduce confirmed simulation.
    3 confirmed integration ticks, capture view CRC. Then 3 predicted "ticks"
    on the predicted overlay running same integration logic — view CRC at this
@@ -297,8 +262,6 @@ static int test_modes_all(void) {
     test_mode_confirmed_promote_is_tick_only();
     test_mode_switch_predict_to_confirmed_to_predict();
     test_mode_predict_multi_tick_lifecycle();
-    test_mode_first_write_no_short_circuit();
-    test_mode_repeat_write_short_circuits();
     test_mode_predict_matches_confirmed_simulation();
     int failed = g_failed - before;
     printf("\nmodes: %d failed\n", failed);

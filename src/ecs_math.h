@@ -91,6 +91,9 @@ static inline void vec3_store(fixed_t* p, vec3_t v) {
 static inline vec3_t vec3_add(vec3_t a, vec3_t b) {
     vec3_t r; r.simd = fixed4_add(a.simd, b.simd); return r;
 }
+static inline int vec3_eq(vec3_t a, vec3_t b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
 static inline vec3_t vec3_sub(vec3_t a, vec3_t b) {
     vec3_t r; r.simd = fixed4_sub(a.simd, b.simd); return r;
 }
