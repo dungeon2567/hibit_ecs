@@ -1003,6 +1003,187 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
     }
 }
 
+/* Confirmed-state variants of iter_compute_l{1,2,3}_mask. Serializer writes
+   confirmed_mask_any; filters must read the same field so include/exclude
+   semantics agree with the bits we actually emit (predicted-mode bits would
+   diverge under in-flight prediction).
+
+   L3/L2 variants are subtree-prune helpers: a cleared bit in the result
+   means the entire L2 / L1 child can be skipped. Exclude uses _mask_all
+   (only drop subtrees where every slot has the term) -- partial overlap
+   falls through to the next level. */
+static uint64_t serialize_compute_l3_filter(const ecs_compiled_query_t* q,
+                                            const ecs_l3_t* const l3[]) {
+    uint64_t result = 0;
+    for (uint32_t c = 0; c < q->clause_count; c++) {
+        const ecs_compiled_clause_t* cl = &q->clauses[c];
+        if (!cl->include && !cl->exclude && !cl->changed) continue;
+
+        uint64_t bits = ~0ULL;
+        uint32_t mask = cl->include;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l3[n]->confirmed_mask_any; }
+        mask = cl->exclude;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l3[n]->confirmed_mask_all; }
+        if (cl->changed) {
+            uint64_t any_changed = 0;
+            mask = cl->changed;
+            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l3[n]->changed; }
+            bits &= any_changed;
+        }
+        result |= bits;
+    }
+    return result;
+}
+
+static uint64_t serialize_compute_l2_filter(const ecs_compiled_query_t* q,
+                                            const ecs_l2_t* const l2[]) {
+    uint64_t result = 0;
+    for (uint32_t c = 0; c < q->clause_count; c++) {
+        const ecs_compiled_clause_t* cl = &q->clauses[c];
+        if (!cl->include && !cl->exclude && !cl->changed) continue;
+
+        uint64_t bits = ~0ULL;
+        uint32_t mask = cl->include;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l2[n]->confirmed_mask_any; }
+        mask = cl->exclude;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l2[n]->confirmed_mask_all; }
+        if (cl->changed) {
+            uint64_t any_changed = 0;
+            mask = cl->changed;
+            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l2[n]->changed; }
+            bits &= any_changed;
+        }
+        result |= bits;
+    }
+    return result;
+}
+
+static uint64_t serialize_compute_l1_filter(const ecs_compiled_query_t* q,
+                                            const ecs_l1_t* const l1[]) {
+    uint64_t result = 0;
+    for (uint32_t c = 0; c < q->clause_count; c++) {
+        const ecs_compiled_clause_t* cl = &q->clauses[c];
+        if (!cl->include && !cl->exclude && !cl->changed) continue;
+
+        uint64_t bits = ~0ULL;
+        uint32_t mask = cl->include;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l1[n]->confirmed_mask_any; }
+        mask = cl->exclude;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l1[n]->confirmed_mask_any; }
+        if (cl->changed) {
+            uint64_t any_changed = 0;
+            mask = cl->changed;
+            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l1[n]->changed; }
+            bits &= any_changed;
+        }
+        result |= bits;
+    }
+    return result;
+}
+
+void ecs_tree_serialize_delta(const ecs_tree_t* tree,
+                                 const ecs_compiled_query_t* query,
+                                 ecs_serializer_t* s) {
+    assert(tree && query && s);
+
+    /* Wire format identical to ecs_tree_serialize -- ecs_tree_deserialize
+       reads the output unchanged. L1 masks are intersected with the
+       per-block query filter; L2/L3 masks are rebuilt bottom-up so a
+       parent bit is set IFF its subtree contains at least one surviving
+       slot (no false positives -- empty subtrees disappear from both the
+       mask stream and the payload stream). */
+    uint8_t version = 1;
+    uint8_t flags   = (tree->data_size > 0) ? 1u : 0u;
+    ecs_serializer_write_bits(s, version, 8);
+    ecs_serializer_write_bits(s, flags,   8);
+
+    ecs_serialize_varint((uint64_t)tree->data_size, s);
+    ecs_serialize_u64_(tree->tick, s);
+
+    const ecs_l3_t* l3 = tree->root;
+
+    /* Pre-pass: compute delta L1 masks, propagate to L2/L3. Storage
+       scoped to set L3/L2 bits only -- worst case 64*64 u64 = 32 KiB stack.
+       L3/L2 filters short-circuit walk: cleared bits skip whole subtrees
+       that the query already prunes (mirrors iter_compute_l{2,3}_mask). */
+    uint64_t delta_l1[64][64];
+    uint64_t delta_l2[64];
+    uint64_t delta_l3 = 0;
+
+    {
+        const ecs_l3_t* l3_arr[ECS_QUERY_MAX_TERMS];
+        for (uint32_t t = 0; t < query->tree_count; t++)
+            l3_arr[t] = query->trees[t]->root;
+        uint64_t l3_filter = serialize_compute_l3_filter(query, l3_arr);
+
+        uint64_t v3 = l3->confirmed_mask_any & l3_filter;
+        while (v3) {
+            int i = ecs_ctz64(v3); v3 &= v3 - 1;
+            const ecs_l2_t* l2 = l3->children[i];
+
+            const ecs_l2_t* l2_arr[ECS_QUERY_MAX_TERMS];
+            for (uint32_t t = 0; t < query->tree_count; t++)
+                l2_arr[t] = l3_arr[t]->children[i];
+            uint64_t l2_filter = serialize_compute_l2_filter(query, l2_arr);
+
+            uint64_t fl2 = 0;
+            uint64_t v2  = l2->confirmed_mask_any & l2_filter;
+            while (v2) {
+                int j = ecs_ctz64(v2); v2 &= v2 - 1;
+
+                const ecs_l1_t* l1_arr[ECS_QUERY_MAX_TERMS];
+                for (uint32_t t = 0; t < query->tree_count; t++)
+                    l1_arr[t] = l2_arr[t]->children[j];
+                uint64_t l1_filter = serialize_compute_l1_filter(query, l1_arr);
+                uint64_t out       = l2->children[j]->confirmed_mask_any & l1_filter;
+
+                if (out) {
+                    delta_l1[i][j] = out;
+                    fl2 |= (uint64_t)1 << j;
+                }
+            }
+            delta_l2[i] = fl2;
+            if (fl2) delta_l3 |= (uint64_t)1 << i;
+        }
+    }
+
+    /* Pass 1: emit pruned masks. */
+    ecs_serialize_mask(delta_l3, s);
+    {
+        uint64_t v3 = delta_l3;
+        while (v3) {
+            int i = ecs_ctz64(v3); v3 &= v3 - 1;
+            ecs_serialize_mask(delta_l2[i], s);
+
+            uint64_t v2 = delta_l2[i];
+            while (v2) {
+                int j = ecs_ctz64(v2); v2 &= v2 - 1;
+                ecs_serialize_mask(delta_l1[i][j], s);
+            }
+        }
+    }
+
+    if (!tree->data_size || !delta_l3) return;
+
+    /* Pass 2: payload. Iterate the same pruned topology so payload bytes
+       align 1:1 with the masks emitted in pass 1. */
+    {
+        uint64_t v3 = delta_l3;
+        while (v3) {
+            int i = ecs_ctz64(v3); v3 &= v3 - 1;
+            const ecs_l2_t* l2 = l3->children[i];
+
+            uint64_t v2 = delta_l2[i];
+            while (v2) {
+                int j = ecs_ctz64(v2); v2 &= v2 - 1;
+                const ecs_l1_t* l1_self = l2->children[j];
+                tree->serialize_batch(ecs_l1_data(l1_self), tree->data_size,
+                                      delta_l1[i][j], s);
+            }
+        }
+    }
+}
+
 /* ==========================================================================
    Binary deserializer -- mirrors ecs_tree_serialize.
    ========================================================================== */

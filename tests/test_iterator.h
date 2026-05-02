@@ -169,12 +169,12 @@ static void test_iter_write_mask_propagates(void) {
 static int test_iterator_all(void) {
     int before = g_failed;
     printf("=== iterator tests ===\n\n");
-    test_iter_atom_count();
-    test_iter_and_intersection();
-    test_iter_exclude();
-    test_iter_get_reads_value();
-    test_iter_set_modifies_value();
-    test_iter_write_mask_propagates();
+    RUN_TEST(test_iter_atom_count);
+    RUN_TEST(test_iter_and_intersection);
+    RUN_TEST(test_iter_exclude);
+    RUN_TEST(test_iter_get_reads_value);
+    RUN_TEST(test_iter_set_modifies_value);
+    RUN_TEST(test_iter_write_mask_propagates);
     int failed = g_failed - before;
     printf("\niterator: %d failed\n", failed);
     return failed ? 1 : 0;

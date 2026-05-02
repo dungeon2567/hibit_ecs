@@ -254,15 +254,15 @@ static void test_mode_predict_matches_confirmed_simulation(void) {
 static int test_modes_all(void) {
     int before = g_failed;
     printf("=== mode / phase tests ===\n\n");
-    test_mode_predict_byte_layout();
-    test_mode_confirmed_byte_layout();
-    test_mode_confirmed_get_reads_confirmed();
-    test_mode_confirmed_remove_releases_l1();
-    test_mode_confirmed_remove_returns_zero_for_absent();
-    test_mode_confirmed_promote_is_tick_only();
-    test_mode_switch_predict_to_confirmed_to_predict();
-    test_mode_predict_multi_tick_lifecycle();
-    test_mode_predict_matches_confirmed_simulation();
+    RUN_TEST(test_mode_predict_byte_layout);
+    RUN_TEST(test_mode_confirmed_byte_layout);
+    RUN_TEST(test_mode_confirmed_get_reads_confirmed);
+    RUN_TEST(test_mode_confirmed_remove_releases_l1);
+    RUN_TEST(test_mode_confirmed_remove_returns_zero_for_absent);
+    RUN_TEST(test_mode_confirmed_promote_is_tick_only);
+    RUN_TEST(test_mode_switch_predict_to_confirmed_to_predict);
+    RUN_TEST(test_mode_predict_multi_tick_lifecycle);
+    RUN_TEST(test_mode_predict_matches_confirmed_simulation);
     int failed = g_failed - before;
     printf("\nmodes: %d failed\n", failed);
     return failed ? 1 : 0;

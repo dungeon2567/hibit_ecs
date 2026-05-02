@@ -146,12 +146,12 @@ static void test_changed_deserialize_zeros(void) {
 static int test_changed_all(void) {
     int before = g_failed;
     printf("=== changed-mask tests ===\n\n");
-    test_changed_set_marks_hierarchy();
-    test_changed_remove_marks();
-    test_changed_begin_tick_clears();
-    test_changed_rollback_clears_on_dirty_walk();
-    test_changed_iter_set_propagates();
-    test_changed_deserialize_zeros();
+    RUN_TEST(test_changed_set_marks_hierarchy);
+    RUN_TEST(test_changed_remove_marks);
+    RUN_TEST(test_changed_begin_tick_clears);
+    RUN_TEST(test_changed_rollback_clears_on_dirty_walk);
+    RUN_TEST(test_changed_iter_set_propagates);
+    RUN_TEST(test_changed_deserialize_zeros);
     int failed = g_failed - before;
     printf("\nchanged: %d failed\n", failed);
     return failed ? 1 : 0;

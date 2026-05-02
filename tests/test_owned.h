@@ -265,17 +265,17 @@ static int test_owned_all(void) {
     printf("=== BUFFER-component lifecycle tests ===\n\n");
 
     int before = g_failed;
-    test_owned_confirmed_push();
-    test_owned_confirmed_clear();
-    test_owned_confirmed_remove();
-    test_owned_predict_push_empty_rollback();
-    test_owned_predict_push_alive_rollback();
-    test_owned_predict_push_push();
-    test_owned_predict_push_remove();
-    test_owned_predict_push_remove_push();
-    test_owned_predict_remove_confirmed_rollback();
-    test_owned_predict_clear_alive_rollback();
-    test_owned_destroy_walk();
+    RUN_TEST(test_owned_confirmed_push);
+    RUN_TEST(test_owned_confirmed_clear);
+    RUN_TEST(test_owned_confirmed_remove);
+    RUN_TEST(test_owned_predict_push_empty_rollback);
+    RUN_TEST(test_owned_predict_push_alive_rollback);
+    RUN_TEST(test_owned_predict_push_push);
+    RUN_TEST(test_owned_predict_push_remove);
+    RUN_TEST(test_owned_predict_push_remove_push);
+    RUN_TEST(test_owned_predict_remove_confirmed_rollback);
+    RUN_TEST(test_owned_predict_clear_alive_rollback);
+    RUN_TEST(test_owned_destroy_walk);
 
     int local_failed = g_failed - before;
     printf("\nowned: %d failed\n", local_failed);

@@ -256,15 +256,15 @@ static void test_fixed8_poly_known(void) {
 static int test_fixed_all(void) {
     int before = g_failed;
     printf("=== fixed.h tests ===\n\n");
-    test_fixed_scalar();
-    test_fixed4_arith();
-    test_fixed4_cmp();
-    test_fixed8_arith();
-    test_fixed8_cmp();
-    test_fixed4_fma_known();
-    test_fixed4_frac_known();
-    test_fixed8_fma_known();
-    test_fixed8_poly_known();
+    RUN_TEST(test_fixed_scalar);
+    RUN_TEST(test_fixed4_arith);
+    RUN_TEST(test_fixed4_cmp);
+    RUN_TEST(test_fixed8_arith);
+    RUN_TEST(test_fixed8_cmp);
+    RUN_TEST(test_fixed4_fma_known);
+    RUN_TEST(test_fixed4_frac_known);
+    RUN_TEST(test_fixed8_fma_known);
+    RUN_TEST(test_fixed8_poly_known);
     int failed = g_failed - before;
     printf("\nfixed: %d failed\n", failed);
     return failed ? 1 : 0;

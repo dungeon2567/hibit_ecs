@@ -17,6 +17,19 @@ static int g_failed = 0;
     else { g_failed++; printf("FAIL [line %d]: %s\n", __LINE__, msg); } \
 } while(0)
 
+/* Run a void test_*(void) function and print "  <name>  OK" on success
+   (no EXPECT failed during the call). The "test_" prefix is stripped for
+   readability so each line matches the per-test status format used by
+   the inline tests in main.c. */
+#define RUN_TEST(fn) do { \
+    int _f0 = g_failed; fn(); \
+    if (g_failed == _f0) { \
+        const char* _n = #fn; \
+        if (strncmp(_n, "test_", 5) == 0) _n += 5; \
+        printf("  %s  OK\n", _n); \
+    } \
+} while (0)
+
 typedef uint32_t comp_t;
 
 static inline ecs_tree_t* make_tree(void) {
@@ -408,27 +421,27 @@ static int test_all(void) {
     ecs_crc64_init();
     printf("=== ECS predict-mode + CRC64 tests ===\n\n");
 
-    test_predict_rollback_data();
-    test_predict_rollback_add();
-    test_predict_rollback_remove();
-    test_predict_promote_advances_confirmed();
-    test_predict_rollback_no_dirty_noop();
-    test_predict_l2_l3_bitmaps();
-    test_crc64_empty_deterministic();
-    test_crc64_changes_on_add();
-    test_crc64_changes_on_modify();
-    test_crc64_position_sensitive();
-    test_crc64_rollback_restores_predicted();
-    test_world_crc64_empty_deterministic();
-    test_world_crc64_changes_on_promote();
-    test_compile_query_atom();
-    test_compile_query_and();
-    test_compile_query_or();
-    test_compile_query_not();
-    test_compile_query_unknown_name();
-    test_compile_query_bad_syntax();
-    test_compile_query_null_args();
-    test_world_predict_rollback();
+    RUN_TEST(test_predict_rollback_data);
+    RUN_TEST(test_predict_rollback_add);
+    RUN_TEST(test_predict_rollback_remove);
+    RUN_TEST(test_predict_promote_advances_confirmed);
+    RUN_TEST(test_predict_rollback_no_dirty_noop);
+    RUN_TEST(test_predict_l2_l3_bitmaps);
+    RUN_TEST(test_crc64_empty_deterministic);
+    RUN_TEST(test_crc64_changes_on_add);
+    RUN_TEST(test_crc64_changes_on_modify);
+    RUN_TEST(test_crc64_position_sensitive);
+    RUN_TEST(test_crc64_rollback_restores_predicted);
+    RUN_TEST(test_world_crc64_empty_deterministic);
+    RUN_TEST(test_world_crc64_changes_on_promote);
+    RUN_TEST(test_compile_query_atom);
+    RUN_TEST(test_compile_query_and);
+    RUN_TEST(test_compile_query_or);
+    RUN_TEST(test_compile_query_not);
+    RUN_TEST(test_compile_query_unknown_name);
+    RUN_TEST(test_compile_query_bad_syntax);
+    RUN_TEST(test_compile_query_null_args);
+    RUN_TEST(test_world_predict_rollback);
 
     printf("\n%d passed, %d failed\n", g_passed, g_failed);
     fflush(stdout);

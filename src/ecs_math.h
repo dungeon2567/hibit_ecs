@@ -2,6 +2,28 @@
 
 #include "fixed.h"
 
+/* ============================================================
+   bitops + branch hints
+   ============================================================ */
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#include <xmmintrin.h>
+static inline int ecs_ctz64(uint64_t x) { unsigned long i; _BitScanForward64(&i, x); return (int)i; }
+static inline int ecs_ctz32(uint32_t x) { unsigned long i; _BitScanForward(&i, x); return (int)i; }
+static inline int ecs_popcount64(uint64_t x) { return (int)__popcnt64(x); }
+#define ECS_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#define ECS_LIKELY(x)   (x)
+#define ECS_UNLIKELY(x) (x)
+#else
+static inline int ecs_ctz64(uint64_t x) { return __builtin_ctzll(x); }
+static inline int ecs_ctz32(uint32_t x) { return __builtin_ctz(x); }
+static inline int ecs_popcount64(uint64_t x) { return __builtin_popcountll(x); }
+#define ECS_PREFETCH(p) __builtin_prefetch((p), 0, 3)
+#define ECS_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define ECS_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
+
 /* Q16.16 vec3 / quaternion math. Storage is fixed_4_t (16 bytes) so SIMD
    ops on add/sub/scale/neg are direct; scalar paths are used where the
    horizontal extraction would cost more than three plain imuls. */
@@ -130,6 +152,30 @@ static inline vec3_t vec3_normalize(vec3_t a) {
 }
 static inline vec3_t vec3_lerp(vec3_t a, vec3_t b, fixed_t t) {
     return vec3_add(a, vec3_scale(vec3_sub(b, a), t));
+}
+
+/* ============================================================
+   aabb — axis-aligned box, Q16.16 metres
+   ============================================================ */
+
+typedef struct {
+    vec3_t min;
+    vec3_t max;
+} aabb_t;
+
+static inline aabb_t aabb_make(vec3_t min, vec3_t max) {
+    aabb_t b = { min, max }; return b;
+}
+static inline aabb_t aabb_from_center_extents(vec3_t c, vec3_t e) {
+    aabb_t b = { vec3_sub(c, e), vec3_add(c, e) }; return b;
+}
+static inline vec3_t aabb_center(aabb_t b) {
+    return vec3_scale(vec3_add(b.min, b.max), FIXED_HALF);
+}
+static inline int aabb_overlaps(aabb_t a, aabb_t b) {
+    return a.min.x <= b.max.x && a.max.x >= b.min.x
+        && a.min.y <= b.max.y && a.max.y >= b.min.y
+        && a.min.z <= b.max.z && a.max.z >= b.min.z;
 }
 
 /* ============================================================

@@ -94,6 +94,7 @@ if (ECS_BUILD_TESTS)
         main.c
         src/ecs.c
         src/ecs_query.c
+        src/broadphase.c
     )
 
     target_include_directories(ecs PRIVATE
@@ -121,6 +122,7 @@ if (ECS_BUILD_BENCH)
         benchmarks/bench_integrate.c
         src/ecs.c
         src/ecs_query.c
+        src/broadphase.c
     )
 
     target_include_directories(ecs_bench PRIVATE

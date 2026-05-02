@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --build C:/Projects/HibitEcs/out/build/x64-debug --target ecs)",
+      "Bash(cmake --build C:/Projects/HibitEcs/out/build/x64-release --target ecs)",
+      "Bash(where clang *)"
+    ]
+  }
+}

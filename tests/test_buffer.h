@@ -174,15 +174,15 @@ static void test_buffer_struct_payload(void) {
 static int test_buffer_all(void) {
     int before = g_failed;
     printf("=== ecs_buffer_t tests ===\n\n");
-    test_buffer_empty();
-    test_buffer_push_int();
-    test_buffer_push_null_value();
-    test_buffer_growth();
-    test_buffer_reserve();
-    test_buffer_pop();
-    test_buffer_swap_remove();
-    test_buffer_clear();
-    test_buffer_struct_payload();
+    RUN_TEST(test_buffer_empty);
+    RUN_TEST(test_buffer_push_int);
+    RUN_TEST(test_buffer_push_null_value);
+    RUN_TEST(test_buffer_growth);
+    RUN_TEST(test_buffer_reserve);
+    RUN_TEST(test_buffer_pop);
+    RUN_TEST(test_buffer_swap_remove);
+    RUN_TEST(test_buffer_clear);
+    RUN_TEST(test_buffer_struct_payload);
     int failed = g_failed - before;
     printf("\nlist: %d failed\n", failed);
     return failed ? 1 : 0;

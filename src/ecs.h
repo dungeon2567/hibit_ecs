@@ -6,25 +6,8 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <mimalloc.h>
+#include "ecs_math.h"
 #include "ecs_serializer.h"
-
-#ifdef _MSC_VER
-#include <intrin.h>
-#include <xmmintrin.h>
-static inline int ecs_ctz64(uint64_t x) { unsigned long i; _BitScanForward64(&i, x); return (int)i; }
-static inline int ecs_ctz32(uint32_t x) { unsigned long i; _BitScanForward(&i, x); return (int)i; }
-static inline int ecs_popcount64(uint64_t x) { return (int)__popcnt64(x); }
-#define ECS_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
-#define ECS_LIKELY(x)   (x)
-#define ECS_UNLIKELY(x) (x)
-#else
-static inline int ecs_ctz64(uint64_t x) { return __builtin_ctzll(x); }
-static inline int ecs_ctz32(uint32_t x) { return __builtin_ctz(x); }
-static inline int ecs_popcount64(uint64_t x) { return __builtin_popcountll(x); }
-#define ECS_PREFETCH(p) __builtin_prefetch((p), 0, 3)
-#define ECS_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define ECS_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#endif
 
 /* mimalloc wrappers. 'x' prefix = abort on OOM (xmalloc convention) -- every
    allocation site in this engine treats failure as fatal, so callers don't
@@ -441,6 +424,22 @@ void     ecs_deserialize_batch_raw(void* l1_data,
    Caller owns the backing buffer and is responsible for sizing it.
    Bitpacker asserts on overflow. */
 void     ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s);
+
+/* Delta serialize. Wire format identical to ecs_tree_serialize -- output
+   reads back via ecs_tree_deserialize unchanged. Only slots matching `query`
+   are emitted; non-matching slots are masked out at the L1 level and L2/L3
+   masks are rebuilt bottom-up so a parent bit is set IFF its subtree contains
+   at least one surviving slot. No false positives: empty subtrees vanish.
+
+   `tree` is the tree whose data is written. `query` supplies the match
+   predicate -- typically `tree` is one of `query->trees[]` but doesn't have
+   to be (other query trees provide cross-tree include/exclude/changed terms).
+
+   Filter reads confirmed_mask_any across all query trees -- consistent with
+   what the serializer writes. PREDICT-mode in-flight bits are not visible. */
+void     ecs_tree_serialize_delta(const ecs_tree_t* tree,
+                                     const ecs_compiled_query_t* query,
+                                     ecs_serializer_t* s);
 
 /* Deserialize a tree previously written by ecs_tree_serialize. Totally
    replaces tree state -- confirmed/predicted/dirty/tick are overwritten

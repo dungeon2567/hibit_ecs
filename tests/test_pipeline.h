@@ -104,10 +104,10 @@ static void test_pipeline_tick_id_synced_across_trees(void) {
 static int test_pipeline_all(void) {
     int before = g_failed;
     printf("=== pipeline tests ===\n\n");
-    test_pipeline_empty_runs_begin_tick();
-    test_pipeline_runs_single_system_once();
-    test_pipeline_preserves_registration_order();
-    test_pipeline_tick_id_synced_across_trees();
+    RUN_TEST(test_pipeline_empty_runs_begin_tick);
+    RUN_TEST(test_pipeline_runs_single_system_once);
+    RUN_TEST(test_pipeline_preserves_registration_order);
+    RUN_TEST(test_pipeline_tick_id_synced_across_trees);
     int failed = g_failed - before;
     printf("\npipeline: %d failed\n", failed);
     return failed ? 1 : 0;

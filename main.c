@@ -9,6 +9,7 @@
 #include "test_modes.h"
 #include "test_owned.h"
 #include "test_buffer.h"
+#include "test_broadphase.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -169,6 +170,7 @@ int main(void) {
                | test_modes_all()
                | test_owned_all()
                | test_buffer_all()
+               | test_broadphase_all()
                | (failures ? 1 : 0);
 
     return result;

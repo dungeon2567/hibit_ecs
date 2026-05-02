@@ -84,6 +84,63 @@ static void BM_RandomAccess100k(benchmark::State& state) {
 }
 BENCHMARK(BM_RandomAccess100k)->Unit(benchmark::kMicrosecond);
 
+/* Readonly sum: positions post-integrate, accumulated to a single vec3.
+   Sparse / dense mirror BM_Integrate*. SOA is the no-ECS lower bound. */
+static void BM_SumPosSparse(benchmark::State& state) {
+    bench_sum_pos_ctx* ctx = bench_sum_pos_setup(10000, 500);
+    for (auto _ : state) {
+        bench_sum_pos_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 500);
+    bench_sum_pos_teardown(ctx);
+}
+BENCHMARK(BM_SumPosSparse)->Unit(benchmark::kMicrosecond);
+
+static void BM_SumPosDense(benchmark::State& state) {
+    bench_sum_pos_ctx* ctx = bench_sum_pos_setup(10000, 9500);
+    for (auto _ : state) {
+        bench_sum_pos_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 9500);
+    bench_sum_pos_teardown(ctx);
+}
+BENCHMARK(BM_SumPosDense)->Unit(benchmark::kMicrosecond);
+
+static void BM_SumPosDense100k(benchmark::State& state) {
+    bench_sum_pos_ctx* ctx = bench_sum_pos_setup(100000, 95000);
+    for (auto _ : state) {
+        bench_sum_pos_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 95000);
+    bench_sum_pos_teardown(ctx);
+}
+BENCHMARK(BM_SumPosDense100k)->Unit(benchmark::kMicrosecond);
+
+static void BM_SumPosDenseSOA(benchmark::State& state) {
+    bench_sum_pos_soa_ctx* ctx = bench_sum_pos_soa_setup(9500);
+    for (auto _ : state) {
+        bench_sum_pos_soa_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 9500);
+    bench_sum_pos_soa_teardown(ctx);
+}
+BENCHMARK(BM_SumPosDenseSOA)->Unit(benchmark::kMicrosecond);
+
+static void BM_SumPosDenseSOA100k(benchmark::State& state) {
+    bench_sum_pos_soa_ctx* ctx = bench_sum_pos_soa_setup(95000);
+    for (auto _ : state) {
+        bench_sum_pos_soa_iter(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 95000);
+    bench_sum_pos_soa_teardown(ctx);
+}
+BENCHMARK(BM_SumPosDenseSOA100k)->Unit(benchmark::kMicrosecond);
+
 int main(int argc, char** argv) {
     ecs_crc64_init();
     benchmark::Initialize(&argc, argv);
