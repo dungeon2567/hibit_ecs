@@ -96,9 +96,10 @@ static void test_changed_iter_set_propagates(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     it.write_mask = 1u;
-    while (ecs_iterator_next(&it)) {
+    int slot;
+    while ((slot = ecs_iterator_next(&it)) >= 0) {
         comp_t v = 0xBEEF;
-        ecs_iterator_set(&it, 0, &v);
+        ecs_iterator_set(&it, 0, slot, &v);
     }
 
     /* l1 changed set directly by iter_set; l2 / l3 set by write_mask propagation. */

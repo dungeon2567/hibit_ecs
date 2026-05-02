@@ -33,7 +33,7 @@ static void test_iter_atom_count(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     int count = 0;
-    while (ecs_iterator_next(&it)) count++;
+    while (ecs_iterator_next(&it) >= 0) count++;
     EXPECT(count == 4, "iterator visits all 4 Pos entities");
 
     ecs_free(q);
@@ -53,9 +53,9 @@ static void test_iter_and_intersection(void) {
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & Vel");
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
-    int count = 0, observed_l1 = -1;
-    while (ecs_iterator_next(&it)) {
-        observed_l1 = it.l1_idx;
+    int count = 0, observed_l1 = -1, slot;
+    while ((slot = ecs_iterator_next(&it)) >= 0) {
+        observed_l1 = slot;
         count++;
     }
     EXPECT(count == 1, "Pos & Vel intersection = 1");
@@ -77,7 +77,7 @@ static void test_iter_exclude(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     int count = 0;
-    while (ecs_iterator_next(&it)) count++;
+    while (ecs_iterator_next(&it) >= 0) count++;
     EXPECT(count == 2, "Pos & !Vel = 2");
 
     ecs_free(q);
@@ -94,8 +94,9 @@ static void test_iter_get_reads_value(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     uint32_t observed = 0;
-    while (ecs_iterator_next(&it)) {
-        const comp_t* v = (const comp_t*)ecs_iterator_get(&it, 0);
+    int slot;
+    while ((slot = ecs_iterator_next(&it)) >= 0) {
+        const comp_t* v = (const comp_t*)ecs_iterator_get(&it, 0, slot);
         observed |= *v;
     }
     EXPECT(observed == (0xAA | 0xBB), "iterator_get sees both values");
@@ -116,9 +117,10 @@ static void test_iter_set_modifies_value(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     it.write_mask = 1u;                /* tree 0 receives writes */
-    while (ecs_iterator_next(&it)) {
+    int slot;
+    while ((slot = ecs_iterator_next(&it)) >= 0) {
         comp_t v = 999;
-        ecs_iterator_set(&it, 0, &v);
+        ecs_iterator_set(&it, 0, slot, &v);
     }
 
     /* Predict-mode write: dirty bit set, predicted slot holds 999, get reads
@@ -149,9 +151,10 @@ static void test_iter_write_mask_propagates(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     it.write_mask = 1u;
-    while (ecs_iterator_next(&it)) {
+    int slot;
+    while ((slot = ecs_iterator_next(&it)) >= 0) {
         comp_t v = 0xC0FFEE;
-        ecs_iterator_set(&it, 0, &v);
+        ecs_iterator_set(&it, 0, slot, &v);
     }
 
     /* After exhausting iteration, l2->dirty must reflect both l1 buckets that
@@ -175,9 +178,10 @@ static void test_iter_set_memcmp_short_circuits(void) {
     ecs_iterator_t it = {0};
     ecs_iterator_init(&it, q);
     it.write_mask = 1u;
-    while (ecs_iterator_next(&it)) {
+    int slot;
+    while ((slot = ecs_iterator_next(&it)) >= 0) {
         comp_t same = 42;              /* identical bytes */
-        ecs_iterator_set(&it, 0, &same);
+        ecs_iterator_set(&it, 0, slot, &same);
     }
     /* memcmp short-circuit: no dirty, no changed, no mask churn. */
     EXPECT(l1_of(&w->trees[0], 0, 0)->dirty   == 0, "no dirty for identical write");

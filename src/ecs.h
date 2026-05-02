@@ -283,7 +283,6 @@ typedef struct ecs_iterator_t {
     uint64_t l1_mask;
     int      l3_idx;
     int      l2_idx;
-    int      l1_idx;
     uint32_t write_mask;
     ecs_mode_t mode;           /* cached from query trees at iterator_init */
 
@@ -684,13 +683,16 @@ static inline int ecs_tree_no_dirty(const ecs_tree_t* tree) {
     return 1;
 }
 
-/* Fast path: pop next entity from current L1 block. Slow path (L1 exhausted ->
-   advance L2/L3 + dirty propagation) lives in ecs.c. */
+/* Fast path: pop next entity from current L1 block. Returns slot idx (0..63)
+   on success, -1 when iteration done. Caller passes returned slot into get/
+   set/remove — exposes ILP by letting hot loops hold multiple in-flight slots
+   simultaneously (no aliasing through iterator state). Slow path (L1 exhausted
+   -> advance L2/L3 + dirty propagation) lives in ecs.c. */
 static inline int ecs_iterator_next(ecs_iterator_t* it) {
     if (it->l1_mask) {
-        it->l1_idx   = ecs_ctz64(it->l1_mask);
+        int i = ecs_ctz64(it->l1_mask);
         it->l1_mask &= it->l1_mask - 1;
-        return 1;
+        return i;
     }
     return ecs_iterator_next_slow(it);
 }
@@ -698,13 +700,13 @@ static inline int ecs_iterator_next(ecs_iterator_t* it) {
 /* "Current frame" data -- predicted when dirty, confirmed when not. Branchless
    via slot-offset shift (+64 when dirty), gated by mode multiplier (0 in
    CONFIRMED zeroes the contribution, 1 in PREDICT keeps it). */
-static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx) {
+static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx, int slot) {
     assert(it);
     assert(tree_idx < it->query->tree_count);
+    assert(slot >= 0 && slot < 64);
     const ecs_l1_t* l1 = it->l1[tree_idx];
-    size_t   slot     = (size_t)it->l1_idx;
     uint64_t dirty_hi = (l1->dirty >> slot) & 1ULL;
-    size_t   off      = slot + (size_t)(dirty_hi << 6) * (size_t)it->mode;
+    size_t   off      = (size_t)slot + (size_t)(dirty_hi << 6) * (size_t)it->mode;
     return (char*)it->l1_data[tree_idx] + off * it->data_size[tree_idx];
 }
 
@@ -718,10 +720,11 @@ static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx
    Mask propagation: only l1->changed is touched eagerly. dirty /
    predicted_mask_any / confirmed_mask_any get derived from changed at the
    L1 block boundary in ecs_iterator_next_slow / ecs_iterator_next_block. */
-static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const void* new_value) {
+static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, int slot, const void* new_value) {
     assert(it);
     assert(new_value);
     assert(tree_idx < it->query->tree_count);
+    assert(slot >= 0 && slot < 64);
     assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_LIST) &&
            "ecs_iterator_set: LIST components not supported on iterator path; use ecs_tree_set");
 
@@ -729,17 +732,86 @@ static inline void ecs_iterator_set(ecs_iterator_t* it, uint32_t tree_idx, const
     size_t    ds   = it->data_size[tree_idx];
     assert(ds > 0 && "ecs_iterator_set called on tag component (data_size == 0)");
 
-    uint64_t  bit  = 1ULL << it->l1_idx;
-    char*     conf = (char*)it->l1_data[tree_idx] + (size_t)it->l1_idx * ds;
+    uint64_t  bit  = 1ULL << slot;
+    char*     conf = (char*)it->l1_data[tree_idx] + (size_t)slot * ds;
     uint64_t  m    = (uint64_t)it->mode;                          /* 0 or 1 */
     char*     dst  = conf + (size_t)64 * ds * (size_t)m;          /* conf when 0, pred when 1 */
 
     /* Visible value = predicted when dirty, else confirmed. */
-    uint64_t    dirty_hi = (l1->dirty >> it->l1_idx) & 1ULL;
+    uint64_t    dirty_hi = (l1->dirty >> slot) & 1ULL;
     const char* cur      = conf + (size_t)64 * ds * (size_t)dirty_hi;
     int eq = (memcmp(cur, new_value, ds) == 0);
 
     memcpy(dst, new_value, ds);
     if (eq) return;
     l1->changed |= bit;
+}
+
+/* Iterator-side remove. Mode-dispatched like ecs_iterator_set:
+     PREDICT   -> clear predicted_mask, set dirty (rolled back on rollback).
+     CONFIRMED -> clear both confirmed_mask and predicted_mask in lockstep.
+   Eager mask propagation up to L2/L3 — does not piggyback the deferred flush
+   in ecs_iterator_next_slow because that flush is OR-only and would re-add
+   the cleared bit. Clears the slot's bit in l1->changed for the same reason
+   (so a same-block iterator_set followed by iterator_remove on this slot
+   leaves predicted_mask clear after the next L1 boundary). Trade-off: the
+   removed slot does NOT register in changed-clauses for this tree (the slot
+   wouldn't iterate post-remove anyway since predicted_mask_any cleared).
+   POD-only; LIST trees must use ecs_tree_remove. Empty L1/L2 nodes are NOT
+   released here — done by ecs_tree_rollback / ecs_tree_destroy.
+   Returns 1 if a slot was present and removed, 0 otherwise. */
+static inline int ecs_iterator_remove(ecs_iterator_t* it, uint32_t tree_idx, int slot) {
+    assert(it);
+    assert(tree_idx < it->query->tree_count);
+    assert(slot >= 0 && slot < 64);
+    assert(!(it->query->trees[tree_idx]->flags & ECS_TREE_FLAG_LIST) &&
+           "ecs_iterator_remove: LIST components not supported on iterator path; use ecs_tree_remove");
+
+    ecs_l1_t* l1   = it->l1[tree_idx];
+    uint64_t  bit1 = 1ULL << slot;
+
+    /* Pre-state for return value. Normal iteration flow guarantees this is 1
+       (l1_mask only carries set bits); only zero on same-slot double-remove,
+       in which case every store below is idempotent (mask clear of cleared
+       bit, OR of already-set bit). */
+    uint64_t was_present = (l1->predicted_mask_any >> slot) & 1ULL;
+
+    uint64_t m         = (uint64_t)it->mode;            /* 0 = CONFIRMED, 1 = PREDICT */
+    uint64_t conf_mask = -(uint64_t)(1ULL - m);         /* ~0 in CONFIRMED, 0 in PREDICT */
+    uint64_t pred_bit1 = bit1 * m;                      /* 0 in CONFIRMED, bit1 in PREDICT */
+    uint64_t conf_bit1 = bit1 & conf_mask;              /* bit1 in CONFIRMED, 0 in PREDICT */
+
+    uint64_t l1_pred = l1->predicted_mask_any & ~bit1;
+    l1->predicted_mask_any  = l1_pred;
+    l1->confirmed_mask_any &= ~conf_bit1;
+    l1->dirty              |=  pred_bit1;
+    l1->changed            &= ~bit1;
+
+    /* Branchless empty-propagation: l1_empty broadcast as ~0 / 0 mask. */
+    uint64_t l1_empty = -(uint64_t)(l1_pred == 0);
+
+    ecs_l2_t* l2   = (ecs_l2_t*)it->l2[tree_idx];
+    uint64_t  bit2 = 1ULL << it->l2_idx;
+    uint64_t  conf_bit2 = bit2 & conf_mask;
+    l2->dirty              |=  bit2 * m;
+    l2->changed            |=  bit2;
+    l2->predicted_mask_all &= ~bit2;
+    l2->confirmed_mask_all &= ~conf_bit2;
+    uint64_t l2_pred = l2->predicted_mask_any & ~(bit2 & l1_empty);
+    l2->predicted_mask_any  = l2_pred;
+    l2->confirmed_mask_any &= ~(conf_bit2 & l1_empty);
+
+    uint64_t l2_empty = -(uint64_t)(l2_pred == 0);
+
+    ecs_l3_t* l3   = (ecs_l3_t*)it->l3[tree_idx];
+    uint64_t  bit3 = 1ULL << it->l3_idx;
+    uint64_t  conf_bit3 = bit3 & conf_mask;
+    l3->dirty              |=  bit3 * m;
+    l3->changed            |=  bit3;
+    l3->predicted_mask_all &= ~bit3;
+    l3->confirmed_mask_all &= ~conf_bit3;
+    l3->predicted_mask_any &= ~(bit3 & l2_empty);
+    l3->confirmed_mask_any &= ~(conf_bit3 & l2_empty);
+
+    return (int)was_present;
 }

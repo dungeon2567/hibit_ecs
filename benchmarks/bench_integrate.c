@@ -14,11 +14,12 @@ struct bench_integrate_ctx {
 };
 
 static void bench_integrate_fn(ecs_iterator_t* it) {
-    while (ecs_iterator_next(it)) {
-        const vec3_t* vel     = (const vec3_t*)ecs_iterator_get(it, 1);
-        const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(it, 0);
+    int slot;
+    while ((slot = ecs_iterator_next(it)) >= 0) {
+        const vec3_t* vel     = (const vec3_t*)ecs_iterator_get(it, 1, slot);
+        const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(it, 0, slot);
         vec3_t        pos_new = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
-        ecs_iterator_set(it, 0, &pos_new);
+        ecs_iterator_set(it, 0, slot, &pos_new);
     }
 }
 

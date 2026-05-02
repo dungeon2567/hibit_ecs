@@ -132,7 +132,6 @@ void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query) {
     it->l1_mask    = 0;
     it->l3_idx     = 0;
     it->l2_idx     = 0;
-    it->l1_idx     = 0;
     it->write_mask = 0;
     it->mode       = query->tree_count ? query->trees[0]->mode : ECS_MODE_CONFIRMED;
 
@@ -240,9 +239,9 @@ next_l2:
         iter_load_l1(it, q->tree_count);
         it->l1_mask = iter_compute_l1_mask(q, (const ecs_l1_t* const*)it->l1);
         if (it->l1_mask) {
-            it->l1_idx   = ecs_ctz64(it->l1_mask);
+            int i = ecs_ctz64(it->l1_mask);
             it->l1_mask &= it->l1_mask - 1;
-            return 1;
+            return i;
         }
         goto advance_l2;
     }
@@ -275,7 +274,7 @@ next_l2:
         it->l2_mask = iter_compute_l2_mask(q, it->l2);
         goto next_l2;
     }
-    return 0;
+    return -1;
 }
 
 /* ==========================================================================
