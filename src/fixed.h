@@ -277,55 +277,64 @@ FIXED4_VERIFY_CMP_(le, ax_[i_] <= bx_[i_])
 
 #if FIXED_BACKEND_X86
 
-typedef __m256i fixed_8_t;
+/* Self-bundled SIMD value: `.simd` is the typed __m256i for intrinsic
+   plumbing; `.e[8]` is the lane-indexed view callers use to read/write a
+   single slot. Same 32 bytes, same alignment (inherited from __m256i). */
+typedef union {
+    __m256i simd;
+    fixed_t e[8];
+} fixed_8_t;
 
-static inline fixed_8_t fixed8_zero(void)                            { return _mm256_setzero_si256(); }
-static inline fixed_8_t fixed8_set1(fixed_t x)                       { return _mm256_set1_epi32(x); }
-static inline fixed_8_t fixed8_load(const fixed_t* p)                { return _mm256_loadu_si256((const __m256i*)p); }
-static inline fixed_8_t fixed8_load_aligned(const fixed_t* p)        { return _mm256_load_si256((const __m256i*)p); }
-static inline void      fixed8_store(fixed_t* p, fixed_8_t v)        { _mm256_storeu_si256((__m256i*)p, v); }
-static inline void      fixed8_store_aligned(fixed_t* p, fixed_8_t v){ _mm256_store_si256((__m256i*)p, v); }
+static inline fixed_8_t fixed8_zero(void)                            { fixed_8_t r; r.simd = _mm256_setzero_si256(); return r; }
+static inline fixed_8_t fixed8_set1(fixed_t x)                       { fixed_8_t r; r.simd = _mm256_set1_epi32(x); return r; }
+static inline fixed_8_t fixed8_load(const fixed_t* p)                { fixed_8_t r; r.simd = _mm256_loadu_si256((const __m256i*)p); return r; }
+static inline fixed_8_t fixed8_load_aligned(const fixed_t* p)        { fixed_8_t r; r.simd = _mm256_load_si256((const __m256i*)p); return r; }
+static inline void      fixed8_store(fixed_t* p, fixed_8_t v)        { _mm256_storeu_si256((__m256i*)p, v.simd); }
+static inline void      fixed8_store_aligned(fixed_t* p, fixed_8_t v){ _mm256_store_si256((__m256i*)p, v.simd); }
 
-static inline fixed_8_t fixed8_add_impl_(fixed_8_t a, fixed_8_t b) { return _mm256_add_epi32(a, b); }
-static inline fixed_8_t fixed8_sub_impl_(fixed_8_t a, fixed_8_t b) { return _mm256_sub_epi32(a, b); }
-static inline fixed_8_t fixed8_neg_impl_(fixed_8_t a)              { return _mm256_sub_epi32(_mm256_setzero_si256(), a); }
+static inline fixed_8_t fixed8_add_impl_(fixed_8_t a, fixed_8_t b) { fixed_8_t r; r.simd = _mm256_add_epi32(a.simd, b.simd); return r; }
+static inline fixed_8_t fixed8_sub_impl_(fixed_8_t a, fixed_8_t b) { fixed_8_t r; r.simd = _mm256_sub_epi32(a.simd, b.simd); return r; }
+static inline fixed_8_t fixed8_neg_impl_(fixed_8_t a)              { fixed_8_t r; r.simd = _mm256_sub_epi32(_mm256_setzero_si256(), a.simd); return r; }
 
 /* Same trick as fixed4_mul, applied per 128-bit lane (AVX2 shuffle/blend are lane-local). */
 static inline fixed_8_t fixed8_mul_impl_(fixed_8_t a, fixed_8_t b) {
-    __m256i ae  = _mm256_mul_epi32(a, b);
-    __m256i ash = _mm256_shuffle_epi32(a, _MM_SHUFFLE(3, 3, 1, 1));
-    __m256i bsh = _mm256_shuffle_epi32(b, _MM_SHUFFLE(3, 3, 1, 1));
+    __m256i ae  = _mm256_mul_epi32(a.simd, b.simd);
+    __m256i ash = _mm256_shuffle_epi32(a.simd, _MM_SHUFFLE(3, 3, 1, 1));
+    __m256i bsh = _mm256_shuffle_epi32(b.simd, _MM_SHUFFLE(3, 3, 1, 1));
     __m256i ao  = _mm256_mul_epi32(ash, bsh);
     ae = _mm256_srli_epi64(ae, FIXED_SHIFT);
     ao = _mm256_srli_epi64(ao, FIXED_SHIFT);
     __m256i ao_shifted = _mm256_shuffle_epi32(ao, _MM_SHUFFLE(2, 2, 0, 0));
-    return _mm256_blend_epi16(ae, ao_shifted, 0xCC);
+    fixed_8_t r; r.simd = _mm256_blend_epi16(ae, ao_shifted, 0xCC); return r;
 }
 
 static inline fixed_8_t fixed8_div_impl_(fixed_8_t a, fixed_8_t b) {
-    int32_t ax[8], bx[8], rx[8];
-    _mm256_storeu_si256((__m256i*)ax, a);
-    _mm256_storeu_si256((__m256i*)bx, b);
-    for (int i = 0; i < 8; ++i) rx[i] = fixed_div(ax[i], bx[i]);
-    return _mm256_loadu_si256((const __m256i*)rx);
+    fixed_8_t r;
+    for (int i = 0; i < 8; ++i) r.e[i] = fixed_div(a.e[i], b.e[i]);
+    return r;
 }
 
 /* Compare ops return an 8-bit mask: bit i set iff lane i true. */
-static inline uint8_t fixed8_eq_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, b))); }
-static inline uint8_t fixed8_gt_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(a, b))); }
-static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(b, a))); }
-static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)~_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(b, a))); }
-static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)~_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(a, b))); }
+static inline uint8_t fixed8_eq_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a.simd, b.simd))); }
+static inline uint8_t fixed8_gt_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(a.simd, b.simd))); }
+static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(b.simd, a.simd))); }
+static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)~_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(b.simd, a.simd))); }
+static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)~_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(a.simd, b.simd))); }
 
 #elif FIXED_BACKEND_NEON
 
-/* NEON is 128-bit; 8-wide is two stacked 4-wide vectors. */
-typedef struct { int32x4_t lo, hi; } fixed_8_t;
+/* NEON is 128-bit; 8-wide is two stacked 4-wide vectors. The anonymous
+   struct keeps `a.lo` / `a.hi` working in the impl_ functions while the
+   union also exposes a flat `.e[8]` lane view for the public API. */
+typedef union {
+    struct { int32x4_t lo, hi; };
+    fixed_t e[8];
+} fixed_8_t;
 
-static inline fixed_8_t fixed8_zero(void)                            { fixed_8_t r = { vdupq_n_s32(0), vdupq_n_s32(0) }; return r; }
-static inline fixed_8_t fixed8_set1(fixed_t x)                       { fixed_8_t r = { vdupq_n_s32(x), vdupq_n_s32(x) }; return r; }
-static inline fixed_8_t fixed8_load(const fixed_t* p)                { fixed_8_t r = { vld1q_s32(p), vld1q_s32(p + 4) }; return r; }
-static inline fixed_8_t fixed8_load_aligned(const fixed_t* p)        { fixed_8_t r = { vld1q_s32(p), vld1q_s32(p + 4) }; return r; }
+static inline fixed_8_t fixed8_zero(void)                            { fixed_8_t r; r.lo = vdupq_n_s32(0); r.hi = vdupq_n_s32(0); return r; }
+static inline fixed_8_t fixed8_set1(fixed_t x)                       { fixed_8_t r; r.lo = vdupq_n_s32(x); r.hi = vdupq_n_s32(x); return r; }
+static inline fixed_8_t fixed8_load(const fixed_t* p)                { fixed_8_t r; r.lo = vld1q_s32(p); r.hi = vld1q_s32(p + 4); return r; }
+static inline fixed_8_t fixed8_load_aligned(const fixed_t* p)        { fixed_8_t r; r.lo = vld1q_s32(p); r.hi = vld1q_s32(p + 4); return r; }
 static inline void      fixed8_store(fixed_t* p, fixed_8_t v)        { vst1q_s32(p, v.lo); vst1q_s32(p + 4, v.hi); }
 static inline void      fixed8_store_aligned(fixed_t* p, fixed_8_t v){ vst1q_s32(p, v.lo); vst1q_s32(p + 4, v.hi); }
 
@@ -350,30 +359,30 @@ static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b)  { return (uint8
 
 #else /* FIXED_BACKEND_SCALAR */
 
-typedef struct { int32_t v[8]; } fixed_8_t;
+typedef struct { fixed_t e[8]; } fixed_8_t;
 
 static inline fixed_8_t fixed8_zero(void)                       { fixed_8_t r = {{0}}; return r; }
 static inline fixed_8_t fixed8_set1(fixed_t x)                  { fixed_8_t r = {{x,x,x,x,x,x,x,x}}; return r; }
-static inline fixed_8_t fixed8_load(const fixed_t* p)           { fixed_8_t r; memcpy(r.v, p, 8 * sizeof(fixed_t)); return r; }
-static inline fixed_8_t fixed8_load_aligned(const fixed_t* p)   { fixed_8_t r; memcpy(r.v, p, 8 * sizeof(fixed_t)); return r; }
-static inline void      fixed8_store(fixed_t* p, fixed_8_t v)        { memcpy(p, v.v, 8 * sizeof(fixed_t)); }
-static inline void      fixed8_store_aligned(fixed_t* p, fixed_8_t v){ memcpy(p, v.v, 8 * sizeof(fixed_t)); }
+static inline fixed_8_t fixed8_load(const fixed_t* p)           { fixed_8_t r; memcpy(r.e, p, 8 * sizeof(fixed_t)); return r; }
+static inline fixed_8_t fixed8_load_aligned(const fixed_t* p)   { fixed_8_t r; memcpy(r.e, p, 8 * sizeof(fixed_t)); return r; }
+static inline void      fixed8_store(fixed_t* p, fixed_8_t v)        { memcpy(p, v.e, 8 * sizeof(fixed_t)); }
+static inline void      fixed8_store_aligned(fixed_t* p, fixed_8_t v){ memcpy(p, v.e, 8 * sizeof(fixed_t)); }
 
-#define FIXED8_LANEWISE_(OP) do { fixed_8_t r; for (int i = 0; i < 8; ++i) r.v[i] = (OP); return r; } while (0)
+#define FIXED8_LANEWISE_(OP) do { fixed_8_t r; for (int i = 0; i < 8; ++i) r.e[i] = (OP); return r; } while (0)
 
-static inline fixed_8_t fixed8_add_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_((fixed_t)((uint32_t)a.v[i] + (uint32_t)b.v[i])); }
-static inline fixed_8_t fixed8_sub_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_((fixed_t)((uint32_t)a.v[i] - (uint32_t)b.v[i])); }
-static inline fixed_8_t fixed8_neg_impl_(fixed_8_t a)              { FIXED8_LANEWISE_((fixed_t)(0u - (uint32_t)a.v[i])); }
-static inline fixed_8_t fixed8_mul_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_(fixed_mul(a.v[i], b.v[i])); }
-static inline fixed_8_t fixed8_div_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_(fixed_div(a.v[i], b.v[i])); }
+static inline fixed_8_t fixed8_add_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_((fixed_t)((uint32_t)a.e[i] + (uint32_t)b.e[i])); }
+static inline fixed_8_t fixed8_sub_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_((fixed_t)((uint32_t)a.e[i] - (uint32_t)b.e[i])); }
+static inline fixed_8_t fixed8_neg_impl_(fixed_8_t a)              { FIXED8_LANEWISE_((fixed_t)(0u - (uint32_t)a.e[i])); }
+static inline fixed_8_t fixed8_mul_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_(fixed_mul(a.e[i], b.e[i])); }
+static inline fixed_8_t fixed8_div_impl_(fixed_8_t a, fixed_8_t b) { FIXED8_LANEWISE_(fixed_div(a.e[i], b.e[i])); }
 
 #define FIXED8_MASK_(OP) do { uint8_t m = 0; for (int i = 0; i < 8; ++i) if (OP) m |= (uint8_t)(1u << i); return m; } while (0)
 
-static inline uint8_t fixed8_eq_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.v[i] == b.v[i]); }
-static inline uint8_t fixed8_gt_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.v[i] >  b.v[i]); }
-static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.v[i] <  b.v[i]); }
-static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.v[i] >= b.v[i]); }
-static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.v[i] <= b.v[i]); }
+static inline uint8_t fixed8_eq_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] == b.e[i]); }
+static inline uint8_t fixed8_gt_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] >  b.e[i]); }
+static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] <  b.e[i]); }
+static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] >= b.e[i]); }
+static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] <= b.e[i]); }
 
 #undef FIXED8_MASK_
 #undef FIXED8_LANEWISE_

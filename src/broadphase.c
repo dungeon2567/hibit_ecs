@@ -123,16 +123,16 @@ void broadphase_insert(broadphase_t* bp, uint32_t id, aabb_t aabb) {
 
 /* SIMD overlap: 8 items vs 1 query AABB. Six fixed8 compares + five ANDs.
    AND with presence_mask zeros out unoccupied lanes so undefined slot data
-   cannot produce false hits. The .simd union view is the lane storage --
-   no separate load is needed. */
+   cannot produce false hits. fixed_8_t lane storage feeds the compare
+   intrinsics directly -- no separate load needed. */
 static inline uint8_t bp_overlap_mask(const broadphase_node_t* n, aabb_t q) {
     fixed_8_t qmin_x = fixed8_set1(q.min.x), qmax_x = fixed8_set1(q.max.x);
     fixed_8_t qmin_y = fixed8_set1(q.min.y), qmax_y = fixed8_set1(q.max.y);
     fixed_8_t qmin_z = fixed8_set1(q.min.z), qmax_z = fixed8_set1(q.max.z);
 
-    uint8_t m = fixed8_le(n->min_x.simd, qmax_x) & fixed8_ge(n->max_x.simd, qmin_x)
-              & fixed8_le(n->min_y.simd, qmax_y) & fixed8_ge(n->max_y.simd, qmin_y)
-              & fixed8_le(n->min_z.simd, qmax_z) & fixed8_ge(n->max_z.simd, qmin_z);
+    uint8_t m = fixed8_le(n->min_x, qmax_x) & fixed8_ge(n->max_x, qmin_x)
+              & fixed8_le(n->min_y, qmax_y) & fixed8_ge(n->max_y, qmin_y)
+              & fixed8_le(n->min_z, qmax_z) & fixed8_ge(n->max_z, qmin_z);
     return m & n->presence_mask;
 }
 

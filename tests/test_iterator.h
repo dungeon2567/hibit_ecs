@@ -31,9 +31,10 @@ static void test_iter_atom_count(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
+    ecs_iterator_init(&it, q, 0);
     int count = 0;
-    while (ecs_iterator_next(&it) >= 0) count++;
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) count += ecs_popcount64(mask);
     EXPECT(count == 4, "iterator visits all 4 Pos entities");
 
     ecs_free(q);
@@ -52,11 +53,16 @@ static void test_iter_and_intersection(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & Vel");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
-    int count = 0, observed_l1 = -1, slot;
-    while ((slot = ecs_iterator_next(&it)) >= 0) {
-        observed_l1 = slot;
-        count++;
+    ecs_iterator_init(&it, q, 0);
+    int count = 0, observed_l1 = -1;
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            observed_l1 = slot;
+            count++;
+        }
     }
     EXPECT(count == 1, "Pos & Vel intersection = 1");
     EXPECT(observed_l1 == 1, "intersection at slot 1");
@@ -75,9 +81,10 @@ static void test_iter_exclude(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & !Vel");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
+    ecs_iterator_init(&it, q, 0);
     int count = 0;
-    while (ecs_iterator_next(&it) >= 0) count++;
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) count += ecs_popcount64(mask);
     EXPECT(count == 2, "Pos & !Vel = 2");
 
     ecs_free(q);
@@ -92,12 +99,16 @@ static void test_iter_get_reads_value(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
+    ecs_iterator_init(&it, q, 0);
     uint32_t observed = 0;
-    int slot;
-    while ((slot = ecs_iterator_next(&it)) >= 0) {
-        const comp_t* v = (const comp_t*)ecs_iterator_get(&it, 0, slot);
-        observed |= *v;
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            const comp_t* v = (const comp_t*)ecs_iterator_get(&it, 0, slot);
+            observed |= *v;
+        }
     }
     EXPECT(observed == (0xAA | 0xBB), "iterator_get sees both values");
 
@@ -115,11 +126,14 @@ static void test_iter_set_modifies_value(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
-    it.write_mask = 1u;                /* tree 0 receives writes */
-    int slot;
-    while ((slot = ecs_iterator_next(&it)) >= 0) {
-        *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 999;
+    ecs_iterator_init(&it, q, 1u);   /* tree 0 receives writes */
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 999;
+        }
     }
 
     /* Predict-mode write: dirty bit set, predicted slot holds 999, get reads
@@ -148,11 +162,14 @@ static void test_iter_write_mask_propagates(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
-    it.write_mask = 1u;
-    int slot;
-    while ((slot = ecs_iterator_next(&it)) >= 0) {
-        *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 0xC0FFEE;
+    ecs_iterator_init(&it, q, 1u);
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 0xC0FFEE;
+        }
     }
 
     /* After exhausting iteration, l2->dirty must reflect both l1 buckets that

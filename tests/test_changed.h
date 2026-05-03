@@ -6,7 +6,7 @@
 /* `changed` semantics:
      - per-tick delta (cleared by ecs_tree_begin_tick / ecs_world_begin_tick)
      - set unconditionally (both CONFIRMED + PREDICT modes)
-     - propagated bottom-up via ecs_iterator_next_slow's write_mask path
+     - propagated bottom-up via ecs_iterator_next_block's write_mask path
      - cleared by rollback on dirty-walked nodes (predicted-only writes only)
      - reset by deserialize (no leak across snapshot loads) */
 
@@ -94,11 +94,14 @@ static void test_changed_iter_set_propagates(void) {
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, q);
-    it.write_mask = 1u;
-    int slot;
-    while ((slot = ecs_iterator_next(&it)) >= 0) {
-        *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 0xBEEF;
+    ecs_iterator_init(&it, q, 1u);
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(&it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            *(comp_t*)ecs_iterator_get_mut(&it, 0, slot) = 0xBEEF;
+        }
     }
 
     /* l1 changed set directly by iter_set; l2 / l3 set by write_mask propagation. */

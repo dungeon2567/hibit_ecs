@@ -264,14 +264,16 @@ typedef struct ecs_iterator_t {
 
     uint64_t l3_mask;
     uint64_t l2_mask;
-    uint64_t l1_mask;
-    int      l3_idx;
+    int      l3_idx;                 /* -1 sentinel = no L1 block loaded yet (init / first call) */
     int      l2_idx;
-    uint32_t write_mask;
-    ecs_mode_t mode;           /* cached from query trees at iterator_init */
+    /* write_mask: per-query-slot mask (one bit per query->trees[i]). Const
+       post-init (compiler hoists across iter_set's l1->changed/dirty stores).
+       Set via cast in ecs_iterator_init. */
+    const uint32_t   write_mask;
+    const ecs_mode_t mode;           /* cached from query trees at iterator_init */
 
-    ecs_world_t* world;
-    uint8_t      world_tree_idx[ECS_QUERY_MAX_TERMS];
+    const ecs_world_t* const world;
+    const uint8_t            world_tree_idx[ECS_QUERY_MAX_TERMS];
 
     const ecs_l3_t* l3[ECS_QUERY_MAX_TERMS];
     const ecs_l2_t* l2[ECS_QUERY_MAX_TERMS];
@@ -525,8 +527,16 @@ void     ecs_tree_buffer_clear(ecs_tree_t* tree, int index);
    Returns 1 if a slot was actually removed, 0 if it wasn't present. */
 int      ecs_tree_remove(ecs_tree_t* tree, int index);
 
-void     ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query);
-int      ecs_iterator_next_slow(ecs_iterator_t* it);
+/* write_mask: per-query-slot bitmask (bit i set â‡’ writes through query->trees[i]).
+   Pass 0 for read-only iterations. */
+void     ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query, uint32_t write_mask);
+/* Returns the L1 hit mask for the next non-empty block (0 = iteration done).
+   Caller iterates the mask: `while (mask) { int i = ecs_ctz64(mask); mask &= mask - 1; ... }`.
+   Each call propagates dirty/changed bits from the prior L1 up to L2/L3, then
+   advances forward until a non-empty L1 block is found. Tree base pointers
+   referenced by ecs_iterator_get / get_mut / remove are updated in-place; the
+   caller's local `mask` is the only per-iteration state. */
+uint64_t ecs_iterator_next_block(ecs_iterator_t* it);
 /* View-aware CRC. Alive set = predicted_mask_any (mirrors confirmed in
    CONFIRMED mode, is the live speculative set in PREDICT). Per-slot bytes:
    predicted bytes when dirty bit set, else confirmed bytes. Tick excluded
@@ -535,6 +545,7 @@ int      ecs_iterator_next_slow(ecs_iterator_t* it);
    predicted simulation and confirmed replay. */
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
+
 
 #ifdef __cplusplus
 }
@@ -696,20 +707,6 @@ static inline int ecs_tree_no_dirty(const ecs_tree_t* tree) {
     return 1;
 }
 
-/* Fast path: pop next entity from current L1 block. Returns slot idx (0..63)
-   on success, -1 when iteration done. Caller passes returned slot into get/
-   set/remove â€” exposes ILP by letting hot loops hold multiple in-flight slots
-   simultaneously (no aliasing through iterator state). Slow path (L1 exhausted
-   -> advance L2/L3 + dirty propagation) lives in ecs.c. */
-static inline int ecs_iterator_next(ecs_iterator_t* it) {
-    if (it->l1_mask) {
-        int i = ecs_ctz64(it->l1_mask);
-        it->l1_mask &= it->l1_mask - 1;
-        return i;
-    }
-    return ecs_iterator_next_slow(it);
-}
-
 /* "Current frame" data -- predicted when dirty, confirmed when not. Branchless
    via slot-offset shift (+64 when dirty), gated by mode multiplier (0 in
    CONFIRMED zeroes the contribution, 1 in PREDICT keeps it). */
@@ -727,7 +724,7 @@ static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx
    the returned ptr; engine assumes bytes are changing (no eq-check). Sets
    l1->changed bit eagerly; dirty / predicted_mask_any / confirmed_mask_any
    get derived from changed at the L1 block boundary in
-   ecs_iterator_next_slow. POD only â€” BUFFER/tag use the tree-level API.
+   ecs_iterator_next_block. POD only â€” BUFFER/tag use the tree-level API.
 
    Caller should only call when the value is actually changing (calling on
    an unchanged slot spuriously promotes dirty/changed bits, breaking
@@ -754,7 +751,7 @@ static inline void* ecs_iterator_get_mut(ecs_iterator_t* it, uint32_t tree_idx, 
      PREDICT   -> clear predicted_mask, set dirty (rolled back on rollback).
      CONFIRMED -> clear both confirmed_mask and predicted_mask in lockstep.
    Eager mask propagation up to L2/L3 â€” does not piggyback the deferred flush
-   in ecs_iterator_next_slow because that flush is OR-only and would re-add
+   in ecs_iterator_next_block because that flush is OR-only and would re-add
    the cleared bit. Clears the slot's bit in l1->changed for the same reason
    (so a same-block iterator_set followed by iterator_remove on this slot
    leaves predicted_mask clear after the next L1 boundary). Trade-off: the
@@ -826,13 +823,13 @@ static inline int ecs_iterator_remove(ecs_iterator_t* it, uint32_t tree_idx, int
 
    Mask propagation: l1->changed and l1->dirty are set inline (dirty drives
    the COW guard). predicted_mask_any/confirmed_mask_any propagation uses the
-   same deferred flush that iterator_get_mut relies on (ecs_iterator_next_slow
+   same deferred flush that iterator_get_mut relies on (ecs_iterator_next_block
    ORs l1->changed into them at the L1 boundary). Iterator only visits slots
    already in predicted_mask_any, so re-OR'ing is a no-op for these ops.
 
-   Caller must set it->write_mask to cover this tree before the iteration.
-   Returned writes go through the slot's ecs_buffer_t header. POD-only ops like
-   ecs_iterator_get_mut still assert non-BUFFER. */
+   Caller must set this tree's bit in the write_mask argument to
+   ecs_iterator_init. Returned writes go through the slot's ecs_buffer_t header.
+   POD-only ops like ecs_iterator_get_mut still assert non-BUFFER. */
 static inline void ecs_iterator_buffer_push(ecs_iterator_t* it, uint32_t tree_idx,
                                           int slot, size_t elem_size, const void* value) {
     assert(it && elem_size && value);

@@ -14,13 +14,17 @@ struct bench_integrate_ctx {
 };
 
 static void bench_integrate_fn(ecs_iterator_t* it) {
-    int slot;
-    while ((slot = ecs_iterator_next(it)) >= 0) {
-        const vec3_t* vel     = (const vec3_t*)ecs_iterator_get(it, 1, slot);
-        const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(it, 0, slot);
-        vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
-        if (!vec3_eq(new_pos, *pos_cur)) {
-            *(vec3_t*)ecs_iterator_get_mut(it, 0, slot) = new_pos;
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            const vec3_t* vel     = (const vec3_t*)ecs_iterator_get(it, 1, slot);
+            const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(it, 0, slot);
+            vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
+            if (!vec3_eq(new_pos, *pos_cur)) {
+                *(vec3_t*)ecs_iterator_get_mut(it, 0, slot) = new_pos;
+            }
         }
     }
 }
@@ -54,6 +58,7 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
         }
     }
 
+    ctx->query.world              = ctx->w;
     ctx->query.tree_count         = 2;
     ctx->query.trees[0]           = &ctx->w->trees[0];
     ctx->query.trees[1]           = &ctx->w->trees[1];
@@ -64,8 +69,7 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
        (signed wrap is fine; benchmarks build without UBSan). */
     for (int i = 0; i < 70; i++) {
         ecs_iterator_t it = {0};
-        ecs_iterator_init(&it, &ctx->query);
-        it.write_mask = 1u;
+        ecs_iterator_init(&it, &ctx->query, 1u);
         bench_integrate_fn(&it);
     }
 
@@ -74,8 +78,7 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
 
 void bench_integrate_iter(bench_integrate_ctx* ctx) {
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, &ctx->query);
-    it.write_mask = 1u;
+    ecs_iterator_init(&it, &ctx->query, 1u);
     bench_integrate_fn(&it);
 }
 
@@ -204,10 +207,14 @@ struct bench_sum_pos_ctx {
 
 static void bench_sum_pos_fn(ecs_iterator_t* it, vec3_t* out) {
     vec3_t s = vec3_zero();
-    int slot;
-    while ((slot = ecs_iterator_next(it)) >= 0) {
-        const vec3_t* p = (const vec3_t*)ecs_iterator_get(it, 0, slot);
-        s = vec3_add(s, *p);
+    uint64_t mask;
+    while ((mask = ecs_iterator_next_block(it))) {
+        while (mask) {
+            int slot = ecs_ctz64(mask);
+            mask &= mask - 1;
+            const vec3_t* p = (const vec3_t*)ecs_iterator_get(it, 0, slot);
+            s = vec3_add(s, *p);
+        }
     }
     *out = s;
 }
@@ -240,6 +247,7 @@ bench_sum_pos_ctx* bench_sum_pos_setup(int n_total, int n_match) {
         }
     }
 
+    ctx->query.world              = ctx->w;
     ctx->query.tree_count         = 2;
     ctx->query.trees[0]           = &ctx->w->trees[0];
     ctx->query.trees[1]           = &ctx->w->trees[1];
@@ -249,22 +257,24 @@ bench_sum_pos_ctx* bench_sum_pos_setup(int n_total, int n_match) {
     /* Advance pos once so the sum reads post-integrate state. */
     {
         ecs_iterator_t it = {0};
-        ecs_iterator_init(&it, &ctx->query);
-        it.write_mask = 1u;
-        int slot;
-        while ((slot = ecs_iterator_next(&it)) >= 0) {
-            const vec3_t* vel_p   = (const vec3_t*)ecs_iterator_get(&it, 1, slot);
-            const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(&it, 0, slot);
-            vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel_p, BENCH_DT));
-            *(vec3_t*)ecs_iterator_get_mut(&it, 0, slot) = new_pos;
+        ecs_iterator_init(&it, &ctx->query, 1u);
+        uint64_t mask;
+        while ((mask = ecs_iterator_next_block(&it))) {
+            while (mask) {
+                int slot = ecs_ctz64(mask);
+                mask &= mask - 1;
+                const vec3_t* vel_p   = (const vec3_t*)ecs_iterator_get(&it, 1, slot);
+                const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(&it, 0, slot);
+                vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel_p, BENCH_DT));
+                *(vec3_t*)ecs_iterator_get_mut(&it, 0, slot) = new_pos;
+            }
         }
     }
 
     /* Cache warmup. */
     for (int k = 0; k < 70; k++) {
         ecs_iterator_t it = {0};
-        ecs_iterator_init(&it, &ctx->query);
-        it.write_mask = 0u;
+        ecs_iterator_init(&it, &ctx->query, 0u);
         bench_sum_pos_fn(&it, &ctx->sink);
     }
 
@@ -273,8 +283,7 @@ bench_sum_pos_ctx* bench_sum_pos_setup(int n_total, int n_match) {
 
 void bench_sum_pos_iter(bench_sum_pos_ctx* ctx) {
     ecs_iterator_t it = {0};
-    ecs_iterator_init(&it, &ctx->query);
-    it.write_mask = 0u;
+    ecs_iterator_init(&it, &ctx->query, 0u);
     bench_sum_pos_fn(&it, &ctx->sink);
 }
 
