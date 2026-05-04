@@ -21,6 +21,13 @@ static aabb_t bp_aabb_xyz_(int x, int y, int z, int half) {
     return aabb_from_center_extents(c, e);
 }
 
+static inline broadphase_object_t bp_obj_(uint32_t id) {
+    broadphase_object_t o;
+    o.transform = transform_identity();
+    o.id        = id;
+    return o;
+}
+
 static int bp_u32_cmp_(const void* a, const void* b) {
     uint32_t ax = *(const uint32_t*)a, bx = *(const uint32_t*)b;
     return (ax > bx) - (ax < bx);
@@ -67,7 +74,7 @@ static void test_broadphase_empty_build(void) {
 static void test_broadphase_insert_query_single(void) {
     broadphase_t bp; broadphase_init(&bp, 16);
 
-    broadphase_insert(&bp, 42, bp_aabb_xyz_(0, 0, 0, 1));
+    broadphase_insert(&bp, bp_obj_(42), bp_aabb_xyz_(0, 0, 0, 1));
     broadphase_build(&bp);
     EXPECT(bp.has_tree == 1, "tree built");
     EXPECT(bp.n_nodes  == 1, "single item -> single leaf node");
@@ -86,7 +93,7 @@ static void test_broadphase_insert_query_single(void) {
 static void test_broadphase_query_aabb_miss(void) {
     /* Disjoint AABBs: SIMD overlap mask must reject. */
     broadphase_t bp; broadphase_init(&bp, 16);
-    broadphase_insert(&bp, 1, bp_aabb_xyz_(0, 0, 0, 1));   /* [-1,1] */
+    broadphase_insert(&bp, bp_obj_(1), bp_aabb_xyz_(0, 0, 0, 1));   /* [-1,1] */
     broadphase_build(&bp);
 
     broadphase_iter_t it;
@@ -104,7 +111,7 @@ static void test_broadphase_leaf_overflow(void) {
 
     enum { N = 20 };
     for (uint32_t i = 0; i < N; ++i)
-        broadphase_insert(&bp, 100u + i, bp_aabb_xyz_(0, 0, 0, 1));
+        broadphase_insert(&bp, bp_obj_(100u + i), bp_aabb_xyz_(0, 0, 0, 1));
     broadphase_build(&bp);
 
     /* leaves = ceil(20/8) = 3, plus 1 root internal -> 4 nodes total. */
@@ -139,7 +146,7 @@ static void test_broadphase_multi_level(void) {
     for (uint32_t i = 0; i < N; ++i) {
         int x = (int)(i % 10);
         int y = (int)((i / 10) % 10);
-        broadphase_insert(&bp, 1u + i, bp_aabb_xyz_(x, y, 0, 1));
+        broadphase_insert(&bp, bp_obj_(1u + i), bp_aabb_xyz_(x, y, 0, 1));
     }
     broadphase_build(&bp);
     EXPECT(bp.n_nodes >= 13 + 2, "leaves(13) + L1(2) + root or merged");
@@ -175,9 +182,9 @@ static void test_broadphase_aabb_filter(void) {
     fixed_t f05 = fixed_from_parts(0, 5);
     vec3_t  e   = vec3_make(f05, f05, f05);
 
-    broadphase_insert(&bp, 10, aabb_from_center_extents(vec3_make(0, 0, 0), e));
-    broadphase_insert(&bp, 11, aabb_from_center_extents(vec3_make(fixed_from_int(3), 0, 0), e));
-    broadphase_insert(&bp, 12, aabb_from_center_extents(vec3_make(0, fixed_from_int(3), 0), e));
+    broadphase_insert(&bp, bp_obj_(10), aabb_from_center_extents(vec3_make(0, 0, 0), e));
+    broadphase_insert(&bp, bp_obj_(11), aabb_from_center_extents(vec3_make(fixed_from_int(3), 0, 0), e));
+    broadphase_insert(&bp, bp_obj_(12), aabb_from_center_extents(vec3_make(0, fixed_from_int(3), 0), e));
     broadphase_build(&bp);
 
     aabb_t q = aabb_from_center_extents(vec3_make(fixed_from_int(3), 0, 0), e);
@@ -201,7 +208,7 @@ static void test_broadphase_clear_reuse(void) {
     broadphase_t bp; broadphase_init(&bp, 64);
 
     for (uint32_t i = 0; i < 30; ++i)
-        broadphase_insert(&bp, 1000u + i, bp_aabb_xyz_(0, 0, 0, 1));
+        broadphase_insert(&bp, bp_obj_(1000u + i), bp_aabb_xyz_(0, 0, 0, 1));
     broadphase_build(&bp);
     EXPECT(bp.has_tree == 1, "tree built");
     EXPECT(bp.n_items  == 30, "items recorded");
@@ -217,7 +224,7 @@ static void test_broadphase_clear_reuse(void) {
     uint32_t id;
     EXPECT(broadphase_query_next(&it, &id) == 0, "no items visible after clear/build");
 
-    broadphase_insert(&bp, 99u, bp_aabb_xyz_(0, 0, 0, 1));
+    broadphase_insert(&bp, bp_obj_(99u), bp_aabb_xyz_(0, 0, 0, 1));
     broadphase_build(&bp);
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 2));
     int got = broadphase_query_next(&it, &id);
@@ -231,7 +238,7 @@ static void test_broadphase_query_far_away(void) {
     /* Query AABB far from any item. Whole tree pruned at the root. */
     broadphase_t bp; broadphase_init(&bp, 16);
 
-    broadphase_insert(&bp, 1, bp_aabb_xyz_(2, 2, 2, 1));
+    broadphase_insert(&bp, bp_obj_(1), bp_aabb_xyz_(2, 2, 2, 1));
     broadphase_build(&bp);
 
     aabb_t q = {
@@ -258,7 +265,7 @@ static void test_broadphase_full_grid(void) {
         int cx = 4 * x + 2;
         int cy = 4 * y + 2;
         int cz = 4 * z + 2;
-        broadphase_insert(&bp, id_counter++, bp_aabb_xyz_(cx, cy, cz, 1));
+        broadphase_insert(&bp, bp_obj_(id_counter++), bp_aabb_xyz_(cx, cy, cz, 1));
     }
     broadphase_build(&bp);
     EXPECT(id_counter == 27, "27 items inserted");
@@ -293,7 +300,7 @@ static void test_broadphase_negative_coords(void) {
        the morton quantization origin is automatically item-relative. */
     broadphase_t bp; broadphase_init(&bp, 16);
 
-    broadphase_insert(&bp, 5, bp_aabb_xyz_(-10, -10, -10, 1));
+    broadphase_insert(&bp, bp_obj_(5), bp_aabb_xyz_(-10, -10, -10, 1));
     broadphase_build(&bp);
 
     broadphase_iter_t it;
@@ -310,7 +317,7 @@ static void test_broadphase_query_before_build(void) {
     /* Insert without build -> has_tree=0 -> queries find nothing. Catches
        missed broadphase_build calls instead of returning stale data. */
     broadphase_t bp; broadphase_init(&bp, 16);
-    broadphase_insert(&bp, 7, bp_aabb_xyz_(0, 0, 0, 1));
+    broadphase_insert(&bp, bp_obj_(7), bp_aabb_xyz_(0, 0, 0, 1));
 
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 4));

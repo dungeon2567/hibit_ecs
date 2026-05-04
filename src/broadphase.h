@@ -34,8 +34,7 @@ typedef struct broadphase_node_t {
     fixed_8_t min_z;
     fixed_8_t max_z;
     uint8_t   presence_mask;     /* bit i set iff slot i occupied */
-    uint8_t   is_leaf;           /* 1 = ids[i] is item id; 0 = ids[i] is child node index */
-    //uint8_t   pad_[2];
+    uint8_t   object_mask;       /* bit i set iff ids[i] indexes objects[]; (presence & ~object) bits index nodes[] */
     uint32_t  ids[8];
 } broadphase_node_t;
 
@@ -66,6 +65,11 @@ typedef struct {
     uint32_t  root;              /* index of root node (valid iff has_tree) */
     uint8_t   has_tree;
 
+    /* Object arena: leaf node ids[] (where object_mask bit set) index here. */
+    broadphase_object_t* objects;
+    uint32_t  n_objects;
+    uint32_t  object_cap;
+
     /* Sort scratch -- sized to item_cap. */
     uint32_t* morton;
     uint32_t* perm;
@@ -78,8 +82,8 @@ typedef struct {
 typedef struct {
     const broadphase_t* bp;
     const aabb_t q;              /* cached for the per-node SIMD splat; init only via broadphase_query_begin */
-    const broadphase_node_t* node;   /* current leaf node yielding hits */
-    uint8_t  mask;               /* unconsumed hits in current leaf */
+    const broadphase_node_t* node;   /* current node holding stashed object hits */
+    uint8_t  mask;               /* unconsumed object-lane hits at it->node (child lanes already pushed) */
     int      sp;
     uint32_t stack[BROADPHASE_STACK_MAX];
 } broadphase_iter_t;
@@ -93,9 +97,10 @@ void broadphase_destroy(broadphase_t* bp);
    overwritten on the next round of inserts/build. */
 void broadphase_clear  (broadphase_t* bp);
 
-/* Append (id, aabb) to the item buffer. The tree is invalidated; the caller
-   must call broadphase_build before query_begin to make the new item visible. */
-void broadphase_insert (broadphase_t* bp, uint32_t id, aabb_t aabb);
+/* Append (obj, aabb) to the item buffer. obj.id is the caller-facing external
+   id; the tree's leaf ids[] index objects[] internally. The tree is invalidated;
+   the caller must call broadphase_build before query_begin. */
+void broadphase_insert (broadphase_t* bp, broadphase_object_t obj, aabb_t aabb);
 
 /* Build the tree from the current item buffer. Must be called between the
    last insert of the tick and the first query. Cheap to call on an empty
@@ -116,7 +121,7 @@ static inline int broadphase_query_next(broadphase_iter_t* it, uint32_t* out_id)
     uint8_t m = it->mask;
     if (m) {
         int b = ecs_ctz32((uint32_t)m);
-        *out_id = it->node->ids[b];
+        *out_id = it->bp->objects[it->node->ids[b]].id;
         it->mask = (uint8_t)(m & (m - 1u));
         return 1;
     }
