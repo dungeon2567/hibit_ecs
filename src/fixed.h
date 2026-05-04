@@ -57,6 +57,9 @@ static inline fixed_t fixed_div(fixed_t a, fixed_t b) {
     return (fixed_t)(((int64_t)a * (int64_t)FIXED_ONE) / (int64_t)b);
 }
 
+static inline fixed_t fixed_min(fixed_t a, fixed_t b) { return a < b ? a : b; }
+static inline fixed_t fixed_max(fixed_t a, fixed_t b) { return a > b ? a : b; }
+
 /* ---------- backend selection ---------- */
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -321,6 +324,27 @@ static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_
 static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)~_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(b.simd, a.simd))); }
 static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b) { return (uint8_t)~_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(a.simd, b.simd))); }
 
+/* Horizontal min/max: collapse all 8 lanes to a scalar. Reduction ladder
+   8 -> 4 -> 2 -> 1: AVX2 split into two 128-bit halves, SSE4.1 _mm_min_epi32
+   pair-min, then byte-shift the 128-bit reg to feed lower lanes against
+   upper. _mm_srli_si128 by 8 / 4 bytes equals 2 / 1 int32-lane shifts. */
+static inline fixed_t fixed8_min_impl_(fixed_8_t v) {
+    __m128i lo = _mm256_castsi256_si128(v.simd);
+    __m128i hi = _mm256_extracti128_si256(v.simd, 1);
+    __m128i m  = _mm_min_epi32(lo, hi);
+    m = _mm_min_epi32(m, _mm_srli_si128(m, 8));
+    m = _mm_min_epi32(m, _mm_srli_si128(m, 4));
+    return (fixed_t)_mm_cvtsi128_si32(m);
+}
+static inline fixed_t fixed8_max_impl_(fixed_8_t v) {
+    __m128i lo = _mm256_castsi256_si128(v.simd);
+    __m128i hi = _mm256_extracti128_si256(v.simd, 1);
+    __m128i m  = _mm_max_epi32(lo, hi);
+    m = _mm_max_epi32(m, _mm_srli_si128(m, 8));
+    m = _mm_max_epi32(m, _mm_srli_si128(m, 4));
+    return (fixed_t)_mm_cvtsi128_si32(m);
+}
+
 #elif FIXED_BACKEND_NEON
 
 /* NEON is 128-bit; 8-wide is two stacked 4-wide vectors. The anonymous
@@ -355,6 +379,20 @@ static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b)  { return (uint8
 static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b)  { return (uint8_t)(fixed4_ge_impl_(a.lo, b.lo) | (fixed4_ge_impl_(a.hi, b.hi) << 4)); }
 static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b)  { return (uint8_t)(fixed4_le_impl_(a.lo, b.lo) | (fixed4_le_impl_(a.hi, b.hi) << 4)); }
 
+/* Horizontal min/max via NEON pairwise reduction: 8 -> 4 -> 2 -> 1. */
+static inline fixed_t fixed8_min_impl_(fixed_8_t v) {
+    int32x4_t m  = vminq_s32(v.lo, v.hi);
+    int32x2_t m2 = vmin_s32(vget_low_s32(m), vget_high_s32(m));
+    m2 = vpmin_s32(m2, m2);
+    return (fixed_t)vget_lane_s32(m2, 0);
+}
+static inline fixed_t fixed8_max_impl_(fixed_8_t v) {
+    int32x4_t m  = vmaxq_s32(v.lo, v.hi);
+    int32x2_t m2 = vmax_s32(vget_low_s32(m), vget_high_s32(m));
+    m2 = vpmax_s32(m2, m2);
+    return (fixed_t)vget_lane_s32(m2, 0);
+}
+
 #undef FIXED8_PAIR_
 
 #else /* FIXED_BACKEND_SCALAR */
@@ -383,6 +421,17 @@ static inline uint8_t fixed8_gt_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(
 static inline uint8_t fixed8_lt_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] <  b.e[i]); }
 static inline uint8_t fixed8_ge_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] >= b.e[i]); }
 static inline uint8_t fixed8_le_impl_(fixed_8_t a, fixed_8_t b)  { FIXED8_MASK_(a.e[i] <= b.e[i]); }
+
+static inline fixed_t fixed8_min_impl_(fixed_8_t v) {
+    fixed_t r = v.e[0];
+    for (int i = 1; i < 8; i++) r = fixed_min(r, v.e[i]);
+    return r;
+}
+static inline fixed_t fixed8_max_impl_(fixed_8_t v) {
+    fixed_t r = v.e[0];
+    for (int i = 1; i < 8; i++) r = fixed_max(r, v.e[i]);
+    return r;
+}
 
 #undef FIXED8_MASK_
 #undef FIXED8_LANEWISE_
@@ -445,6 +494,28 @@ FIXED8_VERIFY_CMP_(lt, ax_[i_] <  bx_[i_])
 FIXED8_VERIFY_CMP_(ge, ax_[i_] >= bx_[i_])
 FIXED8_VERIFY_CMP_(le, ax_[i_] <= bx_[i_])
 
+/* Horizontal reductions: fixed_8_t -> fixed_t. Verified against scalar
+   chain: r0 = v.e[0]; r_{i+1} = OP(r_i, v.e[i+1]). */
+#ifndef NDEBUG
+#  define FIXED8_VERIFY_RED_(name, ref_step) \
+    static inline fixed_t fixed8_##name(fixed_8_t a) { \
+        fixed_t r_ = fixed8_##name##_impl_(a); \
+        fixed_t ax_[8]; \
+        fixed8_store(ax_, a); \
+        fixed_t exp_ = ax_[0]; \
+        for (int i_ = 1; i_ < 8; ++i_) exp_ = (ref_step); \
+        assert(r_ == exp_ && "fixed8_" #name " SIMD/scalar reduction mismatch"); \
+        return r_; \
+    }
+#else
+#  define FIXED8_VERIFY_RED_(name, ref_step) \
+    static inline fixed_t fixed8_##name(fixed_8_t a) { return fixed8_##name##_impl_(a); }
+#endif
+
+FIXED8_VERIFY_RED_(min, fixed_min(exp_, ax_[i_]))
+FIXED8_VERIFY_RED_(max, fixed_max(exp_, ax_[i_]))
+
 #undef FIXED8_VERIFY_BIN_
 #undef FIXED8_VERIFY_UN_
 #undef FIXED8_VERIFY_CMP_
+#undef FIXED8_VERIFY_RED_

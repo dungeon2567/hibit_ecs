@@ -16,16 +16,17 @@ struct bench_integrate_ctx {
 static void bench_integrate_fn(ecs_iterator_t* it) {
     uint64_t mask;
     while ((mask = ecs_iterator_next_block(it))) {
-        while (mask) {
+        do {
             int slot = ecs_ctz64(mask);
             mask &= mask - 1;
-            const vec3_t* vel     = (const vec3_t*)ecs_iterator_get(it, 1, slot);
-            const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(it, 0, slot);
+            const vec3_t* vel = (const vec3_t* __restrict)ecs_iterator_get(it, 1, slot);
+            const vec3_t* pos_cur = (const vec3_t* __restrict)ecs_iterator_get(it, 0, slot);
             vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
+
             if (!vec3_eq(new_pos, *pos_cur)) {
                 *(vec3_t*)ecs_iterator_get_mut(it, 0, slot) = new_pos;
             }
-        }
+        } while (mask);
     }
 }
 
