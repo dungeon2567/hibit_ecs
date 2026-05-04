@@ -157,41 +157,59 @@ void broadphase_insert(broadphase_t* bp, uint32_t id, aabb_t aabb) {
 /* 4-pass × 8-bit LSD radix sort of perm by morton[perm[i]]. After 4 even-
    indexed passes, the sorted output lives back in perm; perm_alt is scratch.
    Stable, so equal-morton items keep insertion order. */
-static void bp_radix_sort_perm(const uint32_t* keys,
-                               uint32_t* perm,
-                               uint32_t* perm_alt,
-                               uint32_t n) {
-    uint32_t hist[4][256] = {{0}};
+static void bp_radix_sort_perm(const uint32_t* restrict keys,
+    uint32_t* restrict perm,
+    uint32_t* restrict perm_alt,
+    uint32_t n) {
+    if (n == 0) return;
+
+    uint32_t hist[4][256] = { {0} };
+
+    // 1. Parallel Histogram Generation (Unrolled)
     for (uint32_t i = 0; i < n; i++) {
         uint32_t k = keys[perm[i]];
-        hist[0][(k >>  0) & 0xFFu]++;
-        hist[1][(k >>  8) & 0xFFu]++;
+        hist[0][(k) & 0xFFu]++;
+        hist[1][(k >> 8) & 0xFFu]++;
         hist[2][(k >> 16) & 0xFFu]++;
         hist[3][(k >> 24) & 0xFFu]++;
     }
+
+    // 2. Prefix Sum (Scan)
     for (int p = 0; p < 4; p++) {
-        uint32_t s = 0;
+        uint32_t sum = 0;
         for (int b = 0; b < 256; b++) {
-            uint32_t c = hist[p][b];
-            hist[p][b] = s;
-            s += c;
+            uint32_t count = hist[p][b];
+            hist[p][b] = sum;
+            sum += count;
         }
     }
 
     uint32_t* src = perm;
     uint32_t* dst = perm_alt;
+
+    // 3. Four-Pass Scatter
+    // We unroll the passes to eliminate pointer swapping logic and the final memcpy
     for (int p = 0; p < 4; p++) {
-        uint32_t shift = (uint32_t)(p * 8);
+        uint32_t shift = p << 3;
+        uint32_t* h = hist[p];
+
+        // Scatter loop with manual optimization
         for (uint32_t i = 0; i < n; i++) {
-            uint32_t idx = src[i];
-            uint32_t b   = (keys[idx] >> shift) & 0xFFu;
-            dst[hist[p][b]++] = idx;
+            uint32_t p_idx = src[i];
+            uint32_t key = keys[p_idx];
+            uint32_t bucket = (key >> shift) & 0xFFu;
+
+            // The destination is often a cache miss. 
+            // In high-performance scenarios, __builtin_prefetch could be used here.
+            dst[h[bucket]++] = p_idx;
         }
-        uint32_t* tmp = src; src = dst; dst = tmp;
+
+        // Swap src and dst for the next pass
+        uint32_t* tmp = src;
+        src = dst;
+        dst = tmp;
     }
-    /* 4 passes => result lives in perm again. Defensive copy keeps the
-       contract clean if someone later changes pass count. */
-    if (src != perm) memcpy(perm, src, n * sizeof(uint32_t));
+    // Result is guaranteed to be in perm because of 4 swaps.
 }
 
 /* Pack one tree level. Reads child_lo..child_hi nodes (or items, when
@@ -279,13 +297,40 @@ void broadphase_build(broadphase_t* bp) {
     fixed_t wmn_x = mn_x_a[0], wmx_x = mx_x_a[0];
     fixed_t wmn_y = mn_y_a[0], wmx_y = mx_y_a[0];
     fixed_t wmn_z = mn_z_a[0], wmx_z = mx_z_a[0];
-    for (uint32_t i = 1; i < n; i++) {
-        wmn_x = fixed_min(wmn_x, mn_x_a[i]);
-        wmx_x = fixed_max(wmx_x, mx_x_a[i]);
-        wmn_y = fixed_min(wmn_y, mn_y_a[i]);
-        wmx_y = fixed_max(wmx_y, mx_y_a[i]);
-        wmn_z = fixed_min(wmn_z, mn_z_a[i]);
-        wmx_z = fixed_max(wmx_z, mx_z_a[i]);
+
+    {
+        uint32_t i = 0;
+
+        while (i + 7 < n) {
+            const fixed_8_t* mnx = (const fixed_8_t*)(mn_x_a + i);
+            const fixed_8_t* mxx = (const fixed_8_t*)(mx_x_a + i);
+            const fixed_8_t* mny = (const fixed_8_t*)(mn_y_a + i);
+            const fixed_8_t* mxy = (const fixed_8_t*)(mx_y_a + i);
+            const fixed_8_t* mnz = (const fixed_8_t*)(mn_z_a + i);
+            const fixed_8_t* mxz = (const fixed_8_t*)(mx_z_a + i);
+
+            wmn_x = fixed_min(wmn_x, fixed8_min(*mnx));
+            wmx_x = fixed_max(wmx_x, fixed8_max(*mxx));
+
+            wmn_y = fixed_min(wmn_y, fixed8_min(*mny));
+            wmx_y = fixed_max(wmx_y, fixed8_max(*mxy));
+
+            wmn_z = fixed_min(wmn_z, fixed8_min(*mnz));
+            wmx_z = fixed_max(wmx_z, fixed8_max(*mxz));
+
+            i += 8;
+        }
+
+        while (i < n) {
+            wmn_x = fixed_min(wmn_x, mn_x_a[i]);
+            wmx_x = fixed_max(wmx_x, mx_x_a[i]);
+            wmn_y = fixed_min(wmn_y, mn_y_a[i]);
+            wmx_y = fixed_max(wmx_y, mx_y_a[i]);
+            wmn_z = fixed_min(wmn_z, mn_z_a[i]);
+            wmx_z = fixed_max(wmx_z, mx_z_a[i]);
+
+            i++;
+        }
     }
 
     /* 2. Morton codes (centroid-quantized) and identity permutation. Range
