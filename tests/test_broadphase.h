@@ -24,7 +24,7 @@ static aabb_t bp_aabb_xyz_(int x, int y, int z, int half) {
 static inline broadphase_object_t bp_obj_(uint32_t id) {
     broadphase_object_t o;
     o.transform = transform_identity();
-    o.id        = id;
+    o.entity_id        = id;
     return o;
 }
 

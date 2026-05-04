@@ -187,7 +187,7 @@ void broadphase_insert(broadphase_t* bp, broadphase_object_t obj, aabb_t aabb) {
     }
     uint32_t i = bp->n_items++;
     bp->n_objects     = bp->n_items;
-    bp->item_ids[i]   = obj.id;
+    bp->item_ids[i]   = obj.entity_id;
     bp->objects[i]    = obj;
     bp->item_min_x[i] = aabb.min.x; bp->item_max_x[i] = aabb.max.x;
     bp->item_min_y[i] = aabb.min.y; bp->item_max_y[i] = aabb.max.y;
@@ -455,7 +455,7 @@ int br(broadphase_iter_t* it, uint32_t* out_id) {
         }
         if (obj_hits) {
             int b = ecs_ctz32((uint32_t)obj_hits);
-            *out_id  = it->bp->objects[n->ids[b]].id;
+            *out_id  = it->bp->objects[n->ids[b]].entity_id;
             it->node = n;
             it->mask = (uint8_t)(obj_hits & (obj_hits - 1u));
             return 1;

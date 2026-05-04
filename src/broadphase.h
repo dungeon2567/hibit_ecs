@@ -40,7 +40,7 @@ typedef struct broadphase_node_t {
 
 typedef struct broadphase_object_t {
     transform_t transform;
-    uint32_t id;
+    uint32_t entity_id;
 } broadphase_object_t;
 
 typedef struct {
@@ -121,7 +121,7 @@ static inline int broadphase_query_next(broadphase_iter_t* it, uint32_t* out_id)
     uint8_t m = it->mask;
     if (m) {
         int b = ecs_ctz32((uint32_t)m);
-        *out_id = it->bp->objects[it->node->ids[b]].id;
+        *out_id = it->bp->objects[it->node->ids[b]].entity_id;
         it->mask = (uint8_t)(m & (m - 1u));
         return 1;
     }

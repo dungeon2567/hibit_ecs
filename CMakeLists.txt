@@ -120,6 +120,7 @@ if (ECS_BUILD_BENCH)
     add_executable(ecs_bench
         benchmarks/bench_main.cpp
         benchmarks/bench_integrate.c
+        benchmarks/bench_broadphase.c
         src/ecs.c
         src/ecs_query.c
         src/broadphase.c

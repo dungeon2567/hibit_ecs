@@ -2,6 +2,7 @@
 
 extern "C" {
 #include "bench_integrate.h"
+#include "bench_broadphase.h"
 void ecs_crc64_init(void);
 }
 
@@ -140,6 +141,77 @@ static void BM_SumPosDenseSOA100k(benchmark::State& state) {
     bench_sum_pos_soa_teardown(ctx);
 }
 BENCHMARK(BM_SumPosDenseSOA100k)->Unit(benchmark::kMicrosecond);
+
+/* Broadphase: 10k items + 10k queries. Three slices --
+     Build  rebuilds tree from a fixed insert list,
+     Query  reuses a tree built once in setup,
+     Full   pays clear+insert+build+queries every iter (per-frame cost). */
+static void BM_BroadphaseBuild10k(benchmark::State& state) {
+    bench_broadphase_ctx* ctx = bench_broadphase_setup(10000, 10000);
+    for (auto _ : state) {
+        bench_broadphase_iter_build(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 10000);
+    bench_broadphase_teardown(ctx);
+}
+BENCHMARK(BM_BroadphaseBuild10k)->Unit(benchmark::kMicrosecond);
+
+static void BM_BroadphaseQuery10k(benchmark::State& state) {
+    bench_broadphase_ctx* ctx = bench_broadphase_setup(10000, 10000);
+    for (auto _ : state) {
+        bench_broadphase_iter_query(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 10000);
+    bench_broadphase_teardown(ctx);
+}
+BENCHMARK(BM_BroadphaseQuery10k)->Unit(benchmark::kMicrosecond);
+
+static void BM_BroadphaseFull10k(benchmark::State& state) {
+    bench_broadphase_ctx* ctx = bench_broadphase_setup(10000, 10000);
+    for (auto _ : state) {
+        bench_broadphase_iter_full(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 10000);
+    bench_broadphase_teardown(ctx);
+}
+BENCHMARK(BM_BroadphaseFull10k)->Unit(benchmark::kMicrosecond);
+
+/* Scatter variant: 10k lattice-placed items (no overlap) + 10k queries. */
+static void BM_BroadphaseBuildScatter10k(benchmark::State& state) {
+    bench_broadphase_ctx* ctx = bench_broadphase_setup_scatter(10000, 10000);
+    for (auto _ : state) {
+        bench_broadphase_iter_build(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 10000);
+    bench_broadphase_teardown(ctx);
+}
+BENCHMARK(BM_BroadphaseBuildScatter10k)->Unit(benchmark::kMicrosecond);
+
+static void BM_BroadphaseQueryScatter10k(benchmark::State& state) {
+    bench_broadphase_ctx* ctx = bench_broadphase_setup_scatter(10000, 10000);
+    for (auto _ : state) {
+        bench_broadphase_iter_query(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 10000);
+    bench_broadphase_teardown(ctx);
+}
+BENCHMARK(BM_BroadphaseQueryScatter10k)->Unit(benchmark::kMicrosecond);
+
+static void BM_BroadphaseFullScatter10k(benchmark::State& state) {
+    bench_broadphase_ctx* ctx = bench_broadphase_setup_scatter(10000, 10000);
+    for (auto _ : state) {
+        bench_broadphase_iter_full(ctx);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * 10000);
+    bench_broadphase_teardown(ctx);
+}
+BENCHMARK(BM_BroadphaseFullScatter10k)->Unit(benchmark::kMicrosecond);
 
 int main(int argc, char** argv) {
     ecs_crc64_init();
