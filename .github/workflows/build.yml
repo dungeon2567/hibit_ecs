@@ -7,13 +7,6 @@ on:
   pull_request:
     branches: [main, master]
 
-permissions:
-  # github-action-benchmark needs write access to the gh-pages branch where
-  # the benchmark history + dashboard live, plus PR comment write for alerts.
-  contents: write
-  pull-requests: write
-  deployments: write
-
 jobs:
   # ---------------------------------------------------------------------------
   # tests — Debug only, multi-OS. Runs the `ecs` binary (tests + asserts on).
@@ -77,9 +70,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # bench — Release, single pinned runner. Runs ecs_bench under Google
-  # Benchmark, then feeds JSON to github-action-benchmark for regression
-  # detection. Pinned to ubuntu-22.04 (cold runner) so the baseline stored in
-  # gh-pages compares apples-to-apples across runs.
+  # Benchmark and prints results to the job log.
   # ---------------------------------------------------------------------------
   bench:
     runs-on: ubuntu-22.04
@@ -92,57 +83,10 @@ jobs:
       - name: Build ecs_bench
         run: cmake --build build --config Release --target ecs_bench --parallel
 
-      - name: Run benchmark (JSON output)
+      - name: Run benchmark
         env:
           MI_ARENA_RESERVE: "0"
-        run: |
-          ./build/ecs_bench \
-            --benchmark_format=json \
-            --benchmark_out=bench.json \
-            --benchmark_out_format=json \
-            --benchmark_repetitions=3 \
-            --benchmark_report_aggregates_only=true \
-            --benchmark_min_time=0.5s
-          cat bench.json
-
-      - name: Store + alert on regression
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: HibitEcs Benchmarks
-          tool: 'googlecpp'
-          output-file-path: bench.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Push history to gh-pages on main pushes; PRs only diff against
-          # the stored baseline and comment.
-          auto-push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
-          alert-threshold: '130%'
-          comment-on-alert: true
-          fail-on-alert: ${{ github.event_name == 'pull_request' }}
-          summary-always: true
-
-      - name: Generate badges + SUMMARY.md
-        run: |
-          mkdir -p gh-pages-extra
-          python3 scripts/bench_to_badges.py bench.json gh-pages-extra
-          ls -R gh-pages-extra
-          cat gh-pages-extra/SUMMARY.md
-
-      - name: Publish badges + summary to gh-pages
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: ./gh-pages-extra
-          destination_dir: dev/bench
-          keep_files: true
-          commit_message: "chore(bench): refresh badges + SUMMARY"
-
-      - name: Upload bench JSON
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-json
-          path: bench.json
+        run: ./build/ecs_bench
 
   # ---------------------------------------------------------------------------
   # tsan — Linux Debug only. TSan catches data races in jobs.c work-stealing
