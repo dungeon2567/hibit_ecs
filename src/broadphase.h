@@ -45,9 +45,16 @@ typedef struct broadphase_object_t {
 } broadphase_object_t;
 
 typedef struct {
-    /* Item buffer: parallel arrays, append-only between clear/build. */
+    /* Item buffer: SoA, append-only between clear/build. Splitting AABBs
+       into 6 fixed_t arrays lets the world-AABB / centroid scans run as
+       dense linear streams the compiler turns into AVX2/NEON min/max loops. */
     uint32_t* item_ids;
-    aabb_t*   item_aabbs;
+    fixed_t*  item_min_x;
+    fixed_t*  item_min_y;
+    fixed_t*  item_min_z;
+    fixed_t*  item_max_x;
+    fixed_t*  item_max_y;
+    fixed_t*  item_max_z;
     uint32_t  n_items;
     uint32_t  item_cap;
 

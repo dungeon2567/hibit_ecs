@@ -39,7 +39,8 @@ static void test_broadphase_init_destroy(void) {
     EXPECT(bp.n_nodes  == 0,     "no nodes on init");
     EXPECT(bp.has_tree == 0,     "tree not built on init");
     EXPECT(bp.item_ids   != NULL, "item_ids allocated");
-    EXPECT(bp.item_aabbs != NULL, "item_aabbs allocated");
+    EXPECT(bp.item_min_x != NULL, "item_min_x allocated");
+    EXPECT(bp.item_max_z != NULL, "item_max_z allocated");
     EXPECT(bp.morton     != NULL, "morton allocated");
     EXPECT(bp.perm       != NULL, "perm allocated");
     EXPECT(bp.nodes      != NULL, "node arena allocated");

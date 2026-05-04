@@ -645,7 +645,7 @@ uint64_t ecs_world_crc64(const ecs_world_t* world) {
 }
 
 /* ==========================================================================
-   Rollback / tick-end â€” discard predicted, clear changed, release empty nodes.
+   Rollback / tick-end - discard predicted, clear changed, release empty nodes.
    Predicted state is always speculative; confirmed state advances only via
    CONFIRMED-mode writes. Walks union of dirty + changed: dirty drives
    predicted-bytes invalidation, changed drives per-tick reset. Predicted-only

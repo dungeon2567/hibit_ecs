@@ -70,7 +70,7 @@ static inline uint8_t bp_overlap_mask(const broadphase_node_t* n, aabb_t q) {
 
 void broadphase_init(broadphase_t* bp, size_t item_cap) {
     assert(bp);
-    if (item_cap == 0) item_cap = 1;
+	assert(item_cap > 8 && item_cap % 8 == 0);
 
     bp->item_cap = (uint32_t)item_cap;
     bp->n_items  = 0;
@@ -83,16 +83,28 @@ void broadphase_init(broadphase_t* bp, size_t item_cap) {
     bp->root     = 0;
     bp->has_tree = 0;
 
-    bp->item_ids   = (uint32_t*)mi_malloc(item_cap * sizeof(uint32_t));
-    bp->item_aabbs = (aabb_t*)  mi_malloc(item_cap * sizeof(aabb_t));
-    bp->morton     = (uint32_t*)mi_malloc(item_cap * sizeof(uint32_t));
-    bp->perm       = (uint32_t*)mi_malloc(item_cap * sizeof(uint32_t));
-    bp->perm_alt   = (uint32_t*)mi_malloc(item_cap * sizeof(uint32_t));
+    /* All SoA item arrays are 32-byte aligned -- AVX2 aligned loads on the
+       autovectorized world-AABB / centroid scans. Pad each axis allocation
+       up to a multiple of 8 fixed_t so the SIMD tail can read junk safely. */
+    size_t pad_cap = (item_cap + 7u) & ~(size_t)7u;
+    size_t axis_bytes = pad_cap * sizeof(fixed_t);
+
+    bp->item_ids   = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->item_min_x = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_min_y = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_min_z = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_max_x = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_max_y = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_max_z = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->morton     = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->perm       = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->perm_alt   = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
     bp->nodes      = (broadphase_node_t*)mi_malloc_aligned(
                          node_cap * sizeof(broadphase_node_t), BP_NODE_ALIGN);
 
-    if (!bp->item_ids || !bp->item_aabbs || !bp->morton ||
-        !bp->perm || !bp->perm_alt || !bp->nodes) {
+    if (!bp->item_ids   || !bp->item_min_x || !bp->item_min_y || !bp->item_min_z ||
+        !bp->item_max_x || !bp->item_max_y || !bp->item_max_z ||
+        !bp->morton     || !bp->perm       || !bp->perm_alt   || !bp->nodes) {
         fprintf(stderr, "broadphase: OOM (item_cap=%zu node_cap=%zu)\n",
                 item_cap, node_cap);
         abort();
@@ -102,13 +114,19 @@ void broadphase_init(broadphase_t* bp, size_t item_cap) {
 void broadphase_destroy(broadphase_t* bp) {
     assert(bp);
     if (bp->item_ids)   mi_free(bp->item_ids);
-    if (bp->item_aabbs) mi_free(bp->item_aabbs);
+    if (bp->item_min_x) mi_free(bp->item_min_x);
+    if (bp->item_min_y) mi_free(bp->item_min_y);
+    if (bp->item_min_z) mi_free(bp->item_min_z);
+    if (bp->item_max_x) mi_free(bp->item_max_x);
+    if (bp->item_max_y) mi_free(bp->item_max_y);
+    if (bp->item_max_z) mi_free(bp->item_max_z);
     if (bp->morton)     mi_free(bp->morton);
     if (bp->perm)       mi_free(bp->perm);
     if (bp->perm_alt)   mi_free(bp->perm_alt);
     if (bp->nodes)      mi_free(bp->nodes);
     bp->item_ids = bp->morton = bp->perm = bp->perm_alt = NULL;
-    bp->item_aabbs = NULL;
+    bp->item_min_x = bp->item_min_y = bp->item_min_z = NULL;
+    bp->item_max_x = bp->item_max_y = bp->item_max_z = NULL;
     bp->nodes = NULL;
     bp->item_cap = bp->n_items = 0;
     bp->node_cap = bp->n_nodes = 0;
@@ -130,7 +148,9 @@ void broadphase_insert(broadphase_t* bp, uint32_t id, aabb_t aabb) {
     }
     uint32_t i = bp->n_items++;
     bp->item_ids[i]   = id;
-    bp->item_aabbs[i] = aabb;
+    bp->item_min_x[i] = aabb.min.x; bp->item_max_x[i] = aabb.max.x;
+    bp->item_min_y[i] = aabb.min.y; bp->item_max_y[i] = aabb.max.y;
+    bp->item_min_z[i] = aabb.min.z; bp->item_max_z[i] = aabb.max.z;
     bp->has_tree = 0;
 }
 
@@ -187,6 +207,17 @@ static void bp_pack_level(broadphase_t* bp,
     uint32_t c = child_lo;
     fixed_8_t sent_min = fixed8_set1(INT32_MAX);
     fixed_8_t sent_max = fixed8_set1(INT32_MIN);
+    /* Hoist SoA bases out of the loop. restrict tells the compiler the SoA
+       streams don't alias the node store, so reads can be vectorized through
+       node writes. */
+    const uint32_t* restrict perm  = bp->perm;
+    const uint32_t* restrict ids   = bp->item_ids;
+    const fixed_t*  restrict min_x = bp->item_min_x;
+    const fixed_t*  restrict min_y = bp->item_min_y;
+    const fixed_t*  restrict min_z = bp->item_min_z;
+    const fixed_t*  restrict max_x = bp->item_max_x;
+    const fixed_t*  restrict max_y = bp->item_max_y;
+    const fixed_t*  restrict max_z = bp->item_max_z;
     while (c < child_hi) {
         assert(bp->n_nodes < bp->node_cap);
         broadphase_node_t* p = &bp->nodes[bp->n_nodes++];
@@ -199,12 +230,14 @@ static void bp_pack_level(broadphase_t* bp,
         for (int s = 0; s < 8 && c < child_hi; s++, c++) {
             if (child_is_items) {
                 /* Leaf: pull the original item via the sorted permutation. */
-                uint32_t idx = bp->perm[c];
-                aabb_t   a   = bp->item_aabbs[idx];
-                p->min_x.e[s] = a.min.x; p->max_x.e[s] = a.max.x;
-                p->min_y.e[s] = a.min.y; p->max_y.e[s] = a.max.y;
-                p->min_z.e[s] = a.min.z; p->max_z.e[s] = a.max.z;
-                p->ids[s]     = bp->item_ids[idx];
+                uint32_t idx = perm[c];
+                p->min_x.e[s] = min_x[idx];
+                p->max_x.e[s] = max_x[idx];
+                p->min_y.e[s] = min_y[idx];
+                p->max_y.e[s] = max_y[idx];
+                p->min_z.e[s] = min_z[idx];
+                p->max_z.e[s] = max_z[idx];
+                p->ids[s]     = ids[idx];
             } else {
                 /* Internal: lane s collapses child c's 8 SoA lanes via
                    fixed8_min/fixed8_max horizontal reduction. Sentinels in
@@ -232,36 +265,47 @@ void broadphase_build(broadphase_t* bp) {
     uint32_t n = bp->n_items;
     if (n == 0) return;
 
-    /* 1. World AABB from items. */
-    aabb_t w;
-    w.min.x = w.min.y = w.min.z = INT32_MAX;
-    w.max.x = w.max.y = w.max.z = INT32_MIN;
-    for (uint32_t i = 0; i < n; i++) {
-        aabb_t a = bp->item_aabbs[i];
-        if (a.min.x < w.min.x) w.min.x = a.min.x;
-        if (a.min.y < w.min.y) w.min.y = a.min.y;
-        if (a.min.z < w.min.z) w.min.z = a.min.z;
-        if (a.max.x > w.max.x) w.max.x = a.max.x;
-        if (a.max.y > w.max.y) w.max.y = a.max.y;
-        if (a.max.z > w.max.z) w.max.z = a.max.z;
+    const fixed_t* restrict mn_x_a = bp->item_min_x;
+    const fixed_t* restrict mn_y_a = bp->item_min_y;
+    const fixed_t* restrict mn_z_a = bp->item_min_z;
+    const fixed_t* restrict mx_x_a = bp->item_max_x;
+    const fixed_t* restrict mx_y_a = bp->item_max_y;
+    const fixed_t* restrict mx_z_a = bp->item_max_z;
+
+    /* 1. World AABB. Six dense linear streams -- compiler turns the
+          fixed_min/fixed_max chain into vmin/vmax SIMD loops with -O2 and
+          AVX2/NEON enabled. The 6 reductions are independent; the compiler
+          interleaves them to fill execution units. */
+    fixed_t wmn_x = mn_x_a[0], wmx_x = mx_x_a[0];
+    fixed_t wmn_y = mn_y_a[0], wmx_y = mx_y_a[0];
+    fixed_t wmn_z = mn_z_a[0], wmx_z = mx_z_a[0];
+    for (uint32_t i = 1; i < n; i++) {
+        wmn_x = fixed_min(wmn_x, mn_x_a[i]);
+        wmx_x = fixed_max(wmx_x, mx_x_a[i]);
+        wmn_y = fixed_min(wmn_y, mn_y_a[i]);
+        wmx_y = fixed_max(wmx_y, mx_y_a[i]);
+        wmn_z = fixed_min(wmn_z, mn_z_a[i]);
+        wmx_z = fixed_max(wmx_z, mx_z_a[i]);
     }
 
     /* 2. Morton codes (centroid-quantized) and identity permutation. Range
           of 0 on any axis -> all centroids collapse to bin 0 on that axis,
-          which is fine; the radix is stable so insertion order is preserved. */
-    fixed_t rx = w.max.x - w.min.x; if (rx <= 0) rx = 1;
-    fixed_t ry = w.max.y - w.min.y; if (ry <= 0) ry = 1;
-    fixed_t rz = w.max.z - w.min.z; if (rz <= 0) rz = 1;
+          which is fine; the radix is stable so insertion order is preserved.
+          Bit-spread is sequence-of-shifts -- not vector-friendly, leave scalar. */
+    fixed_t rx = wmx_x - wmn_x; if (rx <= 0) rx = 1;
+    fixed_t ry = wmx_y - wmn_y; if (ry <= 0) ry = 1;
+    fixed_t rz = wmx_z - wmn_z; if (rz <= 0) rz = 1;
+    uint32_t* restrict morton = bp->morton;
+    uint32_t* restrict perm   = bp->perm;
     for (uint32_t i = 0; i < n; i++) {
-        aabb_t a  = bp->item_aabbs[i];
-        fixed_t cx = bp_avg(a.min.x, a.max.x);
-        fixed_t cy = bp_avg(a.min.y, a.max.y);
-        fixed_t cz = bp_avg(a.min.z, a.max.z);
-        uint32_t qx = bp_quantize(cx, w.min.x, rx);
-        uint32_t qy = bp_quantize(cy, w.min.y, ry);
-        uint32_t qz = bp_quantize(cz, w.min.z, rz);
-        bp->morton[i] = bp_morton30(qx, qy, qz);
-        bp->perm[i]   = i;
+        fixed_t cx = bp_avg(mn_x_a[i], mx_x_a[i]);
+        fixed_t cy = bp_avg(mn_y_a[i], mx_y_a[i]);
+        fixed_t cz = bp_avg(mn_z_a[i], mx_z_a[i]);
+        uint32_t qx = bp_quantize(cx, wmn_x, rx);
+        uint32_t qy = bp_quantize(cy, wmn_y, ry);
+        uint32_t qz = bp_quantize(cz, wmn_z, rz);
+        morton[i] = bp_morton30(qx, qy, qz);
+        perm[i]   = i;
     }
 
     /* 3. Sort permutation by morton. */
