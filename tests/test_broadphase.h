@@ -327,6 +327,153 @@ static void test_broadphase_query_before_build(void) {
     broadphase_destroy(&bp);
 }
 
+/* Determinism golden: 16 collinear items at x=0..15 (y=z=0). Build is fully
+   deterministic across platforms because:
+     - fixed_t is Q16.16 integer math (no FP drift),
+     - the radix sort is stable, and
+     - SIMD min/max reductions are commutative.
+   Tree shape: 2 leaves + 1 root. perm = identity (x ascending == morton
+   ascending), so leaf 0 packs items 0..7, leaf 1 packs 8..15. Root packs
+   leaves into lanes 0,1. Query br() pushes hit children low-to-high then
+   pops LIFO, so leaf 1 yields first; within a leaf, lanes 0..7 yield in
+   order via the ctz scan. Sequence is locked. */
+static void test_broadphase_known_order(void) {
+    broadphase_t bp; broadphase_init(&bp, 32);
+
+    enum { N = 16 };
+    for (uint32_t i = 0; i < N; ++i)
+        broadphase_insert(&bp, bp_obj_(100u + i), bp_aabb_xyz_((int)i, 0, 0, 1));
+    broadphase_build(&bp);
+
+    EXPECT(bp.n_nodes == 3, "deterministic shape: 2 leaves + 1 root");
+    EXPECT(bp.root    == 2, "deterministic root index");
+
+    /* Query covers x=[-93,107] -- hits every item. */
+    aabb_t q = bp_aabb_xyz_(7, 0, 0, 100);
+    broadphase_iter_t it;
+    broadphase_query_begin(&it, &bp, q);
+
+    static const uint32_t expected[N] = {
+        108u, 109u, 110u, 111u, 112u, 113u, 114u, 115u,
+        100u, 101u, 102u, 103u, 104u, 105u, 106u, 107u,
+    };
+    uint32_t got[N] = {0};
+    int n = 0;
+    uint32_t id;
+    while (broadphase_query_next(&it, &id)) {
+        if (n < N) got[n] = id;
+        ++n;
+    }
+    EXPECT(n == N, "all 16 items yielded");
+    int match = (n == N);
+    for (int i = 0; match && i < N; ++i)
+        if (got[i] != expected[i]) match = 0;
+    EXPECT(match, "yield order matches platform-independent golden");
+
+    broadphase_destroy(&bp);
+}
+
+/* Cross-instance determinism: two bp instances with identical insert
+   sequence produce byte-identical query streams. Catches accidental
+   dependence on prior heap state, ASLR-influenced pointer ordering, or
+   uninitialized scratch. */
+static void test_broadphase_determinism_two_instances(void) {
+    enum { N = 50 };
+    broadphase_t a, b;
+    broadphase_init(&a, 64);
+    broadphase_init(&b, 64);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        int x = (int)(i % 7) - 3;
+        int y = (int)((i / 7) % 7) - 3;
+        int z = (int)((i / 3) % 5) - 2;
+        aabb_t aabb = bp_aabb_xyz_(x, y, z, 1);
+        broadphase_insert(&a, bp_obj_(1000u + i), aabb);
+        broadphase_insert(&b, bp_obj_(1000u + i), aabb);
+    }
+    broadphase_build(&a);
+    broadphase_build(&b);
+
+    EXPECT(a.n_nodes == b.n_nodes, "deterministic n_nodes");
+    EXPECT(a.root    == b.root,    "deterministic root");
+
+    aabb_t q = bp_aabb_xyz_(0, 0, 0, 10);
+    broadphase_iter_t ia, ib;
+    broadphase_query_begin(&ia, &a, q);
+    broadphase_query_begin(&ib, &b, q);
+
+    int order_match = 1, count = 0;
+    for (;;) {
+        uint32_t id_a = 0, id_b = 0;
+        int ra = broadphase_query_next(&ia, &id_a);
+        int rb = broadphase_query_next(&ib, &id_b);
+        if (ra != rb) { order_match = 0; break; }
+        if (!ra) break;
+        if (id_a != id_b) { order_match = 0; break; }
+        ++count;
+    }
+    EXPECT(order_match, "identical yield order across two instances");
+    EXPECT(count > 0,   "query non-empty");
+
+    broadphase_destroy(&a);
+    broadphase_destroy(&b);
+}
+
+/* Rebuild determinism: clear + re-insert + rebuild on the same bp must
+   produce the same query stream as the first build. Exercises arena reuse
+   (stale node lanes from prior build must not leak through). */
+static void test_broadphase_determinism_rebuild(void) {
+    enum { N = 30 };
+    broadphase_t bp; broadphase_init(&bp, 64);
+
+    aabb_t boxes[N];
+    for (uint32_t i = 0; i < N; ++i) {
+        int x = (int)(i % 5);
+        int y = (int)((i / 5) % 5);
+        boxes[i] = bp_aabb_xyz_(x, y, 0, 1);
+        broadphase_insert(&bp, bp_obj_(7u + i), boxes[i]);
+    }
+    broadphase_build(&bp);
+
+    aabb_t q = bp_aabb_xyz_(2, 2, 0, 5);
+    uint32_t first[N + 8] = {0};
+    int n1 = 0;
+    {
+        broadphase_iter_t it;
+        broadphase_query_begin(&it, &bp, q);
+        uint32_t id;
+        while (broadphase_query_next(&it, &id)) {
+            if (n1 < (int)(sizeof(first) / sizeof(first[0]))) first[n1] = id;
+            ++n1;
+        }
+    }
+
+    broadphase_clear(&bp);
+    for (uint32_t i = 0; i < N; ++i)
+        broadphase_insert(&bp, bp_obj_(7u + i), boxes[i]);
+    broadphase_build(&bp);
+
+    uint32_t second[N + 8] = {0};
+    int n2 = 0;
+    {
+        broadphase_iter_t it;
+        broadphase_query_begin(&it, &bp, q);
+        uint32_t id;
+        while (broadphase_query_next(&it, &id)) {
+            if (n2 < (int)(sizeof(second) / sizeof(second[0]))) second[n2] = id;
+            ++n2;
+        }
+    }
+
+    EXPECT(n1 == n2, "rebuild yields same hit count");
+    int same_order = (n1 == n2);
+    for (int i = 0; same_order && i < n1; ++i)
+        if (first[i] != second[i]) same_order = 0;
+    EXPECT(same_order, "rebuild yields identical hit order");
+
+    broadphase_destroy(&bp);
+}
+
 /* ============================================================
    runner
    ============================================================ */
@@ -346,6 +493,9 @@ static int test_broadphase_all(void) {
     RUN_TEST(test_broadphase_full_grid);
     RUN_TEST(test_broadphase_negative_coords);
     RUN_TEST(test_broadphase_query_before_build);
+    RUN_TEST(test_broadphase_known_order);
+    RUN_TEST(test_broadphase_determinism_two_instances);
+    RUN_TEST(test_broadphase_determinism_rebuild);
     int failed = g_failed - before;
     printf("\nbroadphase: %d failed\n", failed);
     return failed ? 1 : 0;
