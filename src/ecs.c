@@ -397,7 +397,6 @@ void* ecs_tree_get_mut(ecs_tree_t* tree, int index) {
     ecs_l1_t* l1s = tree_acquire_and_mark(tree, index, &l1_idx);
 
     size_t ds = tree->data_size;
-    if (ds == 0) return NULL;     /* tag */
 
     uint64_t m = (uint64_t)tree->mode;
     return (char*)l1s + sizeof(ecs_l1_t) + (size_t)(l1_idx + 64 * (int)m) * ds;
