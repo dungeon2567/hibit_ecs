@@ -373,37 +373,6 @@ static void test_world_serialize_size_5k_4trees(void) {
            bytes, N_ENT, IDX_RANGE);
     EXPECT(bytes > 0, "world serialize produced output");
 
-    /* Naive baseline: per tree, write 18-bit count then for each entry an
-       18-bit raw index (covers IDX_RANGE up to 2^18) immediately followed by
-       the raw payload bytes. Index width 18 bits is reused for the count
-       header too -- max entries per tree bounded by index range, so 18 bits
-       suffice. No bitmask hierarchy, no run encoding -- this is the dumb
-       wire format the bitmask serializer is meant to beat. */
-    uint8_t* nbuf = (uint8_t*)ecs_xcalloc(1, (size_t)BIG_BUF);
-    ecs_serializer_t ns;
-    ecs_serializer_init(&ns, nbuf, BIG_BUF);
-    for (int t = 0; t < 4; ++t) {
-        ecs_serializer_write_bits(&ns, (uint64_t)N_ENT, 18);
-        for (int i = 0; i < N_ENT; ++i) {
-            int idx = i * STRIDE;
-            ecs_serializer_write_bits(&ns, (uint64_t)idx, 18);
-            if (t == 0) {
-                fixed_4_t p = fixed4_vec3((fixed_t)idx, (fixed_t)(idx + 1), (fixed_t)(idx + 2));
-                ecs_serializer_write_bytes(&ns, (const uint8_t*)&p, (int32_t)sizeof(p));
-            } else if (t == 1) {
-                fixed_4_t v = fixed4_vec3((fixed_t)i, (fixed_t)(i * 2), (fixed_t)(i * 3));
-                ecs_serializer_write_bytes(&ns, (const uint8_t*)&v, (int32_t)sizeof(v));
-            } else if (t == 2) {
-                transform_t x = transform_identity();
-                ecs_serializer_write_bytes(&ns, (const uint8_t*)&x, (int32_t)sizeof(x));
-            }
-            /* t == 3: tag tree, presence-only -- no payload */
-        }
-    }
-    ecs_serializer_flush_bits(&ns);
-    int32_t naive_bytes = ecs_serializer_get_bytes_written(&ns);
-    printf("  naive_serialize: %d bytes (18-bit count + 18-bit idx + payload per entry, per tree)\n", naive_bytes);
-
     /* zstd compression probe on bitmask serializer output + bit-exact round-trip. */
     size_t zbound = ZSTD_compressBound((size_t)bytes);
     uint8_t* zbuf = (uint8_t*)ecs_xcalloc(1, zbound);
@@ -411,19 +380,6 @@ static void test_world_serialize_size_5k_4trees(void) {
     EXPECT(!ZSTD_isError(zsize), "zstd compress ok");
     printf("  zstd(world):     %zu bytes (ratio %.2fx vs raw, level=%d)\n",
            zsize, (double)bytes / (double)zsize, ZSTD_CLEVEL_DEFAULT);
-
-    /* zstd on the naive baseline -- shows whether zstd alone closes the gap. */
-    size_t nzbound = ZSTD_compressBound((size_t)naive_bytes);
-    uint8_t* nzbuf = (uint8_t*)ecs_xcalloc(1, nzbound);
-    size_t nzsize = ZSTD_compress(nzbuf, nzbound, nbuf, (size_t)naive_bytes, ZSTD_CLEVEL_DEFAULT);
-    EXPECT(!ZSTD_isError(nzsize), "zstd compress (naive) ok");
-    printf("  zstd(naive):     %zu bytes (ratio %.2fx vs raw)\n",
-           nzsize, (double)naive_bytes / (double)nzsize);
-    printf("  bitmask vs naive: raw %.2fx smaller, zstd %.2fx smaller\n",
-           (double)naive_bytes / (double)bytes,
-           (double)nzsize / (double)zsize);
-    ecs_free(nbuf);
-    ecs_free(nzbuf);
 
     uint8_t* dbuf = (uint8_t*)ecs_xcalloc(1, (size_t)BIG_BUF);
     size_t dsize = ZSTD_decompress(dbuf, (size_t)BIG_BUF, zbuf, zsize);
