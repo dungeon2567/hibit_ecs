@@ -50,7 +50,9 @@
       "Bash(git *)",
       "PowerShell(& \"${env:COMSPEC}\" /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\Common7\\\\Tools\\\\VsDevCmd.bat\" -arch=x64 -no_logo && cmake --build out\\\\build\\\\x64-debug' 2>&1 | Select-Object -Last 30)",
       "Bash(xargs sed *)",
-      "Bash(cmake --build out/build/x64-release --target ecs_bench)"
+      "Bash(cmake --build out/build/x64-release --target ecs_bench)",
+      "Bash(powershell -Command \"\\(Get-Content tests/test_input.h -Raw\\) -replace 'ecs_input_set\\\\\\(\\(&[a-z_A-Z0-9]+, [^,]+, [^,]+, &[a-zA-Z0-9_\\\\[\\\\]]+, \\(true|false\\)\\), [^\\)]+\\\\\\)', 'ecs_input_set\\(\\\\$1\\)' | Set-Content tests/test_input.h\")",
+      "Bash(powershell -Command \"\\(Get-Content tests/test_input.h -Raw\\) -replace 'ecs_input_frontier\\\\\\(\\([^,]+\\), &valid\\\\\\)', 'ecs_input_frontier\\(\\\\$1\\)' -replace 'ecs_input_frontier\\\\\\(\\([^,]+\\), &\\([a-z]+\\)\\\\\\)', 'ecs_input_frontier\\(\\\\$1\\)' | Set-Content tests/test_input.h\")"
     ],
     "autoApprove": true
   }

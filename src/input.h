@@ -9,19 +9,19 @@
    Design summary
    --------------
      pid             : 18-bit player id (matches entity_t.id width).
-     dense idx       : engine-internal stable index into dense arrays.
+     dense idx       : engine-internal column index into the 2D table.
                        Stable across leaves -- never recycled until pid is
                        unregistered AND the slot is consumed from the free
                        list by a subsequent register.
      opaque payload  : caller defines stride at init; engine never inspects.
 
-   pid -> dense idx  : 9+9 radix table. Top L1 = 512 page pointers (4 KB,
-                       always present). Each populated L2 page = 512 * u32 +
-                       small header. Lookup = 2 loads, branch on NULL page.
-                       At-most ~1 MB if every pid populated; typical few KB.
+   pid -> dense idx  : linear scan of dense_ids[0..dense_high]. O(active)
+                       per lookup. Cap is u16-bound (65535).
 
-   Per-player ring   : `slots` = buf_size * stride bytes, indexed by
-                       (tick & buf_mask). Caller-supplied buf_size, must be
+   Storage           : single 2D table, row-major. Each row = one tick
+                       slot * active_cap * stride bytes (full roster for
+                       that tick). Both buf_size and active_cap grow
+                       pow2 on demand. Caller-supplied buf_size, must be
                        a power of two.
 
    Per-tick state    : flat row-major bitmaps of width words_per_row, indexed
@@ -60,12 +60,34 @@
 
    Allocation philosophy
    ---------------------
-     - Init: ~5 allocations (table fields).
+     - Init: ~5 small bookkeeping allocations.
      - Tick (set/get/clear): zero.
-     - Register: 1 buf-slots block + at most 1 pid_page (first pid in hi bucket).
-     - Unregister: symmetric frees. Caller defers if a rollback window must
-       still observe the player's slots.
-     - active_cap grows pow2; bitmap rows migrated row-by-row on grow.
+     - Register: zero allocs (column already in table); table grows pow2
+       only when high-water exceeds active_cap (rare, doubling).
+     - Unregister: zero frees; column reused on next register.
+     - active_cap grows pow2 (table realloc, no row re-layout).
+     - buf_size grows pow2 (table re-laid-out per-section by mask remap).
+
+   Threading
+   ---------
+   This module is NOT thread-safe. All ops mutate shared scalars (counts,
+   frontier) and shared bitmaps without atomics. Callers serialize by
+   either single-threading the apply path or fronting the table with a
+   queue / mutex.
+
+   Endianness
+   ----------
+   Slot bytes are opaque -- the engine memcpy's stride bytes verbatim
+   on set / get. Cross-platform peers must serialize their input payload
+   endian-explicitly (e.g. via the ecs_serializer write_bits API) before
+   handing bytes to ecs_input_set; in-memory layout is not portable.
+
+   Write semantics for predicted vs confirmed
+   ------------------------------------------
+   Once a (tick, pid) slot is confirmed, predicted writes are dropped --
+   confirmed bytes are authoritative and a later prediction must NOT
+   overwrite them. Confirmed writes always overwrite, regardless of
+   prior state, and are idempotent (same bytes, same flags result).
    ========================================================================== */
 
 /* 18-bit pid space (matches entity_t.id). */
@@ -73,68 +95,69 @@
 #define ECS_INPUT_PID_MAX   (1u << ECS_INPUT_PID_BITS)
 #define ECS_INPUT_PID_NIL   0xFFFFFFFFu
 
-/* Radix table: 9 high bits index L1, 9 low bits index L2 page entry. */
-#define ECS_INPUT_L1_BITS   9
-#define ECS_INPUT_L2_BITS   9
-#define ECS_INPUT_L1_SIZE   (1u << ECS_INPUT_L1_BITS)
-#define ECS_INPUT_L2_SIZE   (1u << ECS_INPUT_L2_BITS)
+/* Hard cap on concurrently registered players. Player capacity grows
+   pow2 on demand below this. */
+#define ECS_INPUT_PLAYER_MAX 1024u
 
-/* Sentinel for free list terminator in free_next[]. */
-#define ECS_INPUT_FREE_NIL  0xFFFFFFFFu
+/* Hard cap on buf_size for auto-grow. Beyond this the caller must take
+   the snapshot/resync path -- a tick lateness larger than this exceeds
+   any reasonable rollback budget. 65536 ticks ~= 18 minutes @ 60fps. */
+#define ECS_INPUT_BUFSIZE_MAX 65536u
+
+/* Initial player capacity allocated on first register. Grows pow2. */
+#define ECS_INPUT_PLAYER_CAP_INIT 16u
+
+/* Default ring depth (tick capacity). Caller passes to ecs_input_init;
+   grows pow2 on burst (see ecs_input_grow_buf). 32 ticks ~= 500ms @ 60fps. */
+#define ECS_INPUT_BUFSIZE_INIT 32u
 
 /* Sentinel for tick_in_slot[] meaning "ring slot empty / never written". */
 #define ECS_INPUT_TICK_NIL  0xFFFFFFFFFFFFFFFFull
 
 typedef uint32_t ecs_pid_t;
 
-typedef struct ecs_input_buf_t {
-    /* buf_size * stride bytes. Indexed by (tick & buf_mask) * stride. */
-    uint8_t* slots;
-} ecs_input_buf_t;
-
-typedef struct ecs_input_pid_page_t {
-    /* pid_lo -> dense idx (or ECS_INPUT_PID_NIL). */
-    uint32_t entry[ECS_INPUT_L2_SIZE];
-    /* Live entries in this page; page freed when 0. */
-    uint16_t used;
-} ecs_input_pid_page_t;
-
 typedef struct ecs_input_t {
-    /* pid -> dense idx (radix). */
-    ecs_input_pid_page_t* l1[ECS_INPUT_L1_SIZE];
+    /* Single packed table. One row per ring slot, layout:
+         u64 tick_in_slot
+         u64 present[words_per_row]
+         u64 confirmed[words_per_row]
+         u8  payload[active_cap * stride]
+       row_bytes = 8 + 2*words_per_row*8 + active_cap*stride (rounded
+       up to 8). Single contiguous allocation; per-slot ops touch one
+       row = warm cache. Both dimensions grow pow2 on demand. */
+    uint8_t*  table;
+    uint32_t  row_bytes;     /* bytes per row, cached */
 
-    /* Dense storage. Stable idx with free-list reuse. */
-    ecs_input_buf_t* dense;
-    uint32_t*        dense_ids;     /* pid for live, ECS_INPUT_PID_NIL for free */
-    uint32_t*        free_next;     /* free-list links (ECS_INPUT_FREE_NIL terminator) */
-    uint32_t         free_head;
-    uint32_t         active_count;  /* populated dense slots (does NOT include free holes) */
-    uint32_t         active_cap;    /* capacity of dense / dense_ids / free_next; pow2 */
-    uint32_t         dense_high;    /* high-water of indices ever assigned (<= active_cap) */
+    /* dense_ids[i] = pid at column i, or ECS_INPUT_PID_NIL for free
+       slots. Pid lookup AND free-slot search both SIMD-scan this same
+       array (active_cap is pow2, multiple of 8). No separate free list. */
+    uint32_t* dense_ids;
+    uint32_t  active_count;  /* populated columns (does NOT include free holes) */
+    uint32_t  active_cap;    /* table column count, pow2 */
+    uint32_t  dense_high;    /* high-water of column indices ever assigned */
+    uint32_t  words_per_row; /* ceil(active_cap / 64) */
 
     /* Frozen at init. */
-    uint32_t stride;     /* bytes per input slot */
-    uint32_t buf_size;   /* ring depth, pow2 */
-    uint32_t buf_mask;   /* buf_size - 1 */
+    uint32_t  stride;        /* bytes per input slot */
+    uint32_t  buf_size;      /* ring depth, pow2 */
+    uint32_t  buf_mask;      /* buf_size - 1 */
 
-    /* Per-tick row-major bitmaps. words_per_row = ceil(active_cap / 64). */
-    uint64_t* confirmed_bm;     /* [buf_size * words_per_row] */
-    uint64_t* present_bm;       /* [buf_size * words_per_row] */
-    uint16_t* confirmed_count;  /* [buf_size] */
-    uint16_t* expected_count;   /* [buf_size] */
-    uint64_t* tick_in_slot;     /* [buf_size]; absolute tick id or ECS_INPUT_TICK_NIL */
-    uint64_t* all_confirmed_bm; /* [ceil(buf_size / 64)] */
+    /* Confirmed frontier: highest tick T such that all live players are
+       confirmed for every tick in [1..T]. 0 = no frontier yet (sim
+       starts at tick 1; tick 0 is reserved as the "no frontier" sentinel
+       and is invalid as an actual tick id). all_confirmed status per
+       tick is computed on demand from dense_ids (live mask) AND
+       confirmed bits in row -- no cached counts. */
     uint64_t  confirmed_frontier;
-    bool      frontier_valid;   /* false = no tick has ever advanced; frontier value undefined */
-
-    uint32_t  words_per_row;
 } ecs_input_t;
 
 /* View returned by ecs_input_get_view -- caller can branch on flags
-   without two separate table lookups. data is stride bytes; only valid
-   while ecs_input_t is unchanged. */
+   without two separate table lookups. data is stride bytes, NULL if
+   pid is unknown OR the ring slot does not currently hold this tick.
+   When data is non-NULL the bytes belong to (tick, pid); use the flags
+   to distinguish predicted-only vs confirmed. */
 typedef struct ecs_input_view_t {
-    const void* data;        /* slot bytes (stride-sized) or NULL if pid unknown */
+    const void* data;
     bool        present;     /* slot has been written for this tick */
     bool        confirmed;   /* slot is authoritative for this tick */
 } ecs_input_view_t;
@@ -150,9 +173,10 @@ void ecs_input_destroy(ecs_input_t* it);
 
 /* --- Membership ---------------------------------------------------------- */
 
-/* Add a player. Returns true on success, false if pid already registered.
-   Allocates the player's slot ring (buf_size * stride bytes) and a pid_page
-   if the high half of the pid was previously empty. */
+/* Add a player. Returns true on success, false if pid already registered
+   or the player cap (ECS_INPUT_PLAYER_MAX) is reached. Auto-grows
+   active_cap (doubling) when the high-water exceeds the current
+   capacity. Reuses a freed column when available; otherwise extends. */
 bool ecs_input_register_player(ecs_input_t* it, ecs_pid_t pid);
 
 /* Remove a player. Frees the player's slot ring and recycles the dense
@@ -167,20 +191,54 @@ static inline uint32_t ecs_input_active_count(const ecs_input_t* it) {
     return it->active_count;
 }
 
+/* True iff `pid` is currently registered. */
+bool ecs_input_is_registered(const ecs_input_t* it, ecs_pid_t pid);
+
+/* --- Iteration ----------------------------------------------------------- */
+
+/* Iterate live players in dense order. Holes (freed slots) skipped.
+   Order is determined by register/unregister sequence -- callers that
+   need cross-peer determinism must replay the same membership stream
+   on every peer. */
+typedef struct ecs_input_iter_t {
+    const ecs_input_t* it;
+    uint32_t           cursor;      /* next dense slot to inspect (private) */
+    uint32_t           dense_idx;   /* dense_idx of the current live entry (set by next) */
+    ecs_pid_t          pid;         /* live pid (set by next) */
+} ecs_input_iter_t;
+
+static inline ecs_input_iter_t ecs_input_iter_begin(const ecs_input_t* it) {
+    ecs_input_iter_t r;
+    r.it = it; r.cursor = 0u; r.dense_idx = 0u; r.pid = ECS_INPUT_PID_NIL;
+    return r;
+}
+
+/* Advance iterator. Returns true and sets iter->pid / iter->dense_idx
+   when a live entry was found, false when iteration is complete. */
+bool ecs_input_iter_next(ecs_input_iter_t* iter);
+
 /* --- Hot path: set / get / clear ----------------------------------------- */
 
 /* Write `value` (stride bytes) into the slot for (tick, pid).
-   `expected` is the server-stamped roster size for this tick; on first
-   write to ring slot (tick & buf_mask) it is recorded as the threshold
-   for frontier advance. If `confirmed` is true the confirmed bit is set
-   and confirmed_count incremented (idempotent if already set).
+   If `confirmed` is true the confirmed bit is set; once every currently-
+   registered player's confirmed bit is set for this tick, the frontier
+   may advance.
+
+   value MUST be non-NULL.
+
+   Predicted-after-confirmed: if (tick, pid) is already confirmed and
+   this call has confirmed=false, the call is a no-op (confirmed bytes
+   are authoritative).
+
    No-op if pid unknown. */
 void ecs_input_set(ecs_input_t* it, uint64_t tick, ecs_pid_t pid,
-                   const void* value, bool confirmed, uint16_t expected);
+                   const void* value, bool confirmed);
 
-/* Return slot pointer for (tick, pid) or NULL if pid unknown.
-   Bytes are valid only if the slot was previously set (caller's
-   responsibility -- use ecs_input_get_view if presence matters). */
+/* Return slot pointer for (tick, pid) or NULL if pid unknown OR the
+   slot has not been written for this tick (ring wrap / never set).
+   When non-NULL the bytes were last written by ecs_input_set for THIS
+   tick. Use ecs_input_get_view to additionally distinguish predicted
+   vs confirmed. */
 const void* ecs_input_get(const ecs_input_t* it, uint64_t tick, ecs_pid_t pid);
 
 /* Combined lookup + presence/confirmed flags. */
@@ -199,11 +257,32 @@ void ecs_input_clear(ecs_input_t* it, uint64_t tick);
    (count == expected). */
 bool ecs_input_tick_confirmed(const ecs_input_t* it, uint64_t tick);
 
-/* Highest contiguous fully-confirmed tick. Returns 0 with *out_valid
-   = false if no tick has ever fully confirmed yet. */
-uint64_t ecs_input_frontier(const ecs_input_t* it, bool* out_valid);
+/* Highest contiguous fully-confirmed tick. Returns 0 if no tick has
+   ever fully confirmed yet (tick 0 is reserved as the "no frontier"
+   sentinel; valid ticks start at 1). */
+uint64_t ecs_input_frontier(const ecs_input_t* it);
 
 /* Seed frontier at `tick` (mid-session join / snapshot bootstrap).
-   Subsequent confirmations of tick+1, tick+2, ... will extend it.
-   Use after restoring world state from a server snapshot. */
+   `tick` must be >= 1. Subsequent confirmations of tick+1, tick+2, ...
+   will extend it. */
 void ecs_input_seed_frontier(ecs_input_t* it, uint64_t tick);
+
+/* Mark `tick` as fully confirmed with zero expected players. Used by
+   the server to seal ticks where the roster was empty -- the frontier
+   advances past such ticks without any set() calls. */
+void ecs_input_seal_empty_tick(ecs_input_t* it, uint64_t tick);
+
+/* --- Auto-grow ----------------------------------------------------------- */
+
+/* Grow the ring depth (table rows) to at least `new_buf_size` (rounded up
+   to next pow2). Re-maps every live row to its new index under the wider
+   mask. ecs_input_set auto-invokes this when a write would otherwise
+   clobber a still-live row (predicted-but-not-yet-frontier-passed). */
+void ecs_input_grow_buf(ecs_input_t* it, uint32_t new_buf_size);
+
+/* Grow the player capacity (table cols) to at least `new_player_cap`
+   (rounded up to next pow2). Both dimensions of the 2D table grow pow2
+   doubling. ecs_input_register_player auto-invokes this on
+   high-water-mark allocation; callers may grow preemptively before a
+   known roster expansion. No-op if new_player_cap <= current. */
+void ecs_input_grow_player_cap(ecs_input_t* it, uint32_t new_player_cap);
