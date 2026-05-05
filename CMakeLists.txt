@@ -111,6 +111,7 @@ if (ECS_BUILD_TESTS)
         src/ecs.c
         src/ecs_query.c
         src/broadphase.c
+        src/input.c
     )
 
     target_include_directories(ecs PRIVATE
