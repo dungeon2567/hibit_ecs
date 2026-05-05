@@ -149,13 +149,11 @@ static void test_predict_promote_advances_confirmed(void) {
     ecs_tree_t* t = make_tree();
 
     set_val(t, 0, 42);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 1, "tick after first promote");
+    EXPECT(ecs_tree_rollback(t) == 1, "rollback reports advance after first promote");
     EXPECT(get_current_val(t, 0) == 42, "confirmed = 42 after first promote");
 
     set_val(t, 0, 99);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 2, "tick after second promote");
+    EXPECT(ecs_tree_rollback(t) == 1, "rollback reports advance after second promote");
     EXPECT(get_current_val(t, 0) == 99, "confirmed = 99 after second promote");
 
     free_tree(t);
@@ -168,7 +166,7 @@ static void test_predict_rollback_no_dirty_noop(void) {
     ecs_tree_rollback(t);
     uint64_t crc1 = ecs_tree_crc64(t);
 
-    /* No predicted writes since promote â€” rollback is a no-op. */
+    /* No predicted writes since promote - rollback is a no-op. */
     ecs_tree_rollback(t);
     EXPECT(ecs_tree_masks_valid(t), "masks valid post-noop-rollback");
     EXPECT(ecs_tree_crc64(t) == crc1, "crc unchanged after no-op rollback");

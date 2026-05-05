@@ -76,22 +76,20 @@ static void test_predict_rollback(void) {
 
     /* Seed confirmed via CONFIRMED write. */
     *(Vec2*)ecs_tree_get_mut(&tree, 3) = (Vec2){ 1.f, 2.f };
-    ecs_tree_rollback(&tree);
-    CHECK(tree.tick == 1);
+    CHECK(ecs_tree_rollback(&tree) == 1);
     uint64_t crc1 = ecs_tree_crc64(&tree);
     CHECK(crc1 != crc0);
 
-    /* Switch to PREDICT â€” modifications are speculative. */
+    /* Switch to PREDICT - modifications are speculative. */
     ecs_tree_set_mode(&tree, ECS_MODE_PREDICT);
     *(Vec2*)ecs_tree_get_mut(&tree, 3) = (Vec2){ 5.f, 6.f };
     *(Vec2*)ecs_tree_get_mut(&tree, 7) = (Vec2){ 9.f, 9.f };
     ecs_tree_remove(&tree, 3);
 
-    /* CRC is view-aware â€” predicted writes shift it. */
+    /* CRC is view-aware - predicted writes shift it. */
     CHECK(ecs_tree_crc64(&tree) != crc1);
 
-    ecs_tree_rollback(&tree);
-    CHECK(tree.tick == 1);                    /* predict-only rollback doesn't advance tick */
+    CHECK(ecs_tree_rollback(&tree) == 0);     /* predict-only rollback reports no advance */
     CHECK(ecs_tree_crc64(&tree) == crc1);     /* rollback restores view to confirmed */
     const Vec2* cur = (const Vec2*)ecs_tree_get(&tree, 3);
     CHECK(cur->x == 1.f && cur->y == 2.f);
@@ -110,8 +108,7 @@ static void test_predict_rollback_mixed(void) {
     /* Seed confirmed via CONFIRMED writes. */
     *(Vec2*)ecs_tree_get_mut(&tree,  3) = (Vec2){ 1.f, 2.f };
     *(Vec2*)ecs_tree_get_mut(&tree,  7) = (Vec2){ 3.f, 4.f };
-    ecs_tree_rollback(&tree);
-    CHECK(tree.tick == 1);
+    CHECK(ecs_tree_rollback(&tree) == 1);
     uint64_t crc1 = ecs_tree_crc64(&tree);
 
     /* Switch to PREDICT for speculative mutations. */
@@ -134,8 +131,7 @@ static void test_predict_rollback_mixed(void) {
     *(Vec2*)ecs_tree_get_mut(&tree,  3) = (Vec2){ 5.f, 6.f };
     ecs_tree_remove(&tree, 7);
     *(Vec2*)ecs_tree_get_mut(&tree, 20) = (Vec2){ 7.f, 8.f };
-    ecs_tree_rollback(&tree);
-    CHECK(tree.tick == 2);                    /* tick=2 after second confirmed advance */
+    CHECK(ecs_tree_rollback(&tree) == 1);     /* second confirmed advance */
     CHECK( entity_exists_confirmed(&tree,  3));
     CHECK(!entity_exists_confirmed(&tree,  7));
     CHECK( entity_exists_confirmed(&tree, 20));

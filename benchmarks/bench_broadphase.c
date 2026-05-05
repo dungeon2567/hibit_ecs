@@ -62,9 +62,9 @@ static uint32_t bench_bp_run_queries(bench_broadphase_ctx* ctx) {
     for (int i = 0; i < ctx->n_queries; i++) {
         broadphase_iter_t it;
         broadphase_query_begin(&it, &ctx->bp, ctx->queries[i]);
-        uint32_t id;
-        while (broadphase_query_next(&it, &id)) {
-            s += id;
+        const broadphase_object_t* obj;
+        while ((obj = broadphase_query_next(&it))) {
+            s += obj->entity_id;
         }
     }
     return s;

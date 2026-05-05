@@ -19,7 +19,7 @@ static void pipe_record(ecs_world_t* w, void* user) {
     st->call_order = (*st->shared_counter)++;
 }
 
-static void test_pipeline_empty_runs_begin_tick(void) {
+static void test_pipeline_empty_runs_end_tick(void) {
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
     w->mask = 1;
@@ -29,7 +29,6 @@ static void test_pipeline_empty_runs_begin_tick(void) {
     uint64_t tid_before = w->tick_id;
     ecs_pipeline_run(&p, w);
     EXPECT(w->tick_id == tid_before + 1, "empty pipeline still bumps tick_id");
-    EXPECT(w->trees[0].tick_id_at_begin == w->tick_id, "tree tick_id snapshot synced");
 
     ecs_pipeline_destroy(&p);
     ecs_world_rollback(w);
@@ -83,31 +82,12 @@ static void test_pipeline_preserves_registration_order(void) {
     ecs_world_destroy(w); ecs_free(w);
 }
 
-static void test_pipeline_tick_id_synced_across_trees(void) {
-    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);
-    ecs_tree_init(&w->trees[3], sizeof(comp_t), 0);
-    ecs_tree_init(&w->trees[7], sizeof(comp_t), 0);
-    w->mask = (1ULL << 0) | (1ULL << 3) | (1ULL << 7);
-
-    ecs_pipeline_t p; ecs_pipeline_init(&p);
-    ecs_pipeline_run(&p, w);
-
-    EXPECT(w->trees[0].tick_id_at_begin == w->tick_id, "tree[0] synced");
-    EXPECT(w->trees[3].tick_id_at_begin == w->tick_id, "tree[3] synced");
-    EXPECT(w->trees[7].tick_id_at_begin == w->tick_id, "tree[7] synced");
-
-    ecs_pipeline_destroy(&p);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
 static int test_pipeline_all(void) {
     int before = g_failed;
     printf("=== pipeline tests ===\n\n");
-    RUN_TEST(test_pipeline_empty_runs_begin_tick);
+    RUN_TEST(test_pipeline_empty_runs_end_tick);
     RUN_TEST(test_pipeline_runs_single_system_once);
     RUN_TEST(test_pipeline_preserves_registration_order);
-    RUN_TEST(test_pipeline_tick_id_synced_across_trees);
     int failed = g_failed - before;
     printf("\npipeline: %d failed\n", failed);
     return failed ? 1 : 0;

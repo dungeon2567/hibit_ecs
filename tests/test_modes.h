@@ -102,9 +102,7 @@ static void test_mode_confirmed_promote_is_tick_only(void) {
     ecs_tree_set_mode(t, ECS_MODE_CONFIRMED);
     set_val(t, 0, 1);
 
-    uint64_t tick_before = t->tick;
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == tick_before + 1, "promote in CONFIRMED still bumps tick");
+    EXPECT(ecs_tree_rollback(t) == 1, "promote in CONFIRMED reports advance");
     EXPECT(get_current_val(t, 0) == 1, "value unchanged");
 
     free_tree(t);
@@ -154,39 +152,34 @@ static void test_mode_predict_multi_tick_lifecycle(void) {
 
     /* Tick 1: CONFIRMED add. */
     set_val(t, 0, 10);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 1, "tick=1 after first rollback");
+    EXPECT(ecs_tree_rollback(t) == 1, "first rollback reports advance");
     EXPECT(get_current_val(t, 0) == 10, "tick 1 confirmed = 10");
 
     /* Tick 2: CONFIRMED overwrite. */
     set_val(t, 0, 20);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 2, "tick=2");
+    EXPECT(ecs_tree_rollback(t) == 1, "second rollback reports advance");
     EXPECT(get_current_val(t, 0) == 20, "tick 2 confirmed=20");
 
-    /* PREDICT modify, rollback discards — confirmed stays 20, tick unchanged. */
+    /* PREDICT modify, rollback discards — confirmed stays 20, no advance. */
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
     set_val(t, 0, 30);
     EXPECT(get_current_val(t, 0) == 30, "predicted=30 mid-tick");
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 2, "predict-only rollback does not advance tick");
+    EXPECT(ecs_tree_rollback(t) == 0, "predict-only rollback reports no advance");
     EXPECT(get_current_val(t, 0) == 20, "confirmed unchanged — predict discarded");
 
     /* Tick 3: CONFIRMED-add second slot. */
     ecs_tree_set_mode(t, ECS_MODE_CONFIRMED);
     set_val(t, 0, 40);
     set_val(t, ENT(0, 0, 5), 50);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 3, "tick=3");
+    EXPECT(ecs_tree_rollback(t) == 1, "third rollback reports advance");
     EXPECT(get_current_val(t, 0)            == 40, "slot 0 = 40");
     EXPECT(get_current_val(t, ENT(0, 0, 5)) == 50, "slot 5 = 50");
 
-    /* PREDICT-remove + PREDICT-modify, rollback restores both. Tick unchanged. */
+    /* PREDICT-remove + PREDICT-modify, rollback restores both. No advance. */
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
     ecs_tree_remove(t, 0);
     set_val(t, ENT(0, 0, 5), 999);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 3, "predict-only rollback does not advance tick");
+    EXPECT(ecs_tree_rollback(t) == 0, "predict-only rollback reports no advance");
     EXPECT(get_current_val(t, 0)            == 40, "rollback restored slot 0");
     EXPECT(get_current_val(t, ENT(0, 0, 5)) == 50, "rollback restored slot 5");
 
@@ -194,8 +187,7 @@ static void test_mode_predict_multi_tick_lifecycle(void) {
     ecs_tree_set_mode(t, ECS_MODE_CONFIRMED);
     ecs_tree_remove(t, 0);
     set_val(t, ENT(0, 0, 7), 70);
-    ecs_tree_rollback(t);
-    EXPECT(t->tick == 4, "tick=4");
+    EXPECT(ecs_tree_rollback(t) == 1, "fourth rollback reports advance");
     EXPECT(((const ecs_l1_t*)l1_of(t, 0, 0))->confirmed_mask_any == ((1ULL << 5) | (1ULL << 7)),
            "confirmed_mask = slots {5,7}");
 
@@ -217,10 +209,11 @@ static void test_mode_predict_matches_confirmed_simulation(void) {
     ecs_tree_t* t = make_tree();
 
     /* Phase A: 3 confirmed ticks. Integration logic = slot 0 := tick. */
-    set_val(t, 0, 1); ecs_tree_rollback(t);
-    set_val(t, 0, 2); ecs_tree_rollback(t);
-    set_val(t, 0, 3); ecs_tree_rollback(t);
-    EXPECT(t->tick == 3, "tick=3 after 3 confirmed integration ticks");
+    int advances = 0;
+    set_val(t, 0, 1); advances += ecs_tree_rollback(t);
+    set_val(t, 0, 2); advances += ecs_tree_rollback(t);
+    set_val(t, 0, 3); advances += ecs_tree_rollback(t);
+    EXPECT(advances == 3, "3 confirmed integration ticks reported advance");
     uint64_t crc_tick_3 = ecs_tree_crc64(t);
 
     /* Phase B: 3 predicted ticks — same logic, predicted slot. No rollback
@@ -241,10 +234,10 @@ static void test_mode_predict_matches_confirmed_simulation(void) {
 
     /* Phase C: 3 confirmed ticks replay → must reach crc_tick_6. */
     ecs_tree_set_mode(t, ECS_MODE_CONFIRMED);
-    set_val(t, 0, 4); ecs_tree_rollback(t);
-    set_val(t, 0, 5); ecs_tree_rollback(t);
-    set_val(t, 0, 6); ecs_tree_rollback(t);
-    EXPECT(t->tick == 6, "tick=6 after 3 more confirmed ticks");
+    set_val(t, 0, 4); advances += ecs_tree_rollback(t);
+    set_val(t, 0, 5); advances += ecs_tree_rollback(t);
+    set_val(t, 0, 6); advances += ecs_tree_rollback(t);
+    EXPECT(advances == 6, "6 confirmed advances total (predict-only rollback didn't count)");
     EXPECT(ecs_tree_crc64(t) == crc_tick_6,
            "confirmed-replay view CRC matches predicted result");
 

@@ -65,8 +65,7 @@ static void test_broadphase_empty_build(void) {
 
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 4));
-    uint32_t id;
-    EXPECT(broadphase_query_next(&it, &id) == 0, "no hits on empty tree");
+    EXPECT(broadphase_query_next(&it) == NULL, "no hits on empty tree");
 
     broadphase_destroy(&bp);
 }
@@ -82,10 +81,10 @@ static void test_broadphase_insert_query_single(void) {
 
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 2));
-    uint32_t id = 0;
-    EXPECT(broadphase_query_next(&it, &id) == 1, "single hit");
-    EXPECT(id == 42,                              "id round-trips");
-    EXPECT(broadphase_query_next(&it, &id) == 0, "iterator drained");
+    const broadphase_object_t* o = broadphase_query_next(&it);
+    EXPECT(o != NULL,                              "single hit");
+    EXPECT(o && o->entity_id == 42,                "id round-trips");
+    EXPECT(broadphase_query_next(&it) == NULL,     "iterator drained");
 
     broadphase_destroy(&bp);
 }
@@ -98,8 +97,7 @@ static void test_broadphase_query_aabb_miss(void) {
 
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(3, 0, 0, 1)); /* [2,4] */
-    uint32_t id;
-    EXPECT(broadphase_query_next(&it, &id) == 0, "AABB-disjoint rejected");
+    EXPECT(broadphase_query_next(&it) == NULL, "AABB-disjoint rejected");
 
     broadphase_destroy(&bp);
 }
@@ -122,9 +120,9 @@ static void test_broadphase_leaf_overflow(void) {
 
     uint32_t found[N + 4] = {0};
     int n = 0;
-    uint32_t id;
-    while (broadphase_query_next(&it, &id)) {
-        if (n < (int)(sizeof(found) / sizeof(found[0]))) found[n] = id;
+    const broadphase_object_t* o;
+    while ((o = broadphase_query_next(&it))) {
+        if (n < (int)(sizeof(found) / sizeof(found[0]))) found[n] = o->entity_id;
         ++n;
     }
     EXPECT(n == N, "all 20 items returned");
@@ -160,8 +158,9 @@ static void test_broadphase_multi_level(void) {
 
     int seen[N + 1] = {0};
     int hits = 0;
-    uint32_t id;
-    while (broadphase_query_next(&it, &id)) {
+    const broadphase_object_t* o;
+    while ((o = broadphase_query_next(&it))) {
+        uint32_t id = o->entity_id;
         EXPECT(id >= 1 && id <= N, "id within inserted range");
         if (id >= 1 && id <= N) seen[id]++;
         ++hits;
@@ -192,9 +191,9 @@ static void test_broadphase_aabb_filter(void) {
     broadphase_query_begin(&it, &bp, q);
 
     int count = 0;
-    uint32_t id;
-    while (broadphase_query_next(&it, &id)) {
-        EXPECT(id == 11, "only id 11 inside the tight query AABB");
+    const broadphase_object_t* o;
+    while ((o = broadphase_query_next(&it))) {
+        EXPECT(o->entity_id == 11, "only id 11 inside the tight query AABB");
         ++count;
     }
     EXPECT(count == 1, "exactly one match");
@@ -221,15 +220,14 @@ static void test_broadphase_clear_reuse(void) {
     broadphase_build(&bp);
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 2));
-    uint32_t id;
-    EXPECT(broadphase_query_next(&it, &id) == 0, "no items visible after clear/build");
+    EXPECT(broadphase_query_next(&it) == NULL, "no items visible after clear/build");
 
     broadphase_insert(&bp, bp_obj_(99u), bp_aabb_xyz_(0, 0, 0, 1));
     broadphase_build(&bp);
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 2));
-    int got = broadphase_query_next(&it, &id);
-    EXPECT(got == 1 && id == 99u, "fresh insert reported");
-    EXPECT(broadphase_query_next(&it, &id) == 0, "no stale ids leak");
+    const broadphase_object_t* o = broadphase_query_next(&it);
+    EXPECT(o != NULL && o->entity_id == 99u, "fresh insert reported");
+    EXPECT(broadphase_query_next(&it) == NULL, "no stale ids leak");
 
     broadphase_destroy(&bp);
 }
@@ -247,8 +245,7 @@ static void test_broadphase_query_far_away(void) {
     };
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, q);
-    uint32_t id;
-    EXPECT(broadphase_query_next(&it, &id) == 0, "far query -> no hits");
+    EXPECT(broadphase_query_next(&it) == NULL, "far query -> no hits");
 
     broadphase_destroy(&bp);
 }
@@ -279,9 +276,9 @@ static void test_broadphase_full_grid(void) {
 
     uint32_t seen[32] = {0};
     int n = 0;
-    uint32_t id;
-    while (broadphase_query_next(&it, &id)) {
-        if (n < 32) seen[n] = id;
+    const broadphase_object_t* o;
+    while ((o = broadphase_query_next(&it))) {
+        if (n < 32) seen[n] = o->entity_id;
         ++n;
     }
     EXPECT(n == 27, "every id hit exactly once");
@@ -305,10 +302,10 @@ static void test_broadphase_negative_coords(void) {
 
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(-10, -10, -10, 2));
-    uint32_t id;
-    EXPECT(broadphase_query_next(&it, &id) == 1, "negative-coord item reachable");
-    EXPECT(id == 5, "id matches");
-    EXPECT(broadphase_query_next(&it, &id) == 0, "drained");
+    const broadphase_object_t* o = broadphase_query_next(&it);
+    EXPECT(o != NULL, "negative-coord item reachable");
+    EXPECT(o && o->entity_id == 5, "id matches");
+    EXPECT(broadphase_query_next(&it) == NULL, "drained");
 
     broadphase_destroy(&bp);
 }
@@ -321,8 +318,7 @@ static void test_broadphase_query_before_build(void) {
 
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, bp_aabb_xyz_(0, 0, 0, 4));
-    uint32_t id;
-    EXPECT(broadphase_query_next(&it, &id) == 0, "query without build -> empty");
+    EXPECT(broadphase_query_next(&it) == NULL, "query without build -> empty");
 
     broadphase_destroy(&bp);
 }
@@ -359,9 +355,9 @@ static void test_broadphase_known_order(void) {
     };
     uint32_t got[N] = {0};
     int n = 0;
-    uint32_t id;
-    while (broadphase_query_next(&it, &id)) {
-        if (n < N) got[n] = id;
+    const broadphase_object_t* o;
+    while ((o = broadphase_query_next(&it))) {
+        if (n < N) got[n] = o->entity_id;
         ++n;
     }
     EXPECT(n == N, "all 16 items yielded");
@@ -404,12 +400,11 @@ static void test_broadphase_determinism_two_instances(void) {
 
     int order_match = 1, count = 0;
     for (;;) {
-        uint32_t id_a = 0, id_b = 0;
-        int ra = broadphase_query_next(&ia, &id_a);
-        int rb = broadphase_query_next(&ib, &id_b);
-        if (ra != rb) { order_match = 0; break; }
-        if (!ra) break;
-        if (id_a != id_b) { order_match = 0; break; }
+        const broadphase_object_t* oa = broadphase_query_next(&ia);
+        const broadphase_object_t* ob = broadphase_query_next(&ib);
+        if ((oa == NULL) != (ob == NULL)) { order_match = 0; break; }
+        if (!oa) break;
+        if (oa->entity_id != ob->entity_id) { order_match = 0; break; }
         ++count;
     }
     EXPECT(order_match, "identical yield order across two instances");
@@ -441,9 +436,9 @@ static void test_broadphase_determinism_rebuild(void) {
     {
         broadphase_iter_t it;
         broadphase_query_begin(&it, &bp, q);
-        uint32_t id;
-        while (broadphase_query_next(&it, &id)) {
-            if (n1 < (int)(sizeof(first) / sizeof(first[0]))) first[n1] = id;
+        const broadphase_object_t* o;
+        while ((o = broadphase_query_next(&it))) {
+            if (n1 < (int)(sizeof(first) / sizeof(first[0]))) first[n1] = o->entity_id;
             ++n1;
         }
     }
@@ -458,9 +453,9 @@ static void test_broadphase_determinism_rebuild(void) {
     {
         broadphase_iter_t it;
         broadphase_query_begin(&it, &bp, q);
-        uint32_t id;
-        while (broadphase_query_next(&it, &id)) {
-            if (n2 < (int)(sizeof(second) / sizeof(second[0]))) second[n2] = id;
+        const broadphase_object_t* o;
+        while ((o = broadphase_query_next(&it))) {
+            if (n2 < (int)(sizeof(second) / sizeof(second[0]))) second[n2] = o->entity_id;
             ++n2;
         }
     }

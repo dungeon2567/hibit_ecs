@@ -66,6 +66,22 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(mimalloc)
 
 # -------------------------
+# zstd (static, used by serialize tests)
+# -------------------------
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC   ON  CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.6
+    SOURCE_SUBDIR  build/cmake
+)
+FetchContent_MakeAvailable(zstd)
+
+# -------------------------
 # Target selection (gated by CMAKE_BUILD_TYPE — single-config generator)
 #   Debug    → ecs       (tests, sanitizers, asserts)
 #   Release  → ecs_bench (Google Benchmark only, no test runtime)
@@ -100,9 +116,10 @@ if (ECS_BUILD_TESTS)
     target_include_directories(ecs PRIVATE
         src
         tests
+        ${zstd_SOURCE_DIR}/lib
     )
 
-    target_link_libraries(ecs PRIVATE mimalloc-static)
+    target_link_libraries(ecs PRIVATE mimalloc-static libzstd_static)
 endif()
 
 if (ECS_BUILD_BENCH)

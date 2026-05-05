@@ -27,7 +27,7 @@
    alignment), keeping aligned loads legal on AVX2; NEON and scalar are
    unaffected. */
 typedef struct broadphase_node_t {
-    _Alignas(32) fixed_8_t min_x;
+    fixed_8_t min_x;
     fixed_8_t max_x;
     fixed_8_t min_y;
     fixed_8_t max_y;
@@ -81,7 +81,12 @@ typedef struct {
 
 typedef struct {
     const broadphase_t* bp;
-    const aabb_t q;              /* cached for the per-node SIMD splat; init only via broadphase_query_begin */
+    const aabb_t q;              /* original query AABB; init only via broadphase_query_begin */
+    /* Pre-splatted query bounds. Splatting once at query_begin instead of on every
+       per-node overlap call eliminates 6 SIMD broadcast ops per visited node. */
+    const fixed_8_t qmin_x, qmax_x;
+    const fixed_8_t qmin_y, qmax_y;
+    const fixed_8_t qmin_z, qmax_z;
     const broadphase_node_t* node;   /* current node holding stashed object hits */
     uint8_t  mask;               /* unconsumed object-lane hits at it->node (child lanes already pushed) */
     int      sp;
@@ -112,18 +117,20 @@ void broadphase_build  (broadphase_t* bp);
 void broadphase_query_begin(broadphase_iter_t* it, const broadphase_t* bp, aabb_t q);
 
 /* Slow path: pop from the descent stack, push hit children for internal
-   nodes, stop on the first leaf with a non-empty hit mask. */
-int  br(broadphase_iter_t* it, uint32_t* out_id);
+   nodes, stop on the first leaf with a non-empty hit mask. Returns NULL when
+   the iterator is drained. */
+const broadphase_object_t* br(broadphase_iter_t* it);
 
 /* Fast path: pop the lowest set bit of the cached leaf hit mask, return its
-   id. Hot loop: branchless other than the empty-mask fallback. */
-static inline int broadphase_query_next(broadphase_iter_t* it, uint32_t* out_id) {
+   object. Hot loop: branchless other than the empty-mask fallback. NULL means
+   no more hits. */
+static inline const broadphase_object_t* broadphase_query_next(broadphase_iter_t* it) {
     uint8_t m = it->mask;
     if (m) {
         int b = ecs_ctz32((uint32_t)m);
-        *out_id = it->bp->objects[it->node->ids[b]].entity_id;
+        const broadphase_object_t* obj = &it->bp->objects[it->node->ids[b]];
         it->mask = (uint8_t)(m & (m - 1u));
-        return 1;
+        return obj;
     }
-    return br(it, out_id);
+    return br(it);
 }

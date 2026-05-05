@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zstd.h>
 #include "ecs.h"
 #include "test_ecs.h"   /* g_passed/g_failed/EXPECT/make_tree/free_tree/set_val/comp_t */
 
@@ -36,7 +37,6 @@ static void ts_round_trip(ecs_tree_t* src, const char* tag) {
 
     EXPECT(ecs_tree_masks_valid(dst), tag);
     EXPECT(ecs_tree_crc64(dst) == crc_src, tag);
-    EXPECT(dst->tick == src->tick, tag);
 
     free_tree(dst);
     ecs_free(buf);
@@ -70,7 +70,7 @@ static void test_serialize_sparse_multi_l1(void) {
 
 static void test_serialize_dense_full_l1(void) {
     ecs_tree_t* t = make_tree();
-    /* Fill an entire L1 (64 consecutive indices) â€” exercises all-set
+    /* Fill an entire L1 (64 consecutive indices) - exercises all-set
        mask shortcut on the encoder side. */
     for (int i = 0; i < 64; i++) set_val(t, i, (comp_t)(i * 7 + 1));
     ecs_tree_rollback(t);
@@ -95,7 +95,7 @@ static void test_serialize_tag_tree(void) {
     /* data_size == 0: presence-only, payload pass entirely skipped. */
     ecs_tree_t* t = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
     ecs_tree_init(t, 0, 0);
-    /* Tag trees can't store data â€” flip presence bits via get_mut + remove. */
+    /* Tag trees can't store data - flip presence bits via get_mut + remove. */
     ecs_tree_get_mut(t, 7);
     ecs_tree_get_mut(t, 200);
     ecs_tree_get_mut(t, 4097);
@@ -123,7 +123,7 @@ static void test_serialize_override_existing_tree(void) {
     ecs_serializer_flush_bits(&s);
     int32_t bytes = ecs_serializer_get_bytes_written(&s);
 
-    /* Build a different state in dst â€” overlapping + non-overlapping indices. */
+    /* Build a different state in dst - overlapping + non-overlapping indices. */
     ecs_tree_t* dst = make_tree();
     set_val(dst, 7,     0xAA);
     set_val(dst, 1000,  0xBB);     /* overlap with src */
@@ -132,7 +132,7 @@ static void test_serialize_override_existing_tree(void) {
     ecs_tree_rollback(dst);
     EXPECT(ecs_tree_crc64(dst) != crc_src, "pre-deserialize state differs");
 
-    /* Deserialize over dst â€” must reuse pool nodes correctly. */
+    /* Deserialize over dst - must reuse pool nodes correctly. */
     ecs_deserializer_t d;
     ecs_deserializer_init(&d, buf, ((bytes + 7) / 8) * 8);
     int rc = ecs_tree_deserialize(dst, &d);
@@ -145,7 +145,7 @@ static void test_serialize_override_existing_tree(void) {
     ecs_free(buf);
 }
 
-/* Re-deserialize twice into the same tree â€” second round must fully replace
+/* Re-deserialize twice into the same tree - second round must fully replace
    the first round's state without leaks. */
 static void test_serialize_back_to_back_overrides(void) {
     /* Build state A */
@@ -193,7 +193,7 @@ static void test_serialize_back_to_back_overrides(void) {
     ecs_free(buf_a); ecs_free(buf_b);
 }
 
-/* Bad header rejection â€” wrong version. Tree state must NOT be touched on
+/* Bad header rejection - wrong version. Tree state must NOT be touched on
    a -1 return (header validated before topology mutation). */
 static void test_serialize_rejects_bad_header(void) {
     ecs_tree_t* t = make_tree();
@@ -201,7 +201,7 @@ static void test_serialize_rejects_bad_header(void) {
     ecs_tree_rollback(t);
     uint64_t crc_before = ecs_tree_crc64(t);
 
-    /* version=99 (unknown), rest zeros â€” must reject before mutating tree. */
+    /* version=99 (unknown), rest zeros - must reject before mutating tree. */
     uint8_t buf[32] = { 99, 0, 0 };
     ecs_deserializer_t d;
     ecs_deserializer_init(&d, buf, sizeof(buf));
@@ -244,7 +244,7 @@ static void ts_world_round_trip(ecs_world_t* src, const char* tag) {
     int rc = ecs_world_deserialize(dst, &d);
     EXPECT(rc == 0, tag);
     EXPECT(ecs_world_crc64(dst) == crc_src, tag);
-    EXPECT(dst->tick == src->tick, tag);
+    EXPECT(dst->tick == src->tick, tag);  /* world->tick survives round-trip */
     EXPECT(dst->mask == src->mask, tag);
 
     ecs_world_destroy(dst); ecs_free(dst);
@@ -268,7 +268,7 @@ static void test_world_serialize_single_tree(void) {
 }
 
 static void test_world_serialize_multi_tree_mixed_sizes(void) {
-    /* Trees at slots 0, 2, 5 with different data sizes â€” exercises
+    /* Trees at slots 0, 2, 5 with different data sizes - exercises
        tree mask sparsity + per-tree data_size round-trip. */
     ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     ecs_tree_init(&w->trees[0], sizeof(comp_t), 0);      /* 4 bytes */
@@ -309,7 +309,7 @@ static void test_world_serialize_override(void) {
     ecs_serializer_flush_bits(&s);
     int32_t bytes = ecs_serializer_get_bytes_written(&s);
 
-    /* Destination: trees at slots {0, 1, 7} â€” overlap at 0, drop 1+7, add 3 */
+    /* Destination: trees at slots {0, 1, 7} - overlap at 0, drop 1+7, add 3 */
     ecs_world_t* dst = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     ecs_tree_init(&dst->trees[0], sizeof(comp_t), 0);
     ecs_tree_init(&dst->trees[1], sizeof(comp_t), 0);
@@ -334,188 +334,73 @@ static void test_world_serialize_override(void) {
 }
 
 /* ============================================================
-   Delta serialize: only entities matching a compiled query are
-   written. Wire format identical to ecs_tree_serialize -- output
-   must round-trip via ecs_tree_deserialize and match a manually
-   constructed reference tree (same indices + same component data).
+   Wire-size sanity probe: 4 trees (pos vec3, vel vec3, transform
+   TRS, flags tag), 5000 entities sparsely placed across 100k
+   slot range. Prints serialized world byte count for inspection.
    ============================================================ */
 
-static void ts_delta_round_trip(ecs_tree_t* src,
-                                   const ecs_compiled_query_t* query,
-                                   const ecs_tree_t* expected,
-                                   const char* tag) {
-    uint8_t* buf = (uint8_t*)ecs_xcalloc(1, (size_t)TS_BUFFER_BYTES);
+static void test_world_serialize_size_5k_4trees(void) {
+    enum { N_ENT = 5000, IDX_RANGE = 100000, STRIDE = IDX_RANGE / N_ENT };
+    enum { BIG_BUF = 2 * 1024 * 1024 };
+
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_tree_init(&w->trees[0], sizeof(vec3_t),      0);  /* pos    */
+    ecs_tree_init(&w->trees[1], sizeof(vec3_t),      0);  /* vel    */
+    ecs_tree_init(&w->trees[2], sizeof(transform_t), 0);  /* transform  */
+    ecs_tree_init(&w->trees[3], 0,                   0);  /* flags  */
+    w->mask = 0xFu;
+
+    for (int i = 0; i < N_ENT; i++) {
+        int idx = i * STRIDE;
+        vec3_t*      p = (vec3_t*)     ecs_tree_get_mut(&w->trees[0], idx);
+        vec3_t*      v = (vec3_t*)     ecs_tree_get_mut(&w->trees[1], idx);
+        transform_t* x = (transform_t*)ecs_tree_get_mut(&w->trees[2], idx);
+        ecs_tree_get_mut(&w->trees[3], idx);
+        *p = vec3_make((fixed_t)idx, (fixed_t)(idx + 1), (fixed_t)(idx + 2));
+        *v = vec3_make((fixed_t)i,   (fixed_t)(i * 2),   (fixed_t)(i * 3));
+        *x = transform_identity();
+    }
+    ecs_world_rollback(w);
+
+    uint8_t* buf = (uint8_t*)ecs_xcalloc(1, (size_t)BIG_BUF);
     ecs_serializer_t s;
-    ecs_serializer_init(&s, buf, TS_BUFFER_BYTES);
-    ecs_tree_serialize_delta(src, query, &s);
+    ecs_serializer_init(&s, buf, BIG_BUF);
+    ecs_world_serialize(w, &s);
     ecs_serializer_flush_bits(&s);
     int32_t bytes = ecs_serializer_get_bytes_written(&s);
-    EXPECT(bytes > 0, tag);
 
-    ecs_tree_t* dst = (ecs_tree_t*)ecs_xcalloc(1, sizeof(ecs_tree_t));
-    ecs_tree_init(dst, src->data_size, 0);
+    printf("  world_serialize: %d bytes (entities=%d, trees=4 [vec3+vec3+transform+tag], range=%d slots)\n",
+           bytes, N_ENT, IDX_RANGE);
+    EXPECT(bytes > 0, "world serialize produced output");
 
+    /* zstd compression probe + bit-exact round-trip. */
+    size_t zbound = ZSTD_compressBound((size_t)bytes);
+    uint8_t* zbuf = (uint8_t*)ecs_xcalloc(1, zbound);
+    size_t zsize = ZSTD_compress(zbuf, zbound, buf, (size_t)bytes, ZSTD_CLEVEL_DEFAULT);
+    EXPECT(!ZSTD_isError(zsize), "zstd compress ok");
+    printf("  zstd: %zu bytes (ratio %.2fx, level=%d)\n",
+           zsize, (double)bytes / (double)zsize, ZSTD_CLEVEL_DEFAULT);
+
+    uint8_t* dbuf = (uint8_t*)ecs_xcalloc(1, (size_t)BIG_BUF);
+    size_t dsize = ZSTD_decompress(dbuf, (size_t)BIG_BUF, zbuf, zsize);
+    EXPECT(!ZSTD_isError(dsize), "zstd decompress ok");
+    EXPECT(dsize == (size_t)bytes, "zstd decompressed size matches");
+    EXPECT(memcmp(dbuf, buf, (size_t)bytes) == 0, "zstd round-trip bit-exact");
+
+    /* Sanity: round-trip CRC parity (decode from zstd-decompressed buffer). */
+    uint64_t crc_src = ecs_world_crc64(w);
+    ecs_world_t* dst = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     ecs_deserializer_t d;
-    ecs_deserializer_init(&d, buf, ((bytes + 7) / 8) * 8);
-    int rc = ecs_tree_deserialize(dst, &d);
-    EXPECT(rc == 0, tag);
-    EXPECT(ecs_tree_masks_valid(dst), tag);
-    EXPECT(ecs_tree_crc64(dst) == ecs_tree_crc64(expected), tag);
-    EXPECT(dst->tick == src->tick, tag);
+    ecs_deserializer_init(&d, dbuf, ((bytes + 7) / 8) * 8);
+    int rc = ecs_world_deserialize(dst, &d);
+    EXPECT(rc == 0, "5k 4-tree world deserializes");
+    EXPECT(ecs_world_crc64(dst) == crc_src, "5k 4-tree world CRC matches");
 
-    free_tree(dst);
+    ecs_world_destroy(dst); ecs_free(dst);
+    ecs_world_destroy(w);   ecs_free(w);
     ecs_free(buf);
-}
-
-/* Single-term query: filter is a no-op -- result equals full tree. */
-static void test_serialize_delta_single_term(void) {
-    const char* names[] = {"Pos", "Vel"};
-    ecs_world_t* w = make_named_world(names, 2);
-    set_val(&w->trees[0], 5,    0xAA);
-    set_val(&w->trees[0], 1000, 0xBB);
-    set_val(&w->trees[0], 4096, 0xCC);
-    ecs_world_rollback(w);
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
-    EXPECT(q != NULL, "deltasingle-term: query compiles");
-    ts_delta_round_trip(&w->trees[0], q, &w->trees[0],
-                           "deltasingle-term matches full tree");
-
-    ecs_free(q);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
-/* AND query: result is intersection of Pos and Vel slot sets. */
-static void test_serialize_delta_and(void) {
-    const char* names[] = {"Pos", "Vel"};
-    ecs_world_t* w = make_named_world(names, 2);
-
-    set_val(&w->trees[0], 5,      0x10);
-    set_val(&w->trees[0], 1000,   0x11);
-    set_val(&w->trees[0], 4096,   0x12);
-    set_val(&w->trees[0], 100000, 0x13);
-    set_val(&w->trees[1], 5,      0x20);
-    set_val(&w->trees[1], 4096,   0x21);
-    set_val(&w->trees[1], 200000, 0x22);
-    ecs_world_rollback(w);
-
-    ecs_tree_t* expected = make_tree();
-    set_val(expected, 5,    0x10);
-    set_val(expected, 4096, 0x12);
-    ecs_tree_rollback(expected);
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & Vel");
-    ts_delta_round_trip(&w->trees[0], q, expected,
-                           "deltaAND yields intersection");
-
-    ecs_free(q);
-    free_tree(expected);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
-/* NOT query: result is Pos slots that are NOT in Vel. */
-static void test_serialize_delta_not(void) {
-    const char* names[] = {"Pos", "Vel"};
-    ecs_world_t* w = make_named_world(names, 2);
-
-    set_val(&w->trees[0], 5,    0x10);
-    set_val(&w->trees[0], 1000, 0x11);
-    set_val(&w->trees[0], 4096, 0x12);
-    set_val(&w->trees[1], 5,    0x20);
-    set_val(&w->trees[1], 4096, 0x21);
-    ecs_world_rollback(w);
-
-    ecs_tree_t* expected = make_tree();
-    set_val(expected, 1000, 0x11);
-    ecs_tree_rollback(expected);
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & !Vel");
-    ts_delta_round_trip(&w->trees[0], q, expected,
-                           "deltaNOT yields difference");
-
-    ecs_free(q);
-    free_tree(expected);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
-/* Filter that rejects every Pos slot -> empty output tree. */
-static void test_serialize_delta_empty_result(void) {
-    const char* names[] = {"Pos", "Vel"};
-    ecs_world_t* w = make_named_world(names, 2);
-
-    /* Every Pos slot is also in Vel; "Pos & !Vel" matches nothing. */
-    set_val(&w->trees[0], 5,    0xA);
-    set_val(&w->trees[0], 4096, 0xB);
-    set_val(&w->trees[1], 5,    0xC);
-    set_val(&w->trees[1], 4096, 0xD);
-    ecs_world_rollback(w);
-
-    ecs_tree_t* expected = make_tree();   /* empty */
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & !Vel");
-    ts_delta_round_trip(&w->trees[0], q, expected,
-                           "deltaempty result yields empty tree");
-
-    ecs_free(q);
-    free_tree(expected);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
-/* Pruning check: most Pos subtrees survive the input but are emptied
-   by the filter. A false-positive parent mask would leak a stale L1
-   node into the decoder and break the CRC vs. a freshly-built tree
-   that contains ONLY the surviving slot. */
-static void test_serialize_delta_prunes_subtrees(void) {
-    const char* names[] = {"Pos", "Vel"};
-    ecs_world_t* w = make_named_world(names, 2);
-
-    /* Pos scattered across multiple L2/L3 buckets; Vel matches a single
-       deep slot only -- "Pos & Vel" keeps that one entity. */
-    set_val(&w->trees[0], 5,        0x1);   /* L3[0] L2[0] L1[5]  */
-    set_val(&w->trees[0], 70,       0x2);   /* L3[0] L2[1] L1[6]  */
-    set_val(&w->trees[0], 4096,     0x3);   /* L3[1] L2[0] L1[0]  */
-    set_val(&w->trees[0], 100000,   0x4);   /* L3[24] L2[26] L1[32] */
-    set_val(&w->trees[1], 100000,   0x5);
-    ecs_world_rollback(w);
-
-    ecs_tree_t* expected = make_tree();
-    set_val(expected, 100000, 0x4);
-    ecs_tree_rollback(expected);
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & Vel");
-    ts_delta_round_trip(&w->trees[0], q, expected,
-                           "deltaprunes empty subtrees");
-
-    ecs_free(q);
-    free_tree(expected);
-    ecs_world_destroy(w); ecs_free(w);
-}
-
-/* Full L1 (all 64 slots set in Pos) intersected with sparse Vel --
-   exercises mask compression on both ends + per-block filter. */
-static void test_serialize_delta_dense_l1(void) {
-    const char* names[] = {"Pos", "Vel"};
-    ecs_world_t* w = make_named_world(names, 2);
-
-    for (int i = 0; i < 64; i++) set_val(&w->trees[0], i, (comp_t)(i + 1));
-    set_val(&w->trees[1], 0,  0x100);
-    set_val(&w->trees[1], 31, 0x131);
-    set_val(&w->trees[1], 63, 0x163);
-    ecs_world_rollback(w);
-
-    ecs_tree_t* expected = make_tree();
-    set_val(expected, 0,  1);
-    set_val(expected, 31, 32);
-    set_val(expected, 63, 64);
-    ecs_tree_rollback(expected);
-
-    ecs_compiled_query_t* q = ecs_compile_query(w, "Pos & Vel");
-    ts_delta_round_trip(&w->trees[0], q, expected,
-                           "deltadense L1 keeps only matching slots");
-
-    ecs_free(q);
-    free_tree(expected);
-    ecs_world_destroy(w); ecs_free(w);
+    ecs_free(zbuf);
+    ecs_free(dbuf);
 }
 
 static int test_serialize_all(void) {
@@ -534,12 +419,7 @@ static int test_serialize_all(void) {
     RUN_TEST(test_world_serialize_single_tree);
     RUN_TEST(test_world_serialize_multi_tree_mixed_sizes);
     RUN_TEST(test_world_serialize_override);
-    RUN_TEST(test_serialize_delta_single_term);
-    RUN_TEST(test_serialize_delta_and);
-    RUN_TEST(test_serialize_delta_not);
-    RUN_TEST(test_serialize_delta_empty_result);
-    RUN_TEST(test_serialize_delta_prunes_subtrees);
-    RUN_TEST(test_serialize_delta_dense_l1);
+    RUN_TEST(test_world_serialize_size_5k_4trees);
     int failed = g_failed - before;
     printf("\nserialize: %d failed\n", failed);
     return failed ? 1 : 0;

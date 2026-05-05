@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
 #define BP_NODE_ALIGN  32
 #define BP_MORTON_BITS 10                       /* per axis -> 30-bit code */
 #define BP_MORTON_MAX  ((1u << BP_MORTON_BITS) - 1u)
@@ -29,15 +33,27 @@ static inline uint32_t bp_quantize_recip(fixed_t v, fixed_t origin, uint64_t rec
     return (uint32_t)q;
 }
 
-/* Spread the low 10 bits of x across every third bit slot. Standard magic-
-   constant interleave; produces 0b001 001 001 ... when x=0x3FF. */
+/* Spread the low 10 bits of x across every third bit slot -- produces
+   0b001 001 001 ... when x = 0x3FF.
+
+   BMI2 path: PDEP deposits the low 10 input bits into the 10 set positions of
+   the destination mask (0x09249249 = bits 0,3,6,...,27). Single-uop, ~3-cycle
+   latency on Intel Haswell+ and AMD Zen 3+. Caveat: Zen 1/2 PDEP is
+   microcoded (~250 cycles) -- if you target those parts, undefine __BMI2__
+   for this TU or add a runtime gate.
+
+   Scalar fallback: standard magic-constant interleave, ~9 cycles. */
 static inline uint32_t bp_morton_part(uint32_t x) {
+#if defined(__BMI2__)
+    return _pdep_u32(x & 0x3FFu, 0x09249249u);
+#else
     x &= 0x3FFu;
     x = (x | (x << 16)) & 0x030000FFu;
     x = (x | (x <<  8)) & 0x0300F00Fu;
     x = (x | (x <<  4)) & 0x030C30C3u;
     x = (x | (x <<  2)) & 0x09249249u;
     return x;
+#endif
 }
 
 static inline uint32_t bp_morton30(uint32_t x, uint32_t y, uint32_t z) {
@@ -54,14 +70,15 @@ static inline uint32_t bp_morton30(uint32_t x, uint32_t y, uint32_t z) {
         fixed8_ge sets that lane bit. */
 
 /* SIMD overlap: 8 child/leaf slots vs 1 query AABB. Six fixed8 compares +
-   five ANDs. AND with presence_mask zeros out unoccupied lanes so undefined
-   slot data cannot produce false hits. Same routine works on internal nodes
-   (lane = child AABB) and leaves (lane = item AABB). */
-static inline uint8_t bp_overlap_mask(const broadphase_node_t* n, aabb_t q) {
-    fixed_8_t qmin_x = fixed8_set1(q.min.x), qmax_x = fixed8_set1(q.max.x);
-    fixed_8_t qmin_y = fixed8_set1(q.min.y), qmax_y = fixed8_set1(q.max.y);
-    fixed_8_t qmin_z = fixed8_set1(q.min.z), qmax_z = fixed8_set1(q.max.z);
-
+   five ANDs. Caller passes pre-splatted query lanes (cached in the iterator)
+   so the splat ops happen once per query, not once per visited node. AND with
+   presence_mask zeros out unoccupied lanes so undefined slot data cannot
+   produce false hits. Same routine works on internal nodes (lane = child
+   AABB) and leaves (lane = item AABB). */
+static inline uint8_t bp_overlap_mask(const broadphase_node_t* n,
+    fixed_8_t qmin_x, fixed_8_t qmax_x,
+    fixed_8_t qmin_y, fixed_8_t qmax_y,
+    fixed_8_t qmin_z, fixed_8_t qmax_z) {
     uint8_t m = fixed8_le(n->min_x, qmax_x) & fixed8_ge(n->max_x, qmin_x)
               & fixed8_le(n->min_y, qmax_y) & fixed8_ge(n->max_y, qmin_y)
               & fixed8_le(n->min_z, qmax_z) & fixed8_ge(n->max_z, qmin_z);
@@ -195,22 +212,21 @@ void broadphase_insert(broadphase_t* bp, broadphase_object_t obj, aabb_t aabb) {
     bp->has_tree = 0;
 }
 
-/* 4-pass × 8-bit LSD radix sort of perm by morton[perm[i]]. After 4 even-
-   indexed passes, the sorted output lives back in perm; perm_alt is scratch.
-   Stable, so equal-morton items keep insertion order. */
+/* 4-pass × 8-bit LSD radix sort of perm by keys[perm[i]]. Covers full 32-bit
+   keys. Stable. Even pass count → final scatter writes to perm directly, no
+   trailing memcpy needed. */
 static void bp_radix_sort_perm(const uint32_t* restrict keys,
     uint32_t* restrict perm,
     uint32_t* restrict perm_alt,
     uint32_t n) {
-    if (n == 0) return;
 
     uint32_t hist[4][256] = { {0} };
 
     // 1. Parallel Histogram Generation (Unrolled)
     for (uint32_t i = 0; i < n; i++) {
         uint32_t k = keys[perm[i]];
-        hist[0][(k) & 0xFFu]++;
-        hist[1][(k >> 8) & 0xFFu]++;
+        hist[0][(k)       & 0xFFu]++;
+        hist[1][(k >>  8) & 0xFFu]++;
         hist[2][(k >> 16) & 0xFFu]++;
         hist[3][(k >> 24) & 0xFFu]++;
     }
@@ -229,28 +245,23 @@ static void bp_radix_sort_perm(const uint32_t* restrict keys,
     uint32_t* dst = perm_alt;
 
     // 3. Four-Pass Scatter
-    // We unroll the passes to eliminate pointer swapping logic and the final memcpy
     for (int p = 0; p < 4; p++) {
-        uint32_t shift = p << 3;
+        uint32_t shift = (uint32_t)p * 8u;
         uint32_t* h = hist[p];
 
-        // Scatter loop with manual optimization
         for (uint32_t i = 0; i < n; i++) {
             uint32_t p_idx = src[i];
             uint32_t key = keys[p_idx];
             uint32_t bucket = (key >> shift) & 0xFFu;
-
-            // The destination is often a cache miss.
-            // In high-performance scenarios, __builtin_prefetch could be used here.
             dst[h[bucket]++] = p_idx;
         }
 
-        // Swap src and dst for the next pass
         uint32_t* tmp = src;
         src = dst;
         dst = tmp;
     }
-    // Result is guaranteed to be in perm because of 4 swaps.
+    // Even pass count: src points back to perm after final swap; sorted output
+    // already in perm.
 }
 
 /* Pack one tree level. Reads child_lo..child_hi nodes (or items, when
@@ -416,14 +427,19 @@ void broadphase_build(broadphase_t* bp) {
 }
 
 void broadphase_query_begin(broadphase_iter_t* it, const broadphase_t* bp, aabb_t q) {
-    /* The struct has a const-qualified `q`, so plain field assignment is
-       illegal -- build the iterator on the stack and memcpy it across. */
+    /* The struct has const-qualified `q` plus the cached splat lanes, so plain
+       field assignment is illegal -- build the iterator on the stack and memcpy
+       it across. The splats are computed exactly once here; bp_overlap_mask
+       reuses them across every visited node. */
     broadphase_iter_t init = {
-        .bp   = bp,
-        .q    = q,
-        .node = NULL,
-        .mask = 0,
-        .sp   = 0,
+        .bp     = bp,
+        .q      = q,
+        .qmin_x = fixed8_set1(q.min.x), .qmax_x = fixed8_set1(q.max.x),
+        .qmin_y = fixed8_set1(q.min.y), .qmax_y = fixed8_set1(q.max.y),
+        .qmin_z = fixed8_set1(q.min.z), .qmax_z = fixed8_set1(q.max.z),
+        .node   = NULL,
+        .mask   = 0,
+        .sp     = 0,
     };
     if (bp->has_tree && bp->n_nodes > 0) {
         init.stack[0] = bp->root;
@@ -432,15 +448,20 @@ void broadphase_query_begin(broadphase_iter_t* it, const broadphase_t* bp, aabb_
     memcpy(it, &init, sizeof(*it));
 }
 
-int br(broadphase_iter_t* it, uint32_t* out_id) {
+const broadphase_object_t* br(broadphase_iter_t* it) {
     /* Entered with it->mask == 0. Pop nodes from the stack and split each
        node's hit lanes by object_mask: child lanes get pushed for descent,
        object lanes are yielded (one now, rest stashed in it->mask). it->mask
        is always object-only -- the fast path never sees a child lane. */
+    /* Hoist the cached splats out of the descent loop -- the compiler keeps
+       them in SIMD registers across every bp_overlap_mask call. */
+    const fixed_8_t qmin_x = it->qmin_x, qmax_x = it->qmax_x;
+    const fixed_8_t qmin_y = it->qmin_y, qmax_y = it->qmax_y;
+    const fixed_8_t qmin_z = it->qmin_z, qmax_z = it->qmax_z;
     while (it->sp > 0) {
         uint32_t idx = it->stack[--it->sp];
         const broadphase_node_t* n = &it->bp->nodes[idx];
-        uint8_t m = bp_overlap_mask(n, it->q);
+        uint8_t m = bp_overlap_mask(n, qmin_x, qmax_x, qmin_y, qmax_y, qmin_z, qmax_z);
         if (!m) continue;
         uint8_t obj_hits   = (uint8_t)(m & n->object_mask);
         uint8_t child_hits = (uint8_t)(m & ~n->object_mask);
@@ -455,13 +476,13 @@ int br(broadphase_iter_t* it, uint32_t* out_id) {
         }
         if (obj_hits) {
             int b = ecs_ctz32((uint32_t)obj_hits);
-            *out_id  = it->bp->objects[n->ids[b]].entity_id;
+            const broadphase_object_t* obj = &it->bp->objects[n->ids[b]];
             it->node = n;
             it->mask = (uint8_t)(obj_hits & (obj_hits - 1u));
-            return 1;
+            return obj;
         }
     }
     it->node = NULL;
     it->mask = 0;
-    return 0;
+    return NULL;
 }

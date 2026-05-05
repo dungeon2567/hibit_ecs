@@ -150,32 +150,11 @@ void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query, ui
        the L3 advance. */
     it->l3_idx     = 0;
     it->l2_idx     = 0;
-    /* write_mask, mode, world, world_tree_idx: const post-init â€” written via cast.
+    /* write_mask, mode, world, world_tree_idx: const post-init - written via cast.
        Same idiom as l1 / l1_data / data_size below. */
     *(uint32_t*)&it->write_mask      = write_mask;
     *(ecs_mode_t*)&it->mode          = query->tree_count ? query->trees[0]->mode : ECS_MODE_CONFIRMED;
     *(const ecs_world_t**)&it->world = query->world;
-
-#ifndef NDEBUG
-    /* `changed` clauses read tree->changed bitmap, which is per-tick. Require
-       ecs_world_begin_tick (or ecs_tree_begin_tick on every involved tree) to
-       have run this tick â€” i.e. tree->tick_id_at_begin == world->tick_id.
-       Debug-only: hot path skips the scan in Release. */
-    {
-        uint32_t changed_terms = 0;
-        for (uint32_t c = 0; c < query->clause_count; c++)
-            changed_terms |= query->clauses[c].changed;
-        if (changed_terms) {
-            assert(query->world && "ecs_iterator_init: query has changed-clause but no world");
-            uint64_t tick_id = query->world->tick_id;
-            while (changed_terms) {
-                int t = ecs_ctz32(changed_terms); changed_terms &= changed_terms - 1;
-                assert(query->trees[t]->tick_id_at_begin == tick_id &&
-                       "ecs_iterator_init: changed-clause used without ecs_world_begin_tick this tick");
-            }
-        }
-    }
-#endif
 
     /* Fused: world_tree_idx + per-slot pointer init in one pass. */
     const ecs_tree_t* base = query->world ? &query->world->trees[0] : NULL;
@@ -326,7 +305,7 @@ next_l2:
    ========================================================================== */
 
 /* Internal: acquire L2/L1 + propagate masks for a write at `index`. Sets all
-   masks (predicted/confirmed/dirty/changed) unconditionally â€” caller is
+   masks (predicted/confirmed/dirty/changed) unconditionally - caller is
    asserting that the slot is being written this frame, no eq-check. Returns
    l1s (used by ecs_tree_buffer_push for direct slot access pre-write). */
 static ecs_l1_t* tree_acquire_and_mark(ecs_tree_t* tree, int index,
@@ -416,7 +395,7 @@ void* ecs_tree_get_mut(ecs_tree_t* tree, int index) {
    via tree_acquire_and_mark_. `wants_confirmed_seed` controls whether the
    COW seeds the predicted buffer from the confirmed buffer (push/pop) or
    leaves it empty (clear). */
-static ecs_buffer_t* buffer_live_(ecs_tree_t* tree, int index, int wants_confirmed_seed) {
+static ecs_buffer_t* buffer_live(ecs_tree_t* tree, int index, int wants_confirmed_seed) {
     assert(tree && (tree->flags & ECS_TREE_FLAG_BUFFER));
     assert(index >= 0 && index < (1 << 18));
     assert(tree->data_size == sizeof(ecs_buffer_t));
@@ -427,7 +406,7 @@ static ecs_buffer_t* buffer_live_(ecs_tree_t* tree, int index, int wants_confirm
     uint64_t m    = (uint64_t)tree->mode;
     uint64_t bit1 = 1ULL << l1_idx;
 
-    /* Pre-mark snapshot â€” tree_acquire_and_mark_ would set dirty unconditionally
+    /* Pre-mark snapshot - tree_acquire_and_mark_ would set dirty unconditionally
        and break the COW test. */
     ecs_l2_t* pre_l2 = tree->root->children[l3_idx];
     ecs_l1_t* pre_l1 = (pre_l2 == &ecs_default_l2) ? &ecs_default_l1
@@ -464,22 +443,22 @@ static ecs_buffer_t* buffer_live_(ecs_tree_t* tree, int index, int wants_confirm
 
 void ecs_tree_buffer_push(ecs_tree_t* tree, int index, size_t elem_size, const void* value) {
     assert(elem_size && value);
-    ecs_buffer_t* live = buffer_live_(tree, index, /*wants_confirmed_seed=*/1);
+    ecs_buffer_t* live = buffer_live(tree, index, /*wants_confirmed_seed=*/1);
     ecs_buffer_push(live, elem_size, value);
 }
 
 void ecs_tree_buffer_pop(ecs_tree_t* tree, int index, size_t elem_size) {
     assert(elem_size);
-    ecs_buffer_t* live = buffer_live_(tree, index, /*wants_confirmed_seed=*/1);
+    ecs_buffer_t* live = buffer_live(tree, index, /*wants_confirmed_seed=*/1);
     ecs_buffer_pop(*live, elem_size);
 }
 
 void ecs_tree_buffer_clear(ecs_tree_t* tree, int index) {
     /* Skip seeding; clear discards confirmed contents conceptually. CONFIRMED
        mode keeps the buffer (size=0, capacity preserved). PREDICT first touch
-       leaves pred->h = NULL â€” next push allocs fresh. PREDICT subsequent
+       leaves pred->h = NULL - next push allocs fresh. PREDICT subsequent
        touch on already-COWed pred buffer just zeroes size. */
-    ecs_buffer_t* live = buffer_live_(tree, index, /*wants_confirmed_seed=*/0);
+    ecs_buffer_t* live = buffer_live(tree, index, /*wants_confirmed_seed=*/0);
     if (live->h) live->h->size = 0u;
 }
 
@@ -601,6 +580,7 @@ static uint64_t ecs_crc64_feed(uint64_t crc, const void* data, size_t len) {
 
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree) {
     uint64_t crc = ~0ULL;
+
     const ecs_l3_t* l3 = tree->root;
     crc = ecs_crc64_feed(crc, &l3->predicted_mask_any, 8);
     uint64_t visit3 = l3->predicted_mask_any;
@@ -651,10 +631,10 @@ uint64_t ecs_world_crc64(const ecs_world_t* world) {
    adds (no confirmed bytes) get released back to the L1/L2 pool.
    ========================================================================== */
 
-void ecs_tree_rollback(ecs_tree_t* tree) {
+int ecs_tree_rollback(ecs_tree_t* tree) {
     assert(tree);
     ecs_l3_t* l3s   = tree->root;
-    if ((l3s->dirty | l3s->changed) == 0) return;     /* idle tick â€” no advance */
+    if ((l3s->dirty | l3s->changed) == 0) return 0;   /* idle tick - no advance */
     uint64_t visit3 = l3s->dirty | l3s->changed;
 
     /* Confirmed state advanced iff any slot has changed&~dirty (CONFIRMED-mode
@@ -675,7 +655,7 @@ void ecs_tree_rollback(ecs_tree_t* tree) {
             if (l1s->changed & ~l1s->dirty) confirmed_advanced = 1;
 
             /* BUFFER: predicted slot bytes hold a live this-cycle buffer header
-               iff (predicted_mask_any & dirty) bit set â€” predict-set this
+               iff (predicted_mask_any & dirty) bit set - predict-set this
                cycle that wasn't subsequently predict-removed (which would
                have freed inline and cleared predicted_mask). Free live
                clones before mask reset, otherwise rollback leaks them. POD
@@ -717,21 +697,22 @@ void ecs_tree_rollback(ecs_tree_t* tree) {
     l3s->dirty               = 0;
     l3s->changed             = 0;
 
-    if (confirmed_advanced) tree->tick++;
     assert(ecs_tree_masks_valid(tree) && "ecs_tree_rollback: mask invariant broken post-rollback");
+    return confirmed_advanced;
 }
 
 /* ==========================================================================
-   Begin-tick â€” clears `changed` hierarchy. Walks `changed` mask sparsely.
+   End-tick - clears `changed` hierarchy. Walks `changed` mask sparsely.
    `changed` is system-facing per-tick delta; lifetime independent of dirty.
    Default-pointer children are skipped (they may be empty stubs left after
    removal that still carry parent-bit set in `changed`).
    ========================================================================== */
-void ecs_tree_begin_tick(ecs_tree_t* tree) {
+void ecs_tree_end_tick(ecs_tree_t* tree) {
     assert(tree);
-    if (tree->root->changed == 0) return;
+
     ecs_l3_t* l3s   = tree->root;
     uint64_t visit3 = l3s->changed;
+
     while (visit3) {
         int i = ecs_ctz64(visit3); visit3 &= visit3 - 1;
         ecs_l2_t* l2s = l3s->children[i];
@@ -748,29 +729,27 @@ void ecs_tree_begin_tick(ecs_tree_t* tree) {
     l3s->changed = 0;
 }
 
-/* Bumps world->tick_id, clears `changed` everywhere, snapshots tick_id onto
-   each populated tree. Pairs with the changed-clause invariant in
-   ecs_iterator_init. Mode-agnostic â€” same call for CONFIRMED + PREDICT ticks. */
-void ecs_world_begin_tick(ecs_world_t* world) {
+/* Bumps world->tick_id, clears `changed` everywhere on populated trees.
+   Mode-agnostic - same call for CONFIRMED + PREDICT ticks. */
+void ecs_world_end_tick(ecs_world_t* world) {
     assert(world);
     world->tick_id++;
     uint64_t mask = world->mask;
     while (mask) {
         int i = ecs_ctz64(mask); mask &= mask - 1;
-        ecs_tree_begin_tick(&world->trees[i]);
-        world->trees[i].tick_id_at_begin = world->tick_id;
+        ecs_tree_end_tick(&world->trees[i]);
     }
 }
 
 void ecs_pipeline_run(ecs_pipeline_t* p, ecs_world_t* world) {
     assert(p && world);
-    ecs_world_begin_tick(world);
     uint32_t n = p->count;
     ecs_system_fn* fns  = p->fns;
     void**         ctxs = p->ctxs;
     for (uint32_t i = 0; i < n; i++) {
         fns[i](world, ctxs[i]);
     }
+    ecs_world_end_tick(world);
 }
 
 /* ==========================================================================
@@ -846,9 +825,7 @@ void ecs_world_rollback(ecs_world_t* world) {
     int any_advanced = 0;
     while (mask) {
         int i = ecs_ctz64(mask); mask &= mask - 1;
-        uint64_t before = world->trees[i].tick;
-        ecs_tree_rollback(&world->trees[i]);
-        if (world->trees[i].tick != before) any_advanced = 1;
+        any_advanced |= ecs_tree_rollback(&world->trees[i]);
     }
     if (any_advanced) world->tick++;
 }
@@ -889,8 +866,8 @@ void ecs_world_destroy(ecs_world_t* world) {
    bitpacked via ecs_serializer.
    ========================================================================== */
 
-void ecs_serialize_batch_raw(const void* l1_data, size_t block_size,
-                             uint64_t mask, ecs_serializer_t* s) {
+static void ecs_serialize_batch_raw(const void* l1_data, size_t block_size,
+                                    uint64_t mask, ecs_serializer_t* s) {
     if (!block_size || !mask) return;
     /* write_bytes self-aligns; coalesce runs of consecutive set bits into
        a single bulk write (shared with ecs_memcpy_sparse via ecs_mask_pop_run). */
@@ -902,8 +879,8 @@ void ecs_serialize_batch_raw(const void* l1_data, size_t block_size,
     }
 }
 
-void ecs_deserialize_batch_raw(void* l1_data, size_t block_size,
-                               uint64_t mask, ecs_deserializer_t* d) {
+static void ecs_deserialize_batch_raw(void* l1_data, size_t block_size,
+                                      uint64_t mask, ecs_deserializer_t* d) {
     if (!block_size || !mask) return;
     int idx, run;
     while ((run = ecs_mask_pop_run(&mask, &idx))) {
@@ -989,13 +966,12 @@ static void ecs_serialize_varint(uint64_t v, ecs_serializer_t* s) {
 void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
     assert(tree && s);
 
-    uint8_t version = 1;
+    uint8_t version = 2;
     uint8_t flags   = (tree->data_size > 0) ? 1u : 0u;
     ecs_serializer_write_bits(s, version, 8);
     ecs_serializer_write_bits(s, flags,   8);
 
     ecs_serialize_varint((uint64_t)tree->data_size, s);
-    ecs_serialize_u64_(tree->tick, s);
 
     const ecs_l3_t* l3 = tree->root;
 
@@ -1028,9 +1004,7 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
        so we don't pre-pad -- the alignment cost (<=7 bits) lands inside
        write_bytes once at the pass-1/pass-2 boundary.
        Same walk order as pass 1 -- decoder traverses the reconstructed
-       topology in the identical order to find each batch's payload.
-       tree->serialize_batch is set by ecs_tree_init (defaults to
-       ecs_serialize_batch_raw), so no NULL check needed here. */
+       topology in the identical order to find each batch's payload. */
     v3 = l3->confirmed_mask_any;
     while (v3) {
         int i = ecs_ctz64(v3); v3 &= v3 - 1;
@@ -1040,189 +1014,8 @@ void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
         while (v2) {
             int j = ecs_ctz64(v2); v2 &= v2 - 1;
             const ecs_l1_t* l1 = l2->children[j];
-            tree->serialize_batch(ecs_l1_data(l1), tree->data_size,
-                                  l1->confirmed_mask_any, s);
-        }
-    }
-}
-
-/* Confirmed-state variants of iter_compute_l{1,2,3}_mask. Serializer writes
-   confirmed_mask_any; filters must read the same field so include/exclude
-   semantics agree with the bits we actually emit (predicted-mode bits would
-   diverge under in-flight prediction).
-
-   L3/L2 variants are subtree-prune helpers: a cleared bit in the result
-   means the entire L2 / L1 child can be skipped. Exclude uses _mask_all
-   (only drop subtrees where every slot has the term) -- partial overlap
-   falls through to the next level. */
-static uint64_t serialize_compute_l3_filter(const ecs_compiled_query_t* q,
-                                            const ecs_l3_t* const l3[]) {
-    uint64_t result = 0;
-    for (uint32_t c = 0; c < q->clause_count; c++) {
-        const ecs_compiled_clause_t* cl = &q->clauses[c];
-        if (!cl->include && !cl->exclude && !cl->changed) continue;
-
-        uint64_t bits = ~0ULL;
-        uint32_t mask = cl->include;
-        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l3[n]->confirmed_mask_any; }
-        mask = cl->exclude;
-        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l3[n]->confirmed_mask_all; }
-        if (cl->changed) {
-            uint64_t any_changed = 0;
-            mask = cl->changed;
-            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l3[n]->changed; }
-            bits &= any_changed;
-        }
-        result |= bits;
-    }
-    return result;
-}
-
-static uint64_t serialize_compute_l2_filter(const ecs_compiled_query_t* q,
-                                            const ecs_l2_t* const l2[]) {
-    uint64_t result = 0;
-    for (uint32_t c = 0; c < q->clause_count; c++) {
-        const ecs_compiled_clause_t* cl = &q->clauses[c];
-        if (!cl->include && !cl->exclude && !cl->changed) continue;
-
-        uint64_t bits = ~0ULL;
-        uint32_t mask = cl->include;
-        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l2[n]->confirmed_mask_any; }
-        mask = cl->exclude;
-        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l2[n]->confirmed_mask_all; }
-        if (cl->changed) {
-            uint64_t any_changed = 0;
-            mask = cl->changed;
-            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l2[n]->changed; }
-            bits &= any_changed;
-        }
-        result |= bits;
-    }
-    return result;
-}
-
-static uint64_t serialize_compute_l1_filter(const ecs_compiled_query_t* q,
-                                            const ecs_l1_t* const l1[]) {
-    uint64_t result = 0;
-    for (uint32_t c = 0; c < q->clause_count; c++) {
-        const ecs_compiled_clause_t* cl = &q->clauses[c];
-        if (!cl->include && !cl->exclude && !cl->changed) continue;
-
-        uint64_t bits = ~0ULL;
-        uint32_t mask = cl->include;
-        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l1[n]->confirmed_mask_any; }
-        mask = cl->exclude;
-        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l1[n]->confirmed_mask_any; }
-        if (cl->changed) {
-            uint64_t any_changed = 0;
-            mask = cl->changed;
-            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l1[n]->changed; }
-            bits &= any_changed;
-        }
-        result |= bits;
-    }
-    return result;
-}
-
-void ecs_tree_serialize_delta(const ecs_tree_t* tree,
-                                 const ecs_compiled_query_t* query,
-                                 ecs_serializer_t* s) {
-    assert(tree && query && s);
-
-    /* Wire format identical to ecs_tree_serialize -- ecs_tree_deserialize
-       reads the output unchanged. L1 masks are intersected with the
-       per-block query filter; L2/L3 masks are rebuilt bottom-up so a
-       parent bit is set IFF its subtree contains at least one surviving
-       slot (no false positives -- empty subtrees disappear from both the
-       mask stream and the payload stream). */
-    uint8_t version = 1;
-    uint8_t flags   = (tree->data_size > 0) ? 1u : 0u;
-    ecs_serializer_write_bits(s, version, 8);
-    ecs_serializer_write_bits(s, flags,   8);
-
-    ecs_serialize_varint((uint64_t)tree->data_size, s);
-    ecs_serialize_u64_(tree->tick, s);
-
-    const ecs_l3_t* l3 = tree->root;
-
-    /* Pre-pass: compute delta L1 masks, propagate to L2/L3. Storage
-       scoped to set L3/L2 bits only -- worst case 64*64 u64 = 32 KiB stack.
-       L3/L2 filters short-circuit walk: cleared bits skip whole subtrees
-       that the query already prunes (mirrors iter_compute_l{2,3}_mask). */
-    uint64_t delta_l1[64][64];
-    uint64_t delta_l2[64];
-    uint64_t delta_l3 = 0;
-
-    {
-        const ecs_l3_t* l3_arr[ECS_QUERY_MAX_TERMS];
-        for (uint32_t t = 0; t < query->tree_count; t++)
-            l3_arr[t] = query->trees[t]->root;
-        uint64_t l3_filter = serialize_compute_l3_filter(query, l3_arr);
-
-        uint64_t v3 = l3->confirmed_mask_any & l3_filter;
-        while (v3) {
-            int i = ecs_ctz64(v3); v3 &= v3 - 1;
-            const ecs_l2_t* l2 = l3->children[i];
-
-            const ecs_l2_t* l2_arr[ECS_QUERY_MAX_TERMS];
-            for (uint32_t t = 0; t < query->tree_count; t++)
-                l2_arr[t] = l3_arr[t]->children[i];
-            uint64_t l2_filter = serialize_compute_l2_filter(query, l2_arr);
-
-            uint64_t fl2 = 0;
-            uint64_t v2  = l2->confirmed_mask_any & l2_filter;
-            while (v2) {
-                int j = ecs_ctz64(v2); v2 &= v2 - 1;
-
-                const ecs_l1_t* l1_arr[ECS_QUERY_MAX_TERMS];
-                for (uint32_t t = 0; t < query->tree_count; t++)
-                    l1_arr[t] = l2_arr[t]->children[j];
-                uint64_t l1_filter = serialize_compute_l1_filter(query, l1_arr);
-                uint64_t out       = l2->children[j]->confirmed_mask_any & l1_filter;
-
-                if (out) {
-                    delta_l1[i][j] = out;
-                    fl2 |= (uint64_t)1 << j;
-                }
-            }
-            delta_l2[i] = fl2;
-            if (fl2) delta_l3 |= (uint64_t)1 << i;
-        }
-    }
-
-    /* Pass 1: emit pruned masks. */
-    ecs_serialize_mask(delta_l3, s);
-    {
-        uint64_t v3 = delta_l3;
-        while (v3) {
-            int i = ecs_ctz64(v3); v3 &= v3 - 1;
-            ecs_serialize_mask(delta_l2[i], s);
-
-            uint64_t v2 = delta_l2[i];
-            while (v2) {
-                int j = ecs_ctz64(v2); v2 &= v2 - 1;
-                ecs_serialize_mask(delta_l1[i][j], s);
-            }
-        }
-    }
-
-    if (!tree->data_size || !delta_l3) return;
-
-    /* Pass 2: payload. Iterate the same pruned topology so payload bytes
-       align 1:1 with the masks emitted in pass 1. */
-    {
-        uint64_t v3 = delta_l3;
-        while (v3) {
-            int i = ecs_ctz64(v3); v3 &= v3 - 1;
-            const ecs_l2_t* l2 = l3->children[i];
-
-            uint64_t v2 = delta_l2[i];
-            while (v2) {
-                int j = ecs_ctz64(v2); v2 &= v2 - 1;
-                const ecs_l1_t* l1_self = l2->children[j];
-                tree->serialize_batch(ecs_l1_data(l1_self), tree->data_size,
-                                      delta_l1[i][j], s);
-            }
+            ecs_serialize_batch_raw(ecs_l1_data(l1), tree->data_size,
+                                    l1->confirmed_mask_any, s);
         }
     }
 }
@@ -1270,7 +1063,7 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
 
     uint8_t version = (uint8_t)ecs_deserializer_read_bits(d, 8);
     uint8_t flags   = (uint8_t)ecs_deserializer_read_bits(d, 8);
-    if (version != 1) return -1;
+    if (version != 2) return -1;
     (void)flags;  /* bit0 is has_data; redundant with data_size */
 
     uint64_t data_size = ecs_deserialize_varint(d);
@@ -1282,8 +1075,6 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
     } else if (data_size != tree->data_size) {
         return -1;
     }
-
-    tree->tick = ecs_deserializer_read_bits(d, 64);
 
     /* ---- Pass 1: read masks, repurpose / acquire / release nodes. ----
        Walk every slot 0..63 testing the sentinel pointer (NOT the old
@@ -1372,8 +1163,8 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
         while (v2) {
             int j = ecs_ctz64(v2); v2 &= v2 - 1;
             ecs_l1_t* l1 = l2->children[j];
-            tree->deserialize_batch(ecs_l1_data(l1), tree->data_size,
-                                    l1->confirmed_mask_any, d);
+            ecs_deserialize_batch_raw(ecs_l1_data(l1), tree->data_size,
+                                      l1->confirmed_mask_any, d);
         }
     }
     return 0;
@@ -1386,7 +1177,7 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
 
 void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
     assert(world && s);
-    uint8_t version = 1;
+    uint8_t version = 2;
     ecs_serializer_write_bits(s, version, 8);
     ecs_serializer_write_bits(s, world->tick, 64);
     ecs_serialize_mask(world->mask, s);
@@ -1401,7 +1192,7 @@ void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
 int ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d) {
     assert(world && d);
     uint8_t version = (uint8_t)ecs_deserializer_read_bits(d, 8);
-    if (version != 1) return -1;
+    if (version != 2) return -1;
 
     world->tick = ecs_deserializer_read_bits(d, 64);
     uint64_t new_mask = ecs_deserialize_mask(d);
@@ -1434,13 +1225,13 @@ int ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d) {
 void ecs_tree_destroy(ecs_tree_t* tree) {
     assert(tree);
     if (tree->root) {
-        /* Tree must be at rest â€” predicted == confirmed everywhere, dirty=0.
+        /* Tree must be at rest - predicted == confirmed everywhere, dirty=0.
            That collapses confirmed_mask_any and predicted_mask_any to the
            same "any present" mask, so we just iterate one of them with ctz
            (skipping all-zero L2/L1 subtrees outright). Heap-owning
            components must promote or rollback before destroy. */
         assert(ecs_tree_no_dirty(tree) &&
-               "ecs_tree_destroy: in-flight prediction â€” promote or rollback first");
+               "ecs_tree_destroy: in-flight prediction - promote or rollback first");
 
         uint64_t v3 = tree->root->confirmed_mask_any;
         while (v3) {

@@ -4,7 +4,7 @@
 #include "test_ecs.h"
 
 /* `changed` semantics:
-     - per-tick delta (cleared by ecs_tree_begin_tick / ecs_world_begin_tick)
+     - per-tick delta (cleared by ecs_tree_end_tick / ecs_world_end_tick)
      - set unconditionally (both CONFIRMED + PREDICT modes)
      - propagated bottom-up via ecs_iterator_next_block's write_mask path
      - cleared by rollback on dirty-walked nodes (predicted-only writes only)
@@ -40,14 +40,14 @@ static void test_changed_remove_marks(void) {
     free_tree(t);
 }
 
-static void test_changed_begin_tick_clears(void) {
+static void test_changed_end_tick_clears(void) {
     ecs_tree_t* t = make_tree();
     set_val(t, 0,    1);
     set_val(t, 64,   2);                 /* different L1 */
     set_val(t, 4096, 3);                 /* different L2 */
     EXPECT(t->root->changed != 0, "changed populated");
 
-    ecs_tree_begin_tick(t);
+    ecs_tree_end_tick(t);
     EXPECT(t->root->changed == 0, "l3 changed zero");
     /* Each l2 / l1 visited via the changed walk must also be zeroed. */
     EXPECT(l2_of(t, 0)->changed       == 0, "l2[0] changed zero");
@@ -63,7 +63,7 @@ static void test_changed_rollback_clears_on_dirty_walk(void) {
     ecs_tree_t* t = make_tree();
     set_val(t, 0, 1);
     ecs_tree_rollback(t);
-    ecs_tree_begin_tick(t);
+    ecs_tree_end_tick(t);
 
     /* PREDICT mode write — dirty + changed both set on this node. */
     ecs_tree_set_mode(t, ECS_MODE_PREDICT);
@@ -89,8 +89,8 @@ static void test_changed_iter_set_propagates(void) {
     set_val(&w->trees[0], ENT(0, 0, 0), 10);
     set_val(&w->trees[0], ENT(0, 2, 0), 20);
     ecs_world_rollback(w);
-    ecs_world_begin_tick(w);
-    EXPECT(w->trees[0].root->changed == 0, "begin_tick cleared root changed");
+    ecs_world_end_tick(w);
+    EXPECT(w->trees[0].root->changed == 0, "end_tick cleared root changed");
 
     ecs_compiled_query_t* q = ecs_compile_query(w, "Pos");
     ecs_iterator_t it = {0};
@@ -151,7 +151,7 @@ static int test_changed_all(void) {
     printf("=== changed-mask tests ===\n\n");
     RUN_TEST(test_changed_set_marks_hierarchy);
     RUN_TEST(test_changed_remove_marks);
-    RUN_TEST(test_changed_begin_tick_clears);
+    RUN_TEST(test_changed_end_tick_clears);
     RUN_TEST(test_changed_rollback_clears_on_dirty_walk);
     RUN_TEST(test_changed_iter_set_propagates);
     RUN_TEST(test_changed_deserialize_zeros);

@@ -44,7 +44,7 @@ static inline void* ecs_xrealloc_aligned(void* p, size_t size, size_t align) {
    `ecs_buffer_t l = {0};` a valid empty buffer (h == NULL) and keeps the public
    type stable as a value type. Mutating ops take `ecs_buffer_t*` because
    growth may reallocate the header.
-   Growth: 1.5Ãƒâ€” from base 8 bytes. push memcpy's the value (or leaves the
+   Growth: 1.5Ãƒ- from base 8 bytes. push memcpy's the value (or leaves the
    slot uninitialized when value == NULL, returning the slot ptr).
 
    Usage:
@@ -81,7 +81,7 @@ static inline void ecs_buffer_reserve(ecs_buffer_t* l, uint32_t min_cap_bytes) {
     uint32_t cap = l->h ? l->h->capacity : 0u;
     if (min_cap_bytes <= cap) return;
     uint32_t newcap = cap ? cap : 8u;
-    while (newcap < min_cap_bytes) newcap = newcap + (newcap >> 1) + 1u;  /* 1.5Ãƒâ€” */
+    while (newcap < min_cap_bytes) newcap = newcap + (newcap >> 1) + 1u;  /* 1.5Ãƒ- */
     ecs_buffer_header_t* nh = (ecs_buffer_header_t*)ecs_xrealloc_aligned(
         l->h, sizeof(ecs_buffer_header_t) + (size_t)newcap, 8);
     if (!l->h) nh->size = 0u;               /* fresh alloc -- size was uninitialized */
@@ -123,7 +123,7 @@ static inline void ecs_buffer_swap_remove(ecs_buffer_t l, size_t elem_size, uint
 }
 
 /* ==========================================================================
-   Predict-mode ECS â€” two buffers per L1 (confirmed + predicted), no undo log.
+   Predict-mode ECS - two buffers per L1 (confirmed + predicted), no undo log.
 
      confirmed_mask_any  = authoritative presence (advances only via CONFIRMED writes)
      predicted_mask_any  = live working-set this frame (predicted is ALWAYS speculative)
@@ -138,7 +138,8 @@ static inline void ecs_buffer_swap_remove(ecs_buffer_t l, size_t elem_size, uint
    CONFIRMED mode (server msgs / authoritative sim).
 
    ecs_tree_rollback = tick-end. predicted_mask = confirmed_mask, dirty = 0,
-                       changed = 0, releases empty L1/L2 nodes, tick++.
+                       changed = 0, releases empty L1/L2 nodes. Returns 1 iff
+                       a CONFIRMED-mode write landed this cycle, 0 otherwise.
                        (Predicted bytes go stale; dirty = 0 forbids reads.)
    ========================================================================== */
 
@@ -153,58 +154,35 @@ typedef enum {
 
 typedef struct ecs_l1_t {
     uint64_t confirmed_mask_any;       /* committed bitmap, observed by readers */
+    uint64_t changed;                  /* slots written this tick; cleared by ecs_tree_rollback */
     uint64_t predicted_mask_any;       /* live this frame; iterator masks come from here */
     uint64_t dirty;                    /* slots written in PREDICT mode since last rollback */
-    uint64_t changed;                  /* slots written this tick; cleared by ecs_tree_rollback */
     /* tail: 128 * data_size bytes -- [0..63] confirmed slots, [64..127] predicted slots */
 } ecs_l1_t;
 
 typedef struct ecs_l2_t {
     uint64_t confirmed_mask_any;
     uint64_t confirmed_mask_all;       /* bit j set iff children[j].confirmed_mask_any == ~0ULL */
+    uint64_t changed;
+    uint64_t dirty;
     uint64_t predicted_mask_any;
     uint64_t predicted_mask_all;       /* bit j set iff children[j].predicted_mask_any == ~0ULL */
-    uint64_t dirty;
-    uint64_t changed;
     ecs_l1_t* children[64];
 } ecs_l2_t;
 
 typedef struct ecs_l3_t {
     uint64_t confirmed_mask_any;
     uint64_t confirmed_mask_all;       /* bit i set iff children[i].confirmed_mask_all == ~0ULL */
-    uint64_t predicted_mask_any;
-    uint64_t predicted_mask_all;       /* bit i set iff children[i].predicted_mask_all == ~0ULL */
     uint64_t dirty;
     uint64_t changed;
+
+    uint64_t predicted_mask_any;
+    uint64_t predicted_mask_all;       /* bit i set iff children[i].predicted_mask_all == ~0ULL */
     ecs_l2_t* children[64];
 } ecs_l3_t;
 
-/* Per-L1 batch encoder. Called once per non-empty L1 during ecs_tree_serialize.
-   Implementation must emit data for slots whose bit is set in `mask`, in
-   ascending lane order, into the bitpacked serializer. Slot stride =
-   `block_size`.
-
-   ecs_tree_init defaults this to ecs_serialize_batch_raw: writes only the
-   set slots back-to-back as raw bytes, coalescing runs of consecutive set
-   bits into a single ecs_serializer_write_bytes call. Override on the
-   tree post-init to plug in quantization, delta-encoding, or bit-packed
-   component formats. */
-typedef void (*ecs_serialize_batch_fn)(const void* l1_data,
-                                       size_t      block_size,
-                                       uint64_t    mask,
-                                       ecs_serializer_t* s);
-
-/* Mirror of ecs_serialize_batch_fn for the deserialization side. Reads the
-   payload that the matching encoder produced, into the slots whose bit is
-   set in `mask`. Default ecs_deserialize_batch_raw reads runs of bytes via
-   ecs_deserializer_read_bytes. Override post-init to match a custom encoder. */
-typedef void (*ecs_deserialize_batch_fn)(void* l1_data,
-                                         size_t      block_size,
-                                         uint64_t    mask,
-                                         ecs_deserializer_t* d);
-
 /* Tree flags. Encodes component kind + future bools.
-   Component lifecycle is fully determined by the BUFFER flag â€” no user-supplied
+   Component lifecycle is fully determined by the BUFFER flag - no user-supplied
    destroy hook. POD = trivial copy + no destroy. LIST = element-level mutation
    via ecs_tree_buffer_push/pop/clear + ecs_free(slot->h) destroy.
 
@@ -220,15 +198,9 @@ typedef void (*ecs_deserialize_batch_fn)(void* l1_data,
 typedef struct ecs_tree_t {
     const char* name;          /* may be NULL */
     size_t      data_size;
-    uint64_t    data_mask;
-    uint64_t    tick;
-    uint64_t    tick_id_at_begin;  /* world->tick_id snapshot at last ecs_tree_begin_tick;
-                                      iterator asserts equality when query has changed-clause */
     ecs_l3_t*   root;
-    ecs_mode_t  mode;          /* CONFIRMED or PREDICT â€” set via ecs_world_set_mode */
+    ecs_mode_t  mode;          /* CONFIRMED or PREDICT - set via ecs_world_set_mode */
     uint32_t    flags;         /* ECS_TREE_FLAG_* bitset */
-    ecs_serialize_batch_fn   serialize_batch;             /* set by ecs_tree_init to raw default */
-    ecs_deserialize_batch_fn deserialize_batch;           /* set by ecs_tree_init to raw default */
 } ecs_tree_t;
 
 /* ==========================================================================
@@ -240,7 +212,7 @@ typedef struct {
     uint64_t version : 46;
 } entity_t;
 
-#define ECS_QUERY_MAX_CLAUSES 8
+#define ECS_QUERY_MAX_CLAUSES 4
 #define ECS_QUERY_MAX_TERMS   8
 
 typedef struct ecs_world_t ecs_world_t;
@@ -279,7 +251,7 @@ typedef struct ecs_iterator_t {
     const ecs_l2_t* l2[ECS_QUERY_MAX_TERMS];
     /* Pointer arrays are const-after-block-load so the compiler can hoist
        loads across ecs_iterator_get_mut's memcpy (which writes through l1_data,
-       not to it). Pointees are still mutable â€” l1->changed |= bit works.
+       not to it). Pointees are still mutable - l1->changed |= bit works.
        Updated via cast in iter_load_l1 / ecs_iterator_init only. */
     ecs_l1_t* const l1[ECS_QUERY_MAX_TERMS];
     void*     const l1_data[ECS_QUERY_MAX_TERMS];   /* inline data base = confirmed[0] */
@@ -295,7 +267,7 @@ struct ecs_world_t {
     uint64_t   mask;
     uint64_t   dirty;
     uint64_t   tick;
-    uint64_t   tick_id;        /* monotonic counter; bumped by ecs_world_begin_tick.
+    uint64_t   tick_id;        /* monotonic counter; bumped by ecs_world_end_tick.
                                   Same value across CONFIRMED + PREDICT ticks (no mode distinction). */
     ecs_mode_t mode;           /* mirrored to every populated tree by ecs_world_set_mode */
 };
@@ -309,12 +281,12 @@ extern ecs_l2_t ecs_default_l2;
 
 int      ecs_tree_masks_valid(const ecs_tree_t* tree);
 ecs_compiled_query_t* ecs_compile_query(const ecs_world_t* world, const char* expr);
-void                  ecs_tree_begin_tick(ecs_tree_t* tree);
-void                  ecs_world_begin_tick(ecs_world_t* world);
+void                  ecs_tree_end_tick(ecs_tree_t* tree);
+void                  ecs_world_end_tick(ecs_world_t* world);
 void     ecs_crc64_init(void);
 
 /* ==========================================================================
-   Pipeline â€” ordered list of systems run once per tick. Single-threaded.
+   Pipeline - ordered list of systems run once per tick. Single-threaded.
    Mode-agnostic: same pipeline runs in CONFIRMED and PREDICT ticks; the
    world's current mode dictates write semantics. Caller drives promote /
    rollback around ecs_pipeline_run.
@@ -357,26 +329,9 @@ static inline uint32_t ecs_pipeline_count(const ecs_pipeline_t* p) {
     return p->count;
 }
 
-/* Begin a tick (clears `changed` everywhere, snapshots tick_id) and run every
-   registered system once. Caller decides promote / rollback after return. */
+/* Run every registered system once, then end-of-tick: clear `changed` and
+   bump tick_id. Caller drives rollback after return. */
 void     ecs_pipeline_run(ecs_pipeline_t* p, ecs_world_t* world);
-
-/* Default per-L1 batch encoder. Writes only the set-bit slots back-to-back,
-   coalescing consecutive set bits into one ecs_serializer_write_bytes call.
-   Compression here is positional: absent slots emit 0 bytes -- the mask is
-   what reconstructs layout on read. write_bytes self-aligns, so callers
-   need not pre-pad. */
-void     ecs_serialize_batch_raw(const void* l1_data,
-                                 size_t      block_size,
-                                 uint64_t    mask,
-                                 ecs_serializer_t* s);
-
-/* Mirror of ecs_serialize_batch_raw -- reads runs of set-bit slots from the
-   deserializer into the L1 inline data tail. */
-void     ecs_deserialize_batch_raw(void* l1_data,
-                                   size_t      block_size,
-                                   uint64_t    mask,
-                                   ecs_deserializer_t* d);
 
 /* Serialize the confirmed state of a tree into the bitpacked serializer.
    Two-pass layout: structural metadata first, payload second. Lets a
@@ -385,10 +340,9 @@ void     ecs_deserialize_batch_raw(void* l1_data,
 
    Format:
 
-       version     = u8 (1)            byte-aligned
+       version     = u8 (2)            byte-aligned
        flags       = u8 (bit0: has_data)
        data_size   = LEB128 varint
-       tick        = u64
 
        --- Pass 1: masks (variable bits) ---
        mask = encoded l3 mask
@@ -402,7 +356,7 @@ void     ecs_deserialize_batch_raw(void* l1_data,
        --- Pass 2: payloads (byte-aligned) ---
        per set bit i in l3_mask:
            per set bit j in l2_mask:
-               batch_payload (via tree->serialize_batch or raw default)
+               batch_payload (raw bytes, runs coalesced via mask)
 
    Tag trees (data_size == 0) and empty trees skip pass 2 entirely.
 
@@ -427,24 +381,8 @@ void     ecs_deserialize_batch_raw(void* l1_data,
    Bitpacker asserts on overflow. */
 void     ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s);
 
-/* Delta serialize. Wire format identical to ecs_tree_serialize -- output
-   reads back via ecs_tree_deserialize unchanged. Only slots matching `query`
-   are emitted; non-matching slots are masked out at the L1 level and L2/L3
-   masks are rebuilt bottom-up so a parent bit is set IFF its subtree contains
-   at least one surviving slot. No false positives: empty subtrees vanish.
-
-   `tree` is the tree whose data is written. `query` supplies the match
-   predicate -- typically `tree` is one of `query->trees[]` but doesn't have
-   to be (other query trees provide cross-tree include/exclude/changed terms).
-
-   Filter reads confirmed_mask_any across all query trees -- consistent with
-   what the serializer writes. PREDICT-mode in-flight bits are not visible. */
-void     ecs_tree_serialize_delta(const ecs_tree_t* tree,
-                                     const ecs_compiled_query_t* query,
-                                     ecs_serializer_t* s);
-
 /* Deserialize a tree previously written by ecs_tree_serialize. Totally
-   replaces tree state -- confirmed/predicted/dirty/tick are overwritten
+   replaces tree state -- confirmed/predicted/dirty are overwritten
    from the stream, predicted_mask = confirmed_mask, dirty = 0.
 
    Reuses already-allocated nodes when possible: l2/l1 nodes that exist
@@ -459,7 +397,7 @@ void     ecs_tree_serialize_delta(const ecs_tree_t* tree,
 int      ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d);
 
 /* Serialize an entire world. Format:
-       version    = u8 (1)
+       version    = u8 (2)
        tick       = u64
        tree_mask  = encoded u64 (which of the 64 tree slots are populated)
        per set bit i in tree_mask:
@@ -475,8 +413,10 @@ void     ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s);
 int      ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d);
 
 /* Tick-end. Discards predicted bytes (predicted is always speculative),
-   clears changed, releases empty L1/L2 nodes, bumps tree->tick. */
-void     ecs_tree_rollback(ecs_tree_t* tree);
+   clears changed, releases empty L1/L2 nodes. Returns 1 iff a CONFIRMED-mode
+   write landed this cycle (caller can use it to drive world->tick or per-tree
+   freshness ack); 0 for predict-only / idle ticks. */
+int      ecs_tree_rollback(ecs_tree_t* tree);
 void     ecs_world_rollback(ecs_world_t* world);
 
 /* Switch global VM mode. Asserts no in-flight prediction (dirty == 0
@@ -489,7 +429,7 @@ void     ecs_world_destroy(ecs_world_t* world);
 
 /* Get mutable pointer to slot, marking it as written-this-frame. Acquires
    L2/L1 if absent. Sets predicted/confirmed/dirty/changed masks
-   unconditionally â€” caller asserts the slot is changing (no eq-check).
+   unconditionally - caller asserts the slot is changing (no eq-check).
    Caller writes through the returned pointer.
 
    POD trees: returns ptr to writable slot (predicted slot in PREDICT mode,
@@ -497,7 +437,7 @@ void     ecs_world_destroy(ecs_world_t* world);
    Tag trees (data_size == 0): returns NULL but masks are still updated.
    BUFFER trees: must use ecs_tree_buffer_push/pop/clear (asserts).
 
-   Caller should only call when value is actually changing â€” calling on an
+   Caller should only call when value is actually changing - calling on an
    unchanged slot will spuriously promote dirty/changed bits, defeating
    prediction-mode rollback semantics. */
 void*    ecs_tree_get_mut(ecs_tree_t* tree, int index);
@@ -541,7 +481,7 @@ uint64_t ecs_iterator_next_block(ecs_iterator_t* it);
    CONFIRMED mode, is the live speculative set in PREDICT). Per-slot bytes:
    predicted bytes when dirty bit set, else confirmed bytes. Tick excluded
    so a confirmed-tick-N state and a predict-on-tick-M state with identical
-   alive masks + view bytes hash equal â€” enabling determinism checks between
+   alive masks + view bytes hash equal - enabling determinism checks between
    predicted simulation and confirmed replay. */
 uint64_t ecs_tree_crc64(const ecs_tree_t* tree);
 uint64_t ecs_world_crc64(const ecs_world_t* world);
@@ -566,18 +506,13 @@ static inline void* ecs_l1_predicted(const ecs_l1_t* n, int i, size_t data_size)
 
 static inline void ecs_tree_init(ecs_tree_t* tree, size_t data_size, uint32_t flags) {
     assert(tree);
-    /* BUFFER trees must use sizeof(ecs_buffer_t) â€” engine reinterprets slot bytes
+    /* BUFFER trees must use sizeof(ecs_buffer_t) - engine reinterprets slot bytes
        as an ecs_buffer_t for assign/destroy. */
     assert(!(flags & ECS_TREE_FLAG_BUFFER) || data_size == sizeof(ecs_buffer_t));
     tree->name             = NULL;
     tree->data_size        = data_size;
-    tree->data_mask        = (uint64_t)-(int64_t)(data_size != 0);
-    tree->tick             = 0;
-    tree->tick_id_at_begin = 0;
     tree->mode             = ECS_MODE_CONFIRMED;
     tree->flags            = flags;
-    tree->serialize_batch             = ecs_serialize_batch_raw;
-    tree->deserialize_batch           = ecs_deserialize_batch_raw;
     tree->root             = (ecs_l3_t*)ecs_xmalloc_aligned(sizeof(ecs_l3_t), 64);
     tree->root->confirmed_mask_any  = 0;
     tree->root->confirmed_mask_all  = 0;
@@ -611,6 +546,7 @@ static inline void ecs_l2_release(ecs_tree_t* tree, ecs_l2_t* node) {
 
 static inline ecs_l1_t* ecs_l1_acquire(ecs_tree_t* tree) {
     assert(tree);
+
     size_t data_size = tree->data_size;
     size_t total     = sizeof(ecs_l1_t) + 128 * data_size;
     ecs_l1_t* node = (ecs_l1_t*)ecs_xmalloc_aligned(total, 64);
@@ -724,7 +660,7 @@ static inline void* ecs_iterator_get(const ecs_iterator_t* it, uint32_t tree_idx
    the returned ptr; engine assumes bytes are changing (no eq-check). Sets
    l1->changed bit eagerly; dirty / predicted_mask_any / confirmed_mask_any
    get derived from changed at the L1 block boundary in
-   ecs_iterator_next_block. POD only â€” BUFFER/tag use the tree-level API.
+   ecs_iterator_next_block. POD only - BUFFER/tag use the tree-level API.
 
    Caller should only call when the value is actually changing (calling on
    an unchanged slot spuriously promotes dirty/changed bits, breaking
@@ -750,7 +686,7 @@ static inline void* ecs_iterator_get_mut(ecs_iterator_t* it, uint32_t tree_idx, 
 /* Iterator-side remove. Mode-dispatched like ecs_iterator_get_mut:
      PREDICT   -> clear predicted_mask, set dirty (rolled back on rollback).
      CONFIRMED -> clear both confirmed_mask and predicted_mask in lockstep.
-   Eager mask propagation up to L2/L3 â€” does not piggyback the deferred flush
+   Eager mask propagation up to L2/L3 - does not piggyback the deferred flush
    in ecs_iterator_next_block because that flush is OR-only and would re-add
    the cleared bit. Clears the slot's bit in l1->changed for the same reason
    (so a same-block iterator_set followed by iterator_remove on this slot
@@ -758,7 +694,7 @@ static inline void* ecs_iterator_get_mut(ecs_iterator_t* it, uint32_t tree_idx, 
    removed slot does NOT register in changed-clauses for this tree (the slot
    wouldn't iterate post-remove anyway since predicted_mask_any cleared).
    POD-only; BUFFER trees must use ecs_tree_remove. Empty L1/L2 nodes are NOT
-   released here â€” done by ecs_tree_rollback / ecs_tree_destroy.
+   released here - done by ecs_tree_rollback / ecs_tree_destroy.
    Returns 1 if a slot was present and removed, 0 otherwise. */
 static inline int ecs_iterator_remove(ecs_iterator_t* it, uint32_t tree_idx, int slot) {
     assert(it);
