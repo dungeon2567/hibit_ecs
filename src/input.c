@@ -3,9 +3,9 @@
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
-#include <immintrin.h>   /* AVX2 */
 
-#include "ecs.h"   /* ecs_xmalloc_aligned, ecs_xcalloc, ecs_xrealloc, ecs_free */
+#include "ecs.h"   /* ecs_xmalloc_aligned, ecs_xcalloc, ecs_xrealloc, ecs_free, ecs_ctz32 */
+#include "fixed.h" /* fixed_8_t portable SIMD eq */
 
 /* ==========================================================================
    Row layout (packed, single allocation in it->table)
@@ -56,17 +56,18 @@ static inline uint8_t* in_row_cell(uint8_t* row, uint32_t W,
     return in_row_payload(row, W) + (size_t)idx * (size_t)stride;
 }
 
-/* SIMD scan dense_ids for first slot whose value == target_val. */
+/* SIMD scan dense_ids for first slot whose value == target_val.
+   active_cap is pow2, ECS_INPUT_PLAYER_CAP_INIT >= 8, so cap is always
+   a multiple of 8 — load is safe to the array end. */
 static uint32_t in_scan_dense_ids(const ecs_input_t* it, uint32_t target_val) {
     uint32_t cap = it->active_cap;
     if (!cap) return ECS_INPUT_PID_NIL;
     const uint32_t* ids = it->dense_ids;
-    __m256i target = _mm256_set1_epi32((int)target_val);
+    fixed_8_t target = fixed8_set1((fixed_t)target_val);
     for (uint32_t i = 0; i < cap; i += 8) {
-        __m256i v  = _mm256_loadu_si256((const __m256i*)(ids + i));
-        __m256i eq = _mm256_cmpeq_epi32(v, target);
-        int mask   = _mm256_movemask_ps(_mm256_castsi256_ps(eq));
-        if (mask) return i + (uint32_t)_tzcnt_u32((unsigned)mask);
+        fixed_8_t v  = fixed8_load((const fixed_t*)(ids + i));
+        uint8_t mask = fixed8_eq(v, target);
+        if (mask) return i + (uint32_t)ecs_ctz32(mask);
     }
     return ECS_INPUT_PID_NIL;
 }
@@ -77,20 +78,19 @@ static inline uint32_t in_pid_lookup(const ecs_input_t* it, ecs_pid_t pid) {
 }
 
 /* Build live mask per word: bits set where dense_ids[w*64+b] != NIL.
-   SIMD-scans 8 ids per AVX2 op, packs result into uint64_t. */
+   SIMD-scans 8 ids per op via fixed_8_t portable backend, packs into uint64_t. */
 static inline uint64_t in_live_mask_word(const ecs_input_t* it, uint32_t w) {
     uint64_t live = 0;
     uint32_t base = w * 64u;
     uint32_t cap  = it->active_cap;
-    __m256i nil_v = _mm256_set1_epi32(-1);
+    fixed_8_t nil_v = fixed8_set1((fixed_t)ECS_INPUT_PID_NIL);
     for (uint32_t k = 0; k < 64u; k += 8u) {
         uint32_t off = base + k;
         if (off >= cap) break;
-        __m256i v  = _mm256_loadu_si256((const __m256i*)(it->dense_ids + off));
-        __m256i eq = _mm256_cmpeq_epi32(v, nil_v);
-        int mask   = _mm256_movemask_ps(_mm256_castsi256_ps(eq));
+        fixed_8_t v  = fixed8_load((const fixed_t*)(it->dense_ids + off));
+        uint8_t mask = fixed8_eq(v, nil_v);
         /* mask: bit b set => dense_ids[off+b] == NIL.  live bit = !NIL. */
-        uint64_t bits = (~(uint64_t)mask) & 0xFFull;
+        uint64_t bits = ((uint64_t)(uint8_t)~mask) & 0xFFull;
         live |= bits << k;
     }
     return live;
