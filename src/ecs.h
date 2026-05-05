@@ -208,8 +208,8 @@ typedef struct ecs_tree_t {
    ========================================================================== */
 
 typedef struct {
-    uint64_t id      : 18;
-    uint64_t version : 46;
+    uint32_t id      : 18;
+    uint32_t version : 12;
 } entity_t;
 
 #define ECS_QUERY_MAX_CLAUSES 4
@@ -266,9 +266,13 @@ struct ecs_world_t {
     ecs_tree_t trees[64];
     uint64_t   mask;
     uint64_t   dirty;
-    uint64_t   tick;
-    uint64_t   tick_id;        /* monotonic counter; bumped by ecs_world_end_tick.
-                                  Same value across CONFIRMED + PREDICT ticks (no mode distinction). */
+    uint64_t   confirmed_tick; /* gameplay/network clock. Bumped by
+                                  ecs_world_rollback when any tree advanced.
+                                  Serialized; replicated across machines. */
+    uint64_t   predicted_tick; /* local frame counter. Bumped every
+                                  ecs_world_end_tick (CONFIRMED or PREDICT).
+                                  Reset to confirmed_tick on rollback so
+                                  predicted - confirmed = pending predict frames. */
     ecs_mode_t mode;           /* mirrored to every populated tree by ecs_world_set_mode */
 };
 
@@ -330,7 +334,7 @@ static inline uint32_t ecs_pipeline_count(const ecs_pipeline_t* p) {
 }
 
 /* Run every registered system once, then end-of-tick: clear `changed` and
-   bump tick_id. Caller drives rollback after return. */
+   bump predicted_tick. Caller drives rollback after return. */
 void     ecs_pipeline_run(ecs_pipeline_t* p, ecs_world_t* world);
 
 /* Serialize the confirmed state of a tree into the bitpacked serializer.
@@ -407,15 +411,16 @@ void     ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s);
 
 /* Deserialize a world. Trees in the old mask but missing from the new mask
    are destroyed; trees in the new mask are deserialized into the slot,
-   auto-initializing zero-initialized slots. world->tick + world->mask are
-   overwritten. world->dirty is reset to 0. Returns 0 on success, -1 on
-   header / per-tree deserialize failure. */
+   auto-initializing zero-initialized slots. world->confirmed_tick +
+   world->mask are overwritten. world->dirty is reset to 0. predicted_tick is
+   set to confirmed_tick. Returns 0 on success, -1 on header / per-tree
+   deserialize failure. */
 int      ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d);
 
 /* Tick-end. Discards predicted bytes (predicted is always speculative),
    clears changed, releases empty L1/L2 nodes. Returns 1 iff a CONFIRMED-mode
-   write landed this cycle (caller can use it to drive world->tick or per-tree
-   freshness ack); 0 for predict-only / idle ticks. */
+   write landed this cycle (caller can use it to drive world->confirmed_tick
+   or per-tree freshness ack); 0 for predict-only / idle ticks. */
 int      ecs_tree_rollback(ecs_tree_t* tree);
 void     ecs_world_rollback(ecs_world_t* world);
 

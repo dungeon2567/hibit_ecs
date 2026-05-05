@@ -26,9 +26,9 @@ static void test_pipeline_empty_runs_end_tick(void) {
     set_val(&w->trees[0], 0, 1);
 
     ecs_pipeline_t p; ecs_pipeline_init(&p);
-    uint64_t tid_before = w->tick_id;
+    uint64_t tid_before = w->predicted_tick;
     ecs_pipeline_run(&p, w);
-    EXPECT(w->tick_id == tid_before + 1, "empty pipeline still bumps tick_id");
+    EXPECT(w->predicted_tick == tid_before + 1, "empty pipeline still bumps predicted_tick");
 
     ecs_pipeline_destroy(&p);
     ecs_world_rollback(w);

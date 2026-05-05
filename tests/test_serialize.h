@@ -193,25 +193,6 @@ static void test_serialize_back_to_back_overrides(void) {
     ecs_free(buf_a); ecs_free(buf_b);
 }
 
-/* Bad header rejection - wrong version. Tree state must NOT be touched on
-   a -1 return (header validated before topology mutation). */
-static void test_serialize_rejects_bad_header(void) {
-    ecs_tree_t* t = make_tree();
-    set_val(t, 99, 0xDEAD);
-    ecs_tree_rollback(t);
-    uint64_t crc_before = ecs_tree_crc64(t);
-
-    /* version=99 (unknown), rest zeros - must reject before mutating tree. */
-    uint8_t buf[32] = { 99, 0, 0 };
-    ecs_deserializer_t d;
-    ecs_deserializer_init(&d, buf, sizeof(buf));
-    int rc = ecs_tree_deserialize(t, &d);
-    EXPECT(rc == -1, "bad version returns -1");
-    EXPECT(ecs_tree_crc64(t) == crc_before, "bad version leaves tree unchanged");
-
-    free_tree(t);
-}
-
 /* ============================================================
    World-level serialize/deserialize round-trips.
    ============================================================ */
@@ -238,13 +219,22 @@ static void ts_world_round_trip(ecs_world_t* src, const char* tag) {
 
     uint64_t crc_src = ecs_world_crc64(src);
 
+    /* Pre-init dst with the same schema as src -- wire is schema-agnostic. */
     ecs_world_t* dst = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    uint64_t schema = src->mask;
+    while (schema) {
+        int i = ecs_ctz64(schema); schema &= schema - 1;
+        ecs_tree_init(&dst->trees[i], src->trees[i].data_size, 0);
+    }
+    dst->mask = src->mask;
+
     ecs_deserializer_t d;
     ecs_deserializer_init(&d, buf, ((bytes + 7) / 8) * 8);
     int rc = ecs_world_deserialize(dst, &d);
     EXPECT(rc == 0, tag);
     EXPECT(ecs_world_crc64(dst) == crc_src, tag);
-    EXPECT(dst->tick == src->tick, tag);  /* world->tick survives round-trip */
+    EXPECT(dst->confirmed_tick == src->confirmed_tick, tag);  /* survives round-trip */
+    EXPECT(dst->predicted_tick == src->confirmed_tick, tag);  /* re-synced on load */
     EXPECT(dst->mask == src->mask, tag);
 
     ecs_world_destroy(dst); ecs_free(dst);
@@ -288,10 +278,11 @@ static void test_world_serialize_multi_tree_mixed_sizes(void) {
     ecs_world_destroy(w); ecs_free(w);
 }
 
-/* Override path: deserialize world A onto a world that previously held
-   world B with overlapping AND non-overlapping tree slots. */
+/* Override path: deserialize src onto a dst that holds different payload but
+   the same schema (slots 0 and 3, both data_size = sizeof(comp_t)). Wire is
+   schema-agnostic; both sides must agree on which trees exist before
+   deserialize. */
 static void test_world_serialize_override(void) {
-    /* Source world: trees at slots {0, 3} */
     ecs_world_t* src = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     ecs_tree_init(&src->trees[0], sizeof(comp_t), 0);
     ecs_tree_init(&src->trees[3], sizeof(comp_t), 0);
@@ -301,7 +292,6 @@ static void test_world_serialize_override(void) {
     ecs_world_rollback(src);
     uint64_t crc_src = ecs_world_crc64(src);
 
-    /* Encode src */
     uint8_t* buf = (uint8_t*)ecs_xcalloc(1, (size_t)TS_BUFFER_BYTES);
     ecs_serializer_t s;
     ecs_serializer_init(&s, buf, TS_BUFFER_BYTES);
@@ -309,15 +299,14 @@ static void test_world_serialize_override(void) {
     ecs_serializer_flush_bits(&s);
     int32_t bytes = ecs_serializer_get_bytes_written(&s);
 
-    /* Destination: trees at slots {0, 1, 7} - overlap at 0, drop 1+7, add 3 */
+    /* dst shares schema with src (slots 0 and 3) but holds different payload. */
     ecs_world_t* dst = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
     ecs_tree_init(&dst->trees[0], sizeof(comp_t), 0);
-    ecs_tree_init(&dst->trees[1], sizeof(comp_t), 0);
-    ecs_tree_init(&dst->trees[7], sizeof(comp_t), 0);
-    dst->mask = (1ULL << 0) | (1ULL << 1) | (1ULL << 7);
-    set_val(&dst->trees[0], 99, 0xFF);
-    set_val(&dst->trees[1], 1,  0x01);
-    set_val(&dst->trees[7], 8000, 0x80);
+    ecs_tree_init(&dst->trees[3], sizeof(comp_t), 0);
+    dst->mask = (1ULL << 0) | (1ULL << 3);
+    set_val(&dst->trees[0], 99,    0xFF);
+    set_val(&dst->trees[3], 8000,  0x80);
+    set_val(&dst->trees[3], 50,    0xCC);   /* same idx as src but different value */
     ecs_world_rollback(dst);
     EXPECT(ecs_world_crc64(dst) != crc_src, "pre-deserialize world differs");
 
@@ -387,9 +376,16 @@ static void test_world_serialize_size_5k_4trees(void) {
     EXPECT(dsize == (size_t)bytes, "zstd decompressed size matches");
     EXPECT(memcmp(dbuf, buf, (size_t)bytes) == 0, "zstd round-trip bit-exact");
 
-    /* Sanity: round-trip CRC parity (decode from zstd-decompressed buffer). */
+    /* Sanity: round-trip CRC parity (decode from zstd-decompressed buffer).
+       dst pre-init's the same schema as src -- wire is schema-agnostic. */
     uint64_t crc_src = ecs_world_crc64(w);
     ecs_world_t* dst = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_tree_init(&dst->trees[0], sizeof(fixed_4_t),   0);
+    ecs_tree_init(&dst->trees[1], sizeof(fixed_4_t),   0);
+    ecs_tree_init(&dst->trees[2], sizeof(transform_t), 0);
+    ecs_tree_init(&dst->trees[3], 0,                   0);
+    dst->mask = 0xFu;
+
     ecs_deserializer_t d;
     ecs_deserializer_init(&d, dbuf, ((bytes + 7) / 8) * 8);
     int rc = ecs_world_deserialize(dst, &d);
@@ -414,7 +410,6 @@ static int test_serialize_all(void) {
     RUN_TEST(test_serialize_tag_tree);
     RUN_TEST(test_serialize_override_existing_tree);
     RUN_TEST(test_serialize_back_to_back_overrides);
-    RUN_TEST(test_serialize_rejects_bad_header);
     RUN_TEST(test_world_serialize_empty);
     RUN_TEST(test_world_serialize_single_tree);
     RUN_TEST(test_world_serialize_multi_tree_mixed_sizes);

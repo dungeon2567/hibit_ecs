@@ -729,11 +729,13 @@ void ecs_tree_end_tick(ecs_tree_t* tree) {
     l3s->changed = 0;
 }
 
-/* Bumps world->tick_id, clears `changed` everywhere on populated trees.
-   Mode-agnostic - same call for CONFIRMED + PREDICT ticks. */
+/* Bumps world->predicted_tick, clears `changed` everywhere on populated trees.
+   Mode-agnostic - same call for CONFIRMED + PREDICT ticks. predicted_tick
+   advances every frame; confirmed_tick advances only when ecs_world_rollback
+   sees an actual confirmed advance. */
 void ecs_world_end_tick(ecs_world_t* world) {
     assert(world);
-    world->tick_id++;
+    world->predicted_tick++;
     uint64_t mask = world->mask;
     while (mask) {
         int i = ecs_ctz64(mask); mask &= mask - 1;
@@ -827,7 +829,11 @@ void ecs_world_rollback(ecs_world_t* world) {
         int i = ecs_ctz64(mask); mask &= mask - 1;
         any_advanced |= ecs_tree_rollback(&world->trees[i]);
     }
-    if (any_advanced) world->tick++;
+    if (any_advanced) world->confirmed_tick++;
+    /* Re-sync the predicted clock to the confirmed clock: pending speculative
+       frames were just discarded, so predicted_tick - confirmed_tick == 0
+       until the next ecs_world_end_tick. */
+    world->predicted_tick = world->confirmed_tick;
 }
 
 /* Switch a single tree's VM mode. Caller must guarantee no in-flight prediction
@@ -966,13 +972,9 @@ static void ecs_serialize_varint(uint64_t v, ecs_serializer_t* s) {
 void ecs_tree_serialize(const ecs_tree_t* tree, ecs_serializer_t* s) {
     assert(tree && s);
 
-    uint8_t version = 2;
-    uint8_t flags   = (tree->data_size > 0) ? 1u : 0u;
-    ecs_serializer_write_bits(s, version, 8);
-    ecs_serializer_write_bits(s, flags,   8);
-
-    ecs_serialize_varint((uint64_t)tree->data_size, s);
-
+    /* Schema (data_size) and version are assumed to match between sender and
+       receiver -- caller is responsible for keeping both sides aligned.
+       Tree-level wire is pure topology + payload, no header. */
     const ecs_l3_t* l3 = tree->root;
 
     /* ---- Pass 1: structural metadata (all masks) ----
@@ -1061,20 +1063,9 @@ static uint64_t ecs_deserialize_mask(ecs_deserializer_t* d) {
 int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
     assert(tree && d);
 
-    uint8_t version = (uint8_t)ecs_deserializer_read_bits(d, 8);
-    uint8_t flags   = (uint8_t)ecs_deserializer_read_bits(d, 8);
-    if (version != 2) return -1;
-    (void)flags;  /* bit0 is has_data; redundant with data_size */
-
-    uint64_t data_size = ecs_deserialize_varint(d);
-    if (!tree->root) {
-        /* Uninitialized slot -- set up topology with the stream's data_size.
-           Lets ecs_world_deserialize hydrate empty world tree-slots in
-           one step. */
-        ecs_tree_init(tree, (size_t)data_size, 0);
-    } else if (data_size != tree->data_size) {
-        return -1;
-    }
+    /* Caller must ensure tree is already initialized with the correct
+       data_size before calling -- the wire format is schema-agnostic. */
+    assert(tree->root && "ecs_tree_deserialize: tree must be initialized");
 
     /* ---- Pass 1: read masks, repurpose / acquire / release nodes. ----
        Walk every slot 0..63 testing the sentinel pointer (NOT the old
@@ -1177,11 +1168,12 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
 
 void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
     assert(world && s);
-    uint8_t version = 2;
-    ecs_serializer_write_bits(s, version, 8);
-    ecs_serializer_write_bits(s, world->tick, 64);
+    ecs_serializer_write_bits(s, world->confirmed_tick, 64);
     ecs_serialize_mask(world->mask, s);
 
+    /* Both sides are assumed to share identical schema (which slots exist
+       and each tree's data_size). Wire carries only confirmed_tick + live
+       mask + per-tree topology + payload. */
     uint64_t m = world->mask;
     while (m) {
         int i = ecs_ctz64(m); m &= m - 1;
@@ -1191,25 +1183,14 @@ void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
 
 int ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d) {
     assert(world && d);
-    uint8_t version = (uint8_t)ecs_deserializer_read_bits(d, 8);
-    if (version != 2) return -1;
-
-    world->tick = ecs_deserializer_read_bits(d, 64);
+    world->confirmed_tick = ecs_deserializer_read_bits(d, 64);
+    /* Snapshot is a confirmed-state ground truth; predicted clock re-syncs
+       to confirmed (no pending speculative frames after a load). */
+    world->predicted_tick = world->confirmed_tick;
     uint64_t new_mask = ecs_deserialize_mask(d);
-    uint64_t old_mask = world->mask;
 
-    /* Slots in old but not new: destroy then zero so a future deserialize
-       sees an uninitialized slot (root == NULL). */
-    uint64_t drop = old_mask & ~new_mask;
-    while (drop) {
-        int i = ecs_ctz64(drop); drop &= drop - 1;
-        ecs_tree_destroy(&world->trees[i]);
-        memset(&world->trees[i], 0, sizeof(ecs_tree_t));
-    }
-
-    /* Slots in new mask: deserialize. ecs_tree_deserialize auto-inits
-       when tree->root is NULL (fresh slot from the drop loop or zero-
-       initialized world). */
+    /* Caller must have pre-initialized every slot in new_mask with the
+       matching data_size before calling -- wire is schema-agnostic. */
     uint64_t bring = new_mask;
     while (bring) {
         int i = ecs_ctz64(bring); bring &= bring - 1;

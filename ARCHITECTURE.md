@@ -64,7 +64,7 @@ There is **no `promote`**. Predicted state is always speculative; it never folds
 - releases L1/L2 nodes that just went empty
 - returns `1` if a CONFIRMED-mode write landed this cycle, `0` otherwise
 
-`ecs_world_rollback` walks every populated tree, ORs return values, and bumps `world->tick` if any tree advanced.
+`ecs_world_rollback` walks every populated tree, ORs return values, and bumps `world->confirmed_tick` if any tree advanced. It also re-syncs `predicted_tick = confirmed_tick` so `predicted_tick - confirmed_tick` always equals the number of pending speculative frames between rollbacks.
 
 Mode switching requires no in-flight prediction (`dirty == 0` everywhere) — asserted via `ecs_tree_no_dirty`.
 
@@ -102,7 +102,7 @@ The hot path (`ecs_iterator_next`, header-inline) is two instructions: CTZ + cle
 
 ## 5. World
 
-`ecs_world_t` is a thin wrapper: 64 trees in a fixed array, plus a `mask` of which slots are populated, a global `tick`, a `tick_id` counter bumped by `ecs_world_end_tick`, and a `mode` mirrored onto every populated tree by `ecs_world_set_mode`. World-level rollback iterates the populated trees. `ecs_world_crc64` over confirmed state gives a deterministic checksum suitable for desync detection.
+`ecs_world_t` is a thin wrapper: 64 trees in a fixed array, plus a `mask` of which slots are populated, two clocks (`confirmed_tick` for replicated gameplay time, `predicted_tick` for local frame counting bumped by `ecs_world_end_tick`), and a `mode` mirrored onto every populated tree by `ecs_world_set_mode`. World-level rollback iterates the populated trees. `ecs_world_crc64` over confirmed state gives a deterministic checksum suitable for desync detection.
 
 ## 6. Fixed-point math (`fixed.h`)
 
