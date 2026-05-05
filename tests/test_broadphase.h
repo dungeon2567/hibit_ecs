@@ -369,6 +369,55 @@ static void test_broadphase_known_order(void) {
     broadphase_destroy(&bp);
 }
 
+/* Known-count query: 5x5x5 grid of unit-half AABBs spaced 2 units apart.
+   Centers lie at (2x, 2y, 2z) for x,y,z in 0..4 -> 125 items. Query AABB
+   [3, 9]^3 overlaps items whose center on each axis is in [2.5, 9.5] (item
+   max c+0.5 >= 3 AND item min c-0.5 <= 9), i.e. c in {4, 6, 8}: exactly 3
+   per axis -> 3 * 3 * 3 = 27 expected hits. Remaining 98 items are pruned
+   by the SIMD overlap mask, exercising negative-lane rejection plus tree
+   descent under heavy cull. */
+static void test_broadphase_query_known_count(void) {
+    broadphase_t bp; broadphase_init(&bp, 256);
+
+    fixed_t  f05 = fixed_from_parts(0, 5);
+    vec3_t   e   = vec3_make(f05, f05, f05);
+
+    enum { N = 125 };
+    uint32_t id = 0;
+    for (int z = 0; z < 5; ++z)
+    for (int y = 0; y < 5; ++y)
+    for (int x = 0; x < 5; ++x) {
+        vec3_t c = vec3_make(fixed_from_int(2 * x),
+                             fixed_from_int(2 * y),
+                             fixed_from_int(2 * z));
+        broadphase_insert(&bp, bp_obj_(id++), aabb_from_center_extents(c, e));
+    }
+    broadphase_build(&bp);
+    EXPECT(id == N, "125 items inserted");
+
+    aabb_t q = {
+        .min = vec3_make(fixed_from_int(3), fixed_from_int(3), fixed_from_int(3)),
+        .max = vec3_make(fixed_from_int(9), fixed_from_int(9), fixed_from_int(9))
+    };
+    broadphase_iter_t it;
+    broadphase_query_begin(&it, &bp, q);
+
+    int seen[N] = {0};
+    int hits = 0;
+    const broadphase_object_t* o;
+    while ((o = broadphase_query_next(&it))) {
+        EXPECT(o->entity_id < N, "id within range");
+        if (o->entity_id < (uint32_t)N) seen[o->entity_id]++;
+        ++hits;
+    }
+    EXPECT(hits == 27, "27 known hits (3 per axis cubed)");
+    int dupes = 0;
+    for (int i = 0; i < N; ++i) if (seen[i] > 1) dupes = 1;
+    EXPECT(dupes == 0, "no item yielded twice");
+
+    broadphase_destroy(&bp);
+}
+
 /* Cross-instance determinism: two bp instances with identical insert
    sequence produce byte-identical query streams. Catches accidental
    dependence on prior heap state, ASLR-influenced pointer ordering, or
@@ -489,6 +538,7 @@ static int test_broadphase_all(void) {
     RUN_TEST(test_broadphase_negative_coords);
     RUN_TEST(test_broadphase_query_before_build);
     RUN_TEST(test_broadphase_known_order);
+    RUN_TEST(test_broadphase_query_known_count);
     RUN_TEST(test_broadphase_determinism_two_instances);
     RUN_TEST(test_broadphase_determinism_rebuild);
     int failed = g_failed - before;
