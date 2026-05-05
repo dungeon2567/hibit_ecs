@@ -112,25 +112,8 @@ static bool in_tick_all_confirmed(const ecs_input_t* it, uint32_t t) {
     return true;
 }
 
-/* Greedily advance confirmed_frontier. Frontier seeds when tick 1 fully
-   confirms; from there it extends contiguously. Bound: buf_size.
-   confirmed_frontier == 0 means "no frontier yet" (tick 0 is reserved
-   sentinel; valid ticks start at 1). */
-static void in_advance_frontier(ecs_input_t* it, uint64_t just_confirmed_tick) {
-    if (just_confirmed_tick != it->confirmed_frontier + 1ull) return;
-    it->confirmed_frontier = just_confirmed_tick;
-    for (uint32_t i = 0; i < it->buf_size; i++) {
-        uint64_t n = it->confirmed_frontier + 1ull;
-        uint32_t t = (uint32_t)(n & it->buf_mask);
-        uint8_t* row = in_row_ptr(it, t);
-        if (*in_row_tick(row) != n) break;
-        if (!in_tick_all_confirmed(it, t)) break;
-        it->confirmed_frontier = n;
-    }
-}
-
 /* Reset row: zero present + confirmed bits, mark slot empty. Used by
-   ecs_input_clear and ecs_input_seal_empty_tick (no carry-forward). */
+   ecs_input_clear (no carry-forward). */
 static void in_reset_row(ecs_input_t* it, uint32_t t) {
     uint8_t* row = in_row_ptr(it, t);
     uint32_t W = it->words_per_row;
@@ -439,9 +422,6 @@ void ecs_input_set(ecs_input_t* it, uint64_t tick, ecs_pid_t pid,
 
     if (confirmed && !was_confirmed) {
         conf[word] |= bit;
-        if (in_tick_all_confirmed(it, t)) {
-            in_advance_frontier(it, tick);
-        }
     }
 }
 
@@ -486,15 +466,10 @@ void ecs_input_clear(ecs_input_t* it, uint64_t tick) {
     assert(tick >= 1ull);
     uint32_t t = (uint32_t)(tick & it->buf_mask);
     in_reset_row(it, t);
-
-    /* If cleared tick was within confirmed range, rewind frontier to
-       tick - 1 (which may be 0 = no frontier). */
-    if (tick <= it->confirmed_frontier) {
-        it->confirmed_frontier = tick - 1ull;
-    }
 }
 
 bool ecs_input_tick_confirmed(const ecs_input_t* it, uint64_t tick) {
+    if (it->active_count == 0u) return true;
     uint32_t t = (uint32_t)(tick & it->buf_mask);
     uint8_t* row = in_row_ptr(it, t);
     if (*in_row_tick(row) != tick) return false;
@@ -505,32 +480,12 @@ uint64_t ecs_input_frontier(const ecs_input_t* it) {
     return it->confirmed_frontier;
 }
 
-void ecs_input_seed_frontier(ecs_input_t* it, uint64_t tick) {
+void ecs_input_advance_to_tick(ecs_input_t* it, uint64_t tick) {
     assert(it);
     assert(tick != ECS_INPUT_TICK_NIL);
     assert(tick >= 1ull);
+    assert(tick >= it->confirmed_frontier);   /* frontier monotonic */
     it->confirmed_frontier = tick;
-}
-
-void ecs_input_seal_empty_tick(ecs_input_t* it, uint64_t tick) {
-    assert(it);
-    assert(tick != ECS_INPUT_TICK_NIL);
-    assert(tick >= 1ull);
-    uint32_t t = (uint32_t)(tick & it->buf_mask);
-    uint8_t* row = in_row_ptr(it, t);
-
-    if (*in_row_tick(row) != tick) {
-        in_reset_row(it, t);
-        *in_row_tick(row) = tick;
-    } else {
-        /* Caller bug: sealing as empty a tick that already has writes. */
-        uint32_t W = it->words_per_row;
-        if (W) {
-            uint64_t* conf = in_row_confirmed(row, W);
-            for (uint32_t w = 0; w < W; w++) assert(conf[w] == 0ull);
-        }
-    }
-    in_advance_frontier(it, tick);
 }
 
 bool ecs_input_is_registered(const ecs_input_t* it, ecs_pid_t pid) {

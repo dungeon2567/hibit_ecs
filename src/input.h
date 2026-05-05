@@ -31,21 +31,18 @@
                          present_bm    -- bit set iff the (tick, idx) slot
                                           has been written at all (predicted
                                           or confirmed).
-                       Plus per-tick scalars:
-                         confirmed_count -- popcount of confirmed_bm row.
-                         expected_count  -- server-stamped roster size for
-                                            this tick. Set on first packet
-                                            for the tick. Frontier advances
-                                            when count == expected.
+                       Plus per-tick scalar:
                          tick_in_slot    -- absolute tick id currently
                                             occupying ring slot t. Disambig
                                             wraparound; first-touch reset is
                                             triggered by mismatch.
-                         all_confirmed_bm -- 1 bit per ring slot, set when
-                                             count hits expected.
-                         confirmed_frontier -- highest tick T such that all
-                                               ticks <= T are fully confirmed.
-                                               Greedily advanced.
+
+   Frontier          : confirmed_frontier is sim-driven via
+                       ecs_input_advance_to_tick. Input does NOT auto-track
+                       it. Ring slots holding ticks <= frontier are eligible
+                       for eviction on first-touch by a write to a newer
+                       tick. Querying tick_confirmed for an arbitrary tick
+                       still works (computed on demand).
 
    Operations (hot)  : set / get / get_view / clear -- all O(1) on the
                        per-tick scalars and O(active_cap / 64) memset on
@@ -142,12 +139,12 @@ typedef struct ecs_input_t {
     uint32_t  buf_size;      /* ring depth, pow2 */
     uint32_t  buf_mask;      /* buf_size - 1 */
 
-    /* Confirmed frontier: highest tick T such that all live players are
-       confirmed for every tick in [1..T]. 0 = no frontier yet (sim
-       starts at tick 1; tick 0 is reserved as the "no frontier" sentinel
-       and is invalid as an actual tick id). all_confirmed status per
-       tick is computed on demand from dense_ids (live mask) AND
-       confirmed bits in row -- no cached counts. */
+    /* Confirmed frontier: sim-driven low-water mark. Set via
+       ecs_input_advance_to_tick. Ticks <= confirmed_frontier are
+       considered discarded -- their ring slots may be evicted on
+       first-touch by a write to a newer tick. 0 = no frontier yet
+       (sim starts at tick 1; tick 0 is reserved as the "no frontier"
+       sentinel and is invalid as an actual tick id). */
     uint64_t  confirmed_frontier;
 } ecs_input_t;
 
@@ -220,9 +217,9 @@ bool ecs_input_iter_next(ecs_input_iter_t* iter);
 /* --- Hot path: set / get / clear ----------------------------------------- */
 
 /* Write `value` (stride bytes) into the slot for (tick, pid).
-   If `confirmed` is true the confirmed bit is set; once every currently-
-   registered player's confirmed bit is set for this tick, the frontier
-   may advance.
+   If `confirmed` is true the confirmed bit is set. Frontier is NOT
+   touched here -- the simulation drives it via
+   ecs_input_advance_to_tick.
 
    value MUST be non-NULL.
 
@@ -246,31 +243,32 @@ ecs_input_view_t ecs_input_get_view(const ecs_input_t* it,
                                     uint64_t tick, ecs_pid_t pid);
 
 /* Reset all per-player state for `tick`: zero confirmed/present rows,
-   zero counts, mark slot empty (tick_in_slot = NIL). If `tick` is
-   <= confirmed_frontier the frontier is rewound to tick - 1.
-   This is admin/rollback API -- DO NOT call from sim path. */
+   zero counts, mark slot empty (tick_in_slot = NIL). Does NOT touch
+   frontier -- caller is responsible for any frontier rewind via
+   advance_to_tick if their semantics require it.
+   Admin/rollback API -- DO NOT call from sim path. */
 void ecs_input_clear(ecs_input_t* it, uint64_t tick);
 
 /* --- Frontier / status --------------------------------------------------- */
 
-/* True iff every registered player's input for `tick` is confirmed
-   (count == expected). */
+/* True iff every currently-registered player has a confirmed bit set
+   for `tick`. Computed on demand from the row's confirmed bitmap and
+   the live dense_ids[] mask -- no cached counts. Returns true when
+   active_count == 0 (vacuous). */
 bool ecs_input_tick_confirmed(const ecs_input_t* it, uint64_t tick);
 
-/* Highest contiguous fully-confirmed tick. Returns 0 if no tick has
-   ever fully confirmed yet (tick 0 is reserved as the "no frontier"
-   sentinel; valid ticks start at 1). */
+/* Current sim-driven frontier. Returns 0 if no tick has ever been
+   advanced past yet (tick 0 is reserved as the "no frontier" sentinel;
+   valid ticks start at 1). */
 uint64_t ecs_input_frontier(const ecs_input_t* it);
 
-/* Seed frontier at `tick` (mid-session join / snapshot bootstrap).
-   `tick` must be >= 1. Subsequent confirmations of tick+1, tick+2, ...
-   will extend it. */
-void ecs_input_seed_frontier(ecs_input_t* it, uint64_t tick);
-
-/* Mark `tick` as fully confirmed with zero expected players. Used by
-   the server to seal ticks where the roster was empty -- the frontier
-   advances past such ticks without any set() calls. */
-void ecs_input_seal_empty_tick(ecs_input_t* it, uint64_t tick);
+/* Set frontier to `tick`. Sim is responsible for invoking this after
+   it has decided that everything <= `tick` is finalized; ring slots
+   for those ticks are then eligible for eviction on first-touch by a
+   newer write. `tick` must be >= 1 and >= current frontier (monotonic).
+   Does NOT scrub ring contents -- queries on stale ticks still return
+   data until the slot is overwritten. */
+void ecs_input_advance_to_tick(ecs_input_t* it, uint64_t tick);
 
 /* --- Auto-grow ----------------------------------------------------------- */
 

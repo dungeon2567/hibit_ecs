@@ -41,7 +41,7 @@ static inline int ecs_popcount64(uint64_t x) { return __builtin_popcountll(x); }
 #define FIXED_HALF_PI  ((fixed_t)102944)   /* pi/2  in Q16.16 */
 
 /* Digit-by-digit unsigned 64-bit isqrt. Branch-on-bit, no division. */
-static inline uint32_t fixed_isqrt64_(uint64_t v) {
+static inline uint32_t fixed_isqrt64(uint64_t v) {
     uint64_t r = 0;
     uint64_t bit = (uint64_t)1 << 62;
     while (bit > v) bit >>= 2;
@@ -58,12 +58,32 @@ static inline fixed_t fixed_sqrt(fixed_t x) {
     if (x <= 0) return 0;
     /* sqrt(x_real) * 2^16 = sqrt(x * 2^16). Cast through uint32 first to
        avoid signed left-shift UB; we already know x > 0. */
-    return (fixed_t)fixed_isqrt64_((uint64_t)(uint32_t)x << FIXED_SHIFT);
+    return (fixed_t)fixed_isqrt64((uint64_t)(uint32_t)x << FIXED_SHIFT);
 }
 
+/* rsqrt without isqrt-loop or 64-bit divide. Bitscan gives a seed within √2
+   of truth; one sqrt(2) bias on odd exponents tightens that to ~19%, after
+   which Newton-Raphson y' = y*(3 - x*y^2)/2 converges quadratically — 4
+   iterations clear Q16.16 ULP. y stays in [1, 2^24] for valid Q16.16 inputs,
+   so the int64 intermediates (y*y up to 2^48, y*t up to 2^41) cannot overflow. */
 static inline fixed_t fixed_rsqrt(fixed_t x) {
-    fixed_t s = fixed_sqrt(x);
-    return s > 0 ? fixed_div(FIXED_ONE, s) : 0;
+    if (x <= 0) return 0;
+    uint32_t ux = (uint32_t)x;
+#ifdef _MSC_VER
+    unsigned long n; _BitScanReverse(&n, ux);
+#else
+    unsigned n = 31u - (unsigned)__builtin_clz(ux);
+#endif
+    int e = 48 - (int)n;
+    int64_t y = (int64_t)1 << (e >> 1);
+    if (e & 1) y = (y * 46341) >> 16;  /* 46341 ≈ 2^16 / sqrt(2) */
+    for (int i = 0; i < 4; ++i) {
+        int64_t y2  = (y * y) >> FIXED_SHIFT;
+        int64_t xy2 = ((int64_t)x * y2) >> FIXED_SHIFT;
+        int64_t t   = 3LL * FIXED_ONE - xy2;
+        y = (y * t) >> (FIXED_SHIFT + 1);
+    }
+    return (fixed_t)y;
 }
 
 /* sin via range reduction to [-pi/2, pi/2] then degree-5 minimax-style

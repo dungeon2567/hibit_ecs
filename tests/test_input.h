@@ -17,7 +17,8 @@
        roster (dense_ids != NIL) AND confirmed bits.
      - ecs_input_set has no `expected` parameter; the live roster
        implicitly defines it.
-     - ecs_input_frontier returns 0 = no frontier yet. */
+     - Frontier is sim-driven. ecs_input_set never advances it; tests
+       call ecs_input_advance_to_tick explicitly to model the sim. */
 
 typedef struct {
     uint32_t buttons;
@@ -91,13 +92,12 @@ static void test_input_set_idempotent_same_value(void) {
     EXPECT(!ecs_input_tick_confirmed(&it, 1),   "1 of 2 confirmed -> tick not yet confirmed");
     ecs_input_set(&it, 1, 2, &b, true);
     EXPECT(ecs_input_tick_confirmed(&it, 1),    "2 of 2 confirmed -> tick confirmed");
-    EXPECT(ecs_input_frontier(&it) == 1ull,     "frontier == 1 after first full tick");
+    EXPECT(ecs_input_frontier(&it) == 0ull,     "frontier untouched -- sim drives it");
 
     /* Replay: must not double-confirm. */
     ecs_input_set(&it, 1, 1, &a, true);
     ecs_input_set(&it, 1, 2, &b, true);
     EXPECT(ecs_input_tick_confirmed(&it, 1),    "tick still confirmed after replay");
-    EXPECT(ecs_input_frontier(&it) == 1ull,     "frontier unchanged on replay");
     EXPECT(ti_eq(ti_get(&it, 1, 1), a),         "pid 1 bytes preserved on replay");
     EXPECT(ti_eq(ti_get(&it, 1, 2), b),         "pid 2 bytes preserved on replay");
 
@@ -146,8 +146,6 @@ static void test_input_multi_packet_split(void) {
 
     EXPECT(ecs_input_tick_confirmed(&a, 1),   "a: tick confirmed");
     EXPECT(ecs_input_tick_confirmed(&b, 1),   "b: tick confirmed (reverse order)");
-    EXPECT(ecs_input_frontier(&a) == ecs_input_frontier(&b),
-                                              "frontiers match across orderings");
     for (int i = 0; i < 4; i++) {
         EXPECT(ti_eq(ti_get(&a, 1, pids[i]), ti_get(&b, 1, pids[i])),
                                               "per-pid bytes match across orderings");
@@ -157,29 +155,29 @@ static void test_input_multi_packet_split(void) {
     ecs_input_destroy(&b);
 }
 
-/* --- frontier advances only when contiguous ---------------------------- */
+/* --- frontier is sim-driven, not auto-tracked -------------------------- */
 
-static void test_input_frontier_contiguous(void) {
+static void test_input_frontier_sim_driven(void) {
     ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
     ecs_input_register_player(&it, 1);
     ti_input_t v = ti_make(0, 0, 0);
 
-    /* Confirm tick 3 first -- frontier cannot start (only tick 1 seeds). */
-    ecs_input_set(&it, 3, 1, &v, true);
-    EXPECT(ecs_input_frontier(&it) == 0ull,    "frontier not seeded by tick > 1 alone");
-
-    /* Confirm tick 1 -- seeds, walks forward. Tick 2 missing -> stops at 1. */
     ecs_input_set(&it, 1, 1, &v, true);
-    EXPECT(ecs_input_frontier(&it) == 1ull,    "frontier == 1, gap at tick 2 blocks");
-
-    /* Fill tick 2 -> walks to 3. */
     ecs_input_set(&it, 2, 1, &v, true);
-    EXPECT(ecs_input_frontier(&it) == 3ull,    "frontier extends to 3 after gap fills");
+    ecs_input_set(&it, 3, 1, &v, true);
+    EXPECT(ecs_input_frontier(&it) == 0ull,    "set never moves frontier");
+
+    /* Sim decides ticks 1..3 are done. */
+    ecs_input_advance_to_tick(&it, 3);
+    EXPECT(ecs_input_frontier(&it) == 3ull,    "advance_to_tick(3) -> frontier 3");
+
+    ecs_input_advance_to_tick(&it, 5);
+    EXPECT(ecs_input_frontier(&it) == 5ull,    "advance is monotonic, can skip ticks");
 
     ecs_input_destroy(&it);
 }
 
-/* --- partial confirm does NOT advance frontier ------------------------- */
+/* --- partial confirm reports tick as not-confirmed --------------------- */
 
 static void test_input_partial_no_advance(void) {
     ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
@@ -189,7 +187,6 @@ static void test_input_partial_no_advance(void) {
     ti_input_t v = ti_make(0, 0, 0);
     ecs_input_set(&it, 1, 1, &v, true);
 
-    EXPECT(ecs_input_frontier(&it) == 0ull,    "frontier not advanced on partial confirm");
     EXPECT(!ecs_input_tick_confirmed(&it, 1),  "tick 1 not confirmed -- pid 2 missing");
 
     ecs_input_destroy(&it);
@@ -205,12 +202,13 @@ static void test_input_ring_wrap(void) {
     ti_input_t old_v = ti_make(0xDEAD, 1, 1);
     ti_input_t new_v = ti_make(0xBEEF, 9, 9);
 
-    /* Confirm ticks 1..8 contiguously -> frontier == 8. */
+    /* Confirm ticks 1..8; sim then advances frontier past them. */
     for (uint64_t t = 1; t <= BUF; t++) {
         ecs_input_set(&it, t, 1, &old_v, true);
     }
+    ecs_input_advance_to_tick(&it, BUF);
     EXPECT(ecs_input_frontier(&it) == (uint64_t)BUF,
-                                              "frontier == buf_size after BUF confirms");
+                                              "frontier == buf_size after sim advance");
 
     /* Tick 9 aliases slot of tick 1; tick 1 at frontier so safe to evict. */
     ecs_input_set(&it, BUF + 1u, 1, &new_v, true);
@@ -232,16 +230,15 @@ static void test_input_clear(void) {
     ti_input_t v = ti_make(7, 7, 7);
     ecs_input_set(&it, 1, 1, &v, true);
     ecs_input_set(&it, 2, 1, &v, true);
-    EXPECT(ecs_input_frontier(&it) == 2ull,    "frontier == 2 after 2 confirms");
 
     ecs_input_clear(&it, 2);
     ecs_input_view_t view = ecs_input_get_view(&it, 2, 1);
     EXPECT(!view.present && !view.confirmed,   "after clear: not present");
     EXPECT(!ecs_input_tick_confirmed(&it, 2),  "after clear: tick not confirmed");
-    EXPECT(ecs_input_frontier(&it) == 1ull,    "frontier rewound to 1");
+    EXPECT(ecs_input_frontier(&it) == 0ull,    "clear does NOT touch frontier");
 
-    ecs_input_clear(&it, 1);
-    EXPECT(ecs_input_frontier(&it) == 0ull,    "frontier rewound to 0 (no frontier)");
+    /* Tick 1 still intact since clear only resets one row. */
+    EXPECT(ti_eq(ti_get(&it, 1, 1), v),        "untouched tick survives clear");
 
     ecs_input_destroy(&it);
 }
@@ -302,25 +299,29 @@ static void test_input_deterministic_replay(void) {
                                                 "deterministic: bytes match");
         }
     }
-    EXPECT(ecs_input_frontier(&a) == ecs_input_frontier(&b),
-                                                "deterministic: frontier matches");
+    /* Frontier never advances on its own, so both stay 0. */
+    EXPECT(ecs_input_frontier(&a) == 0ull && ecs_input_frontier(&b) == 0ull,
+                                                "deterministic: both frontiers untouched");
 
     ecs_input_destroy(&a);
     ecs_input_destroy(&b);
 }
 
-/* --- seed_frontier for mid-session join -------------------------------- */
+/* --- advance_to_tick for mid-session join ------------------------------ */
 
-static void test_input_seed_frontier(void) {
+static void test_input_advance_to_tick(void) {
     ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
     ecs_input_register_player(&it, 1);
 
-    ecs_input_seed_frontier(&it, 1000);
-    EXPECT(ecs_input_frontier(&it) == 1000ull, "seed sets frontier to 1000");
+    ecs_input_advance_to_tick(&it, 1000);
+    EXPECT(ecs_input_frontier(&it) == 1000ull, "advance_to_tick(1000) sets frontier");
 
     ti_input_t v = ti_make(0, 0, 0);
     ecs_input_set(&it, 1001, 1, &v, true);
-    EXPECT(ecs_input_frontier(&it) == 1001ull, "frontier extends past seeded value");
+    EXPECT(ecs_input_frontier(&it) == 1000ull, "set does not move frontier");
+
+    ecs_input_advance_to_tick(&it, 1001);
+    EXPECT(ecs_input_frontier(&it) == 1001ull, "subsequent advance bumps frontier");
 
     ecs_input_destroy(&it);
 }
@@ -345,22 +346,14 @@ static void test_input_predicted_after_confirmed_dropped(void) {
     ecs_input_destroy(&it);
 }
 
-/* --- seal_empty_tick advances frontier without sets ------------------- */
+/* --- empty roster: tick_confirmed vacuously true ----------------------- */
 
-static void test_input_seal_empty_tick(void) {
+static void test_input_empty_roster(void) {
     ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
 
-    /* No players registered. Server seals ticks 1..3 as empty. */
-    ecs_input_seal_empty_tick(&it, 1);
-    EXPECT(ecs_input_frontier(&it) == 1ull,   "seal_empty(1) -> frontier 1");
-    ecs_input_seal_empty_tick(&it, 2);
-    EXPECT(ecs_input_frontier(&it) == 2ull,   "seal_empty(2) -> frontier 2");
-    ecs_input_seal_empty_tick(&it, 3);
-    EXPECT(ecs_input_frontier(&it) == 3ull,   "seal_empty(3) -> frontier 3");
-
-    EXPECT(ecs_input_tick_confirmed(&it, 1),  "tick 1 reported confirmed");
-    EXPECT(ecs_input_tick_confirmed(&it, 2),  "tick 2 reported confirmed");
-    EXPECT(ecs_input_tick_confirmed(&it, 3),  "tick 3 reported confirmed");
+    /* No players registered -- every tick reports confirmed (vacuous). */
+    EXPECT(ecs_input_tick_confirmed(&it, 1),  "no roster -> tick 1 vacuously confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 42), "no roster -> arbitrary tick confirmed");
 
     ecs_input_destroy(&it);
 }
@@ -435,7 +428,7 @@ static void test_input_persistence(void) {
     /* Confirm tick 1 for both players. */
     ecs_input_set(&it, 1, 1, &a, true);
     ecs_input_set(&it, 1, 2, &b, true);
-    EXPECT(ecs_input_frontier(&it) == 1ull,    "tick 1 confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 1),   "tick 1 confirmed");
 
     /* Predict tick 2 for pid 1 only; pid 2's prev bytes (b) carry forward
        as predicted via advance_row. */
@@ -471,13 +464,14 @@ static void test_input_auto_grow_burst(void) {
     EXPECT(ti_eq(ti_get(&it, 600, 1), pred_v[599]),
                                               "tick 600 predicted bytes preserved");
 
-    /* Confirmed burst: frontier walks to 600. */
+    /* Confirmed burst, then sim advances frontier. */
     for (uint64_t t = 1; t <= 600; t++) {
         ti_input_t v = ti_make((uint32_t)t, (int16_t)t, 0);
         ecs_input_set(&it, t, 1, &v, true);
     }
+    ecs_input_advance_to_tick(&it, 600);
     EXPECT(ecs_input_frontier(&it) == 600ull,
-                                              "frontier reached 600 after confirm burst");
+                                              "sim advanced frontier to 600");
 
     ecs_input_destroy(&it);
 }
@@ -511,15 +505,15 @@ static int test_input_all(void) {
     RUN_TEST(test_input_set_idempotent_same_value);
     RUN_TEST(test_input_set_overwrite);
     RUN_TEST(test_input_multi_packet_split);
-    RUN_TEST(test_input_frontier_contiguous);
+    RUN_TEST(test_input_frontier_sim_driven);
     RUN_TEST(test_input_partial_no_advance);
     RUN_TEST(test_input_ring_wrap);
     RUN_TEST(test_input_clear);
     RUN_TEST(test_input_register_unregister_cycle);
     RUN_TEST(test_input_deterministic_replay);
-    RUN_TEST(test_input_seed_frontier);
+    RUN_TEST(test_input_advance_to_tick);
     RUN_TEST(test_input_predicted_after_confirmed_dropped);
-    RUN_TEST(test_input_seal_empty_tick);
+    RUN_TEST(test_input_empty_roster);
     RUN_TEST(test_input_iterator);
     RUN_TEST(test_input_player_cap);
     RUN_TEST(test_input_persistence);

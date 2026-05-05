@@ -89,59 +89,6 @@ void bench_integrate_teardown(bench_integrate_ctx* ctx) {
     free(ctx);
 }
 
-/* SOA baseline: two contiguous vec3 arrays + scratch output, no ECS overhead.
-   Same arithmetic as bench_integrate_fn (pos_new = pos + vel * dt).
-   Writes to pos_out scratch — matches predict-mode semantics of BM_IntegrateDense
-   (reads stay valid across iters, no overflow accumulation). */
-struct bench_integrate_soa_ctx {
-    fixed_4_t* pos;
-    fixed_4_t* vel;
-    fixed_4_t* pos_out;
-    int     n;
-};
-
-static void bench_integrate_soa_fn(fixed_4_t* pos_out,
-                                   const fixed_4_t* pos,
-                                   const fixed_4_t* vel,
-                                   int n) {
-    for (int i = 0; i < n; i++) {
-        pos_out[i] = fixed4_add(pos[i], fixed4_scale(vel[i], BENCH_DT));
-    }
-}
-
-bench_integrate_soa_ctx* bench_integrate_soa_setup(int n) {
-    bench_integrate_soa_ctx* ctx = (bench_integrate_soa_ctx*)calloc(1, sizeof(*ctx));
-    ctx->n       = n;
-    ctx->pos     = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
-    ctx->vel     = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
-    ctx->pos_out = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
-
-    fixed_4_t v0 = fixed4_vec3(fixed_from_int(60), fixed_from_int(-30), 0);
-    for (int i = 0; i < n; i++) {
-        ctx->pos[i]     = fixed4_vec3(fixed_from_int(i), 0, 0);
-        ctx->vel[i]     = v0;
-        ctx->pos_out[i] = fixed4_zero();
-    }
-
-    /* Cache warmup. */
-    for (int k = 0; k < 70; k++) {
-        bench_integrate_soa_fn(ctx->pos_out, ctx->pos, ctx->vel, n);
-    }
-
-    return ctx;
-}
-
-void bench_integrate_soa_iter(bench_integrate_soa_ctx* ctx) {
-    bench_integrate_soa_fn(ctx->pos_out, ctx->pos, ctx->vel, ctx->n);
-}
-
-void bench_integrate_soa_teardown(bench_integrate_soa_ctx* ctx) {
-    free(ctx->pos);
-    free(ctx->vel);
-    free(ctx->pos_out);
-    free(ctx);
-}
-
 struct bench_random_access_ctx {
     ecs_tree_t*       tree;
     int*              indices;
@@ -294,43 +241,3 @@ void bench_sum_pos_teardown(bench_sum_pos_ctx* ctx) {
     free(ctx);
 }
 
-/* SOA readonly sum baseline: pos array post-integrate, summed flat. */
-struct bench_sum_pos_soa_ctx {
-    fixed_4_t* pos;
-    int     n;
-    fixed_4_t  sink;
-};
-
-static void bench_sum_pos_soa_fn(const fixed_4_t* pos, int n, fixed_4_t* out) {
-    fixed_4_t s = fixed4_zero();
-    for (int i = 0; i < n; i++) s = fixed4_add(s, pos[i]);
-    *out = s;
-}
-
-bench_sum_pos_soa_ctx* bench_sum_pos_soa_setup(int n) {
-    bench_sum_pos_soa_ctx* ctx = (bench_sum_pos_soa_ctx*)calloc(1, sizeof(*ctx));
-    ctx->n   = n;
-    ctx->pos = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
-
-    fixed_4_t v0 = fixed4_vec3(fixed_from_int(60), fixed_from_int(-30), 0);
-    for (int i = 0; i < n; i++) {
-        fixed_4_t p0 = fixed4_vec3(fixed_from_int(i), 0, 0);
-        ctx->pos[i] = fixed4_add(p0, fixed4_scale(v0, BENCH_DT));
-    }
-
-    /* Cache warmup. */
-    for (int k = 0; k < 70; k++) {
-        bench_sum_pos_soa_fn(ctx->pos, n, &ctx->sink);
-    }
-
-    return ctx;
-}
-
-void bench_sum_pos_soa_iter(bench_sum_pos_soa_ctx* ctx) {
-    bench_sum_pos_soa_fn(ctx->pos, ctx->n, &ctx->sink);
-}
-
-void bench_sum_pos_soa_teardown(bench_sum_pos_soa_ctx* ctx) {
-    free(ctx->pos);
-    free(ctx);
-}
