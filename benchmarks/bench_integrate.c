@@ -19,12 +19,12 @@ static void bench_integrate_fn(ecs_iterator_t* it) {
         do {
             int slot = ecs_ctz64(mask);
             mask &= mask - 1;
-            const vec3_t* vel = (const vec3_t* __restrict)ecs_iterator_get(it, 1, slot);
-            const vec3_t* pos_cur = (const vec3_t* __restrict)ecs_iterator_get(it, 0, slot);
-            vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel, BENCH_DT));
+            const fixed_4_t* vel = (const fixed_4_t* __restrict)ecs_iterator_get(it, 1, slot);
+            const fixed_4_t* pos_cur = (const fixed_4_t* __restrict)ecs_iterator_get(it, 0, slot);
+            fixed_4_t new_pos = fixed4_add(*pos_cur, fixed4_scale(*vel, BENCH_DT));
 
-            if (!vec3_eq(new_pos, *pos_cur)) {
-                *(vec3_t*)ecs_iterator_get_mut(it, 0, slot) = new_pos;
+            if (fixed4_eq(new_pos, *pos_cur) != 0xF) {
+                *(fixed_4_t*)ecs_iterator_get_mut(it, 0, slot) = new_pos;
             }
         } while (mask);
     }
@@ -34,28 +34,28 @@ bench_integrate_ctx* bench_integrate_setup(int n_total, int n_match) {
     bench_integrate_ctx* ctx = (bench_integrate_ctx*)calloc(1, sizeof(*ctx));
     ctx->n_match = n_match;
     ctx->w       = (ecs_world_t*)calloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&ctx->w->trees[0], sizeof(vec3_t), 0);
-    ecs_tree_init(&ctx->w->trees[1], sizeof(vec3_t), 0);
+    ecs_tree_init(&ctx->w->trees[0], sizeof(fixed_4_t), 0);
+    ecs_tree_init(&ctx->w->trees[1], sizeof(fixed_4_t), 0);
     ctx->w->mask = 3;
 
     for (int i = 0; i < n_total; i++) {
-        *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[0], i) =
-            vec3_make(fixed_from_int(i), 0, 0);
+        *(fixed_4_t*)ecs_tree_get_mut(&ctx->w->trees[0], i) =
+            fixed4_vec3(fixed_from_int(i), 0, 0);
     }
 
-    vec3_t vel = vec3_make(fixed_from_int(60), fixed_from_int(-30), 0);
+    fixed_4_t vel = fixed4_vec3(fixed_from_int(60), fixed_from_int(-30), 0);
 
     if (n_match <= n_total / 2) {
         int step = n_total / n_match;
         for (int i = 0, got = 0; got < n_match; i += step, got++) {
-            *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
+            *(fixed_4_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
         }
     } else {
         int n_skip = n_total - n_match;
         int step   = n_total / n_skip;
         for (int i = 0; i < n_total; i++) {
             if (i % step == 0) continue;
-            *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
+            *(fixed_4_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
         }
     }
 
@@ -94,33 +94,33 @@ void bench_integrate_teardown(bench_integrate_ctx* ctx) {
    Writes to pos_out scratch — matches predict-mode semantics of BM_IntegrateDense
    (reads stay valid across iters, no overflow accumulation). */
 struct bench_integrate_soa_ctx {
-    vec3_t* pos;
-    vec3_t* vel;
-    vec3_t* pos_out;
+    fixed_4_t* pos;
+    fixed_4_t* vel;
+    fixed_4_t* pos_out;
     int     n;
 };
 
-static void bench_integrate_soa_fn(vec3_t* pos_out,
-                                   const vec3_t* pos,
-                                   const vec3_t* vel,
+static void bench_integrate_soa_fn(fixed_4_t* pos_out,
+                                   const fixed_4_t* pos,
+                                   const fixed_4_t* vel,
                                    int n) {
     for (int i = 0; i < n; i++) {
-        pos_out[i] = vec3_add(pos[i], vec3_scale(vel[i], BENCH_DT));
+        pos_out[i] = fixed4_add(pos[i], fixed4_scale(vel[i], BENCH_DT));
     }
 }
 
 bench_integrate_soa_ctx* bench_integrate_soa_setup(int n) {
     bench_integrate_soa_ctx* ctx = (bench_integrate_soa_ctx*)calloc(1, sizeof(*ctx));
     ctx->n       = n;
-    ctx->pos     = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
-    ctx->vel     = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
-    ctx->pos_out = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
+    ctx->pos     = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
+    ctx->vel     = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
+    ctx->pos_out = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
 
-    vec3_t v0 = vec3_make(fixed_from_int(60), fixed_from_int(-30), 0);
+    fixed_4_t v0 = fixed4_vec3(fixed_from_int(60), fixed_from_int(-30), 0);
     for (int i = 0; i < n; i++) {
-        ctx->pos[i]     = vec3_make(fixed_from_int(i), 0, 0);
+        ctx->pos[i]     = fixed4_vec3(fixed_from_int(i), 0, 0);
         ctx->vel[i]     = v0;
-        ctx->pos_out[i] = vec3_zero();
+        ctx->pos_out[i] = fixed4_zero();
     }
 
     /* Cache warmup. */
@@ -161,10 +161,10 @@ bench_random_access_ctx* bench_random_access_setup(int n_total, int n_access) {
     }
 
     ctx->tree = (ecs_tree_t*)calloc(1, sizeof(ecs_tree_t));
-    ecs_tree_init(ctx->tree, sizeof(vec3_t), 0);
+    ecs_tree_init(ctx->tree, sizeof(fixed_4_t), 0);
     for (int i = 0; i < n_total; i++) {
-        *(vec3_t*)ecs_tree_get_mut(ctx->tree, i) =
-            vec3_make(fixed_from_int(i), 0, 0);
+        *(fixed_4_t*)ecs_tree_get_mut(ctx->tree, i) =
+            fixed4_vec3(fixed_from_int(i), 0, 0);
     }
     ecs_tree_rollback(ctx->tree);
 
@@ -172,7 +172,7 @@ bench_random_access_ctx* bench_random_access_setup(int n_total, int n_access) {
     for (int k = 0; k < 5; k++) {
         uint32_t s = 0;
         for (int i = 0; i < n_access; i++) {
-            const vec3_t* p = (const vec3_t*)ecs_tree_get(ctx->tree, ctx->indices[i]);
+            const fixed_4_t* p = (const fixed_4_t*)ecs_tree_get(ctx->tree, ctx->indices[i]);
             s += (uint32_t)p->x;
         }
         ctx->sink = s;
@@ -184,7 +184,7 @@ bench_random_access_ctx* bench_random_access_setup(int n_total, int n_access) {
 void bench_random_access_iter(bench_random_access_ctx* ctx) {
     uint32_t s = 0;
     for (int i = 0; i < ctx->n_access; i++) {
-        const vec3_t* p = (const vec3_t*)ecs_tree_get(ctx->tree, ctx->indices[i]);
+        const fixed_4_t* p = (const fixed_4_t*)ecs_tree_get(ctx->tree, ctx->indices[i]);
         s += (uint32_t)p->x;
     }
     ctx->sink = s;
@@ -203,18 +203,18 @@ void bench_random_access_teardown(bench_random_access_ctx* ctx) {
 struct bench_sum_pos_ctx {
     ecs_world_t*         w;
     ecs_compiled_query_t query;
-    vec3_t               sink;
+    fixed_4_t               sink;
 };
 
-static void bench_sum_pos_fn(ecs_iterator_t* it, vec3_t* out) {
-    vec3_t s = vec3_zero();
+static void bench_sum_pos_fn(ecs_iterator_t* it, fixed_4_t* out) {
+    fixed_4_t s = fixed4_zero();
     uint64_t mask;
     while ((mask = ecs_iterator_next_block(it))) {
         while (mask) {
             int slot = ecs_ctz64(mask);
             mask &= mask - 1;
-            const vec3_t* p = (const vec3_t*)ecs_iterator_get(it, 0, slot);
-            s = vec3_add(s, *p);
+            const fixed_4_t* p = (const fixed_4_t*)ecs_iterator_get(it, 0, slot);
+            s = fixed4_add(s, *p);
         }
     }
     *out = s;
@@ -223,28 +223,28 @@ static void bench_sum_pos_fn(ecs_iterator_t* it, vec3_t* out) {
 bench_sum_pos_ctx* bench_sum_pos_setup(int n_total, int n_match) {
     bench_sum_pos_ctx* ctx = (bench_sum_pos_ctx*)calloc(1, sizeof(*ctx));
     ctx->w = (ecs_world_t*)calloc(1, sizeof(ecs_world_t));
-    ecs_tree_init(&ctx->w->trees[0], sizeof(vec3_t), 0);
-    ecs_tree_init(&ctx->w->trees[1], sizeof(vec3_t), 0);
+    ecs_tree_init(&ctx->w->trees[0], sizeof(fixed_4_t), 0);
+    ecs_tree_init(&ctx->w->trees[1], sizeof(fixed_4_t), 0);
     ctx->w->mask = 3;
 
     for (int i = 0; i < n_total; i++) {
-        *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[0], i) =
-            vec3_make(fixed_from_int(i), 0, 0);
+        *(fixed_4_t*)ecs_tree_get_mut(&ctx->w->trees[0], i) =
+            fixed4_vec3(fixed_from_int(i), 0, 0);
     }
 
-    vec3_t vel = vec3_make(fixed_from_int(60), fixed_from_int(-30), 0);
+    fixed_4_t vel = fixed4_vec3(fixed_from_int(60), fixed_from_int(-30), 0);
 
     if (n_match <= n_total / 2) {
         int step = n_total / n_match;
         for (int i = 0, got = 0; got < n_match; i += step, got++) {
-            *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
+            *(fixed_4_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
         }
     } else {
         int n_skip = n_total - n_match;
         int step   = n_total / n_skip;
         for (int i = 0; i < n_total; i++) {
             if (i % step == 0) continue;
-            *(vec3_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
+            *(fixed_4_t*)ecs_tree_get_mut(&ctx->w->trees[1], i) = vel;
         }
     }
 
@@ -264,10 +264,10 @@ bench_sum_pos_ctx* bench_sum_pos_setup(int n_total, int n_match) {
             while (mask) {
                 int slot = ecs_ctz64(mask);
                 mask &= mask - 1;
-                const vec3_t* vel_p   = (const vec3_t*)ecs_iterator_get(&it, 1, slot);
-                const vec3_t* pos_cur = (const vec3_t*)ecs_iterator_get(&it, 0, slot);
-                vec3_t new_pos = vec3_add(*pos_cur, vec3_scale(*vel_p, BENCH_DT));
-                *(vec3_t*)ecs_iterator_get_mut(&it, 0, slot) = new_pos;
+                const fixed_4_t* vel_p   = (const fixed_4_t*)ecs_iterator_get(&it, 1, slot);
+                const fixed_4_t* pos_cur = (const fixed_4_t*)ecs_iterator_get(&it, 0, slot);
+                fixed_4_t new_pos = fixed4_add(*pos_cur, fixed4_scale(*vel_p, BENCH_DT));
+                *(fixed_4_t*)ecs_iterator_get_mut(&it, 0, slot) = new_pos;
             }
         }
     }
@@ -296,26 +296,26 @@ void bench_sum_pos_teardown(bench_sum_pos_ctx* ctx) {
 
 /* SOA readonly sum baseline: pos array post-integrate, summed flat. */
 struct bench_sum_pos_soa_ctx {
-    vec3_t* pos;
+    fixed_4_t* pos;
     int     n;
-    vec3_t  sink;
+    fixed_4_t  sink;
 };
 
-static void bench_sum_pos_soa_fn(const vec3_t* pos, int n, vec3_t* out) {
-    vec3_t s = vec3_zero();
-    for (int i = 0; i < n; i++) s = vec3_add(s, pos[i]);
+static void bench_sum_pos_soa_fn(const fixed_4_t* pos, int n, fixed_4_t* out) {
+    fixed_4_t s = fixed4_zero();
+    for (int i = 0; i < n; i++) s = fixed4_add(s, pos[i]);
     *out = s;
 }
 
 bench_sum_pos_soa_ctx* bench_sum_pos_soa_setup(int n) {
     bench_sum_pos_soa_ctx* ctx = (bench_sum_pos_soa_ctx*)calloc(1, sizeof(*ctx));
     ctx->n   = n;
-    ctx->pos = (vec3_t*)malloc((size_t)n * sizeof(vec3_t));
+    ctx->pos = (fixed_4_t*)malloc((size_t)n * sizeof(fixed_4_t));
 
-    vec3_t v0 = vec3_make(fixed_from_int(60), fixed_from_int(-30), 0);
+    fixed_4_t v0 = fixed4_vec3(fixed_from_int(60), fixed_from_int(-30), 0);
     for (int i = 0; i < n; i++) {
-        vec3_t p0 = vec3_make(fixed_from_int(i), 0, 0);
-        ctx->pos[i] = vec3_add(p0, vec3_scale(v0, BENCH_DT));
+        fixed_4_t p0 = fixed4_vec3(fixed_from_int(i), 0, 0);
+        ctx->pos[i] = fixed4_add(p0, fixed4_scale(v0, BENCH_DT));
     }
 
     /* Cache warmup. */

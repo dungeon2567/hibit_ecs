@@ -37,8 +37,8 @@ static aabb_t bench_bp_item_aabb(uint32_t* rng) {
     fixed_t cx = fixed_from_int((int)(bench_bp_lcg(rng) % BENCH_BP_WORLD));
     fixed_t cy = fixed_from_int((int)(bench_bp_lcg(rng) % BENCH_BP_WORLD));
     fixed_t cz = fixed_from_int((int)(bench_bp_lcg(rng) % BENCH_BP_WORLD));
-    vec3_t  c  = vec3_make(cx, cy, cz);
-    vec3_t  e  = vec3_make(fixed_from_int(1), fixed_from_int(1), fixed_from_int(1));
+    fixed_4_t  c  = fixed4_vec3(cx, cy, cz);
+    fixed_4_t  e  = fixed4_vec3(fixed_from_int(1), fixed_from_int(1), fixed_from_int(1));
     return aabb_from_center_extents(c, e);
 }
 
@@ -46,8 +46,8 @@ static aabb_t bench_bp_query_aabb(uint32_t* rng) {
     fixed_t cx = fixed_from_int((int)(bench_bp_lcg(rng) % BENCH_BP_WORLD));
     fixed_t cy = fixed_from_int((int)(bench_bp_lcg(rng) % BENCH_BP_WORLD));
     fixed_t cz = fixed_from_int((int)(bench_bp_lcg(rng) % BENCH_BP_WORLD));
-    vec3_t  c  = vec3_make(cx, cy, cz);
-    vec3_t  e  = vec3_make(fixed_from_int(4), fixed_from_int(4), fixed_from_int(4));
+    fixed_4_t  c  = fixed4_vec3(cx, cy, cz);
+    fixed_4_t  e  = fixed4_vec3(fixed_from_int(4), fixed_from_int(4), fixed_from_int(4));
     return aabb_from_center_extents(c, e);
 }
 
@@ -136,10 +136,10 @@ bench_broadphase_ctx* bench_broadphase_setup_scatter(int n_items, int n_queries)
         fixed_t jx = (fixed_t)((bench_bp_lcg(&rng) & 0xFFFF) - 0x8000);
         fixed_t jy = (fixed_t)((bench_bp_lcg(&rng) & 0xFFFF) - 0x8000);
         fixed_t jz = (fixed_t)((bench_bp_lcg(&rng) & 0xFFFF) - 0x8000);
-        vec3_t  c  = vec3_make(fixed_from_int(ix * spacing) + jx,
+        fixed_4_t  c  = fixed4_vec3(fixed_from_int(ix * spacing) + jx,
                                fixed_from_int(iy * spacing) + jy,
                                fixed_from_int(iz * spacing) + jz);
-        vec3_t  e  = vec3_make(fixed_from_int(1), fixed_from_int(1), fixed_from_int(1));
+        fixed_4_t  e  = fixed4_vec3(fixed_from_int(1), fixed_from_int(1), fixed_from_int(1));
         ctx->objs[i].transform = transform_identity();
         ctx->objs[i].entity_id = (uint32_t)i;
         ctx->boxes[i]          = aabb_from_center_extents(c, e);
@@ -148,8 +148,8 @@ bench_broadphase_ctx* bench_broadphase_setup_scatter(int n_items, int n_queries)
         fixed_t cx = fixed_from_int((int)(bench_bp_lcg(&rng) % (uint32_t)world));
         fixed_t cy = fixed_from_int((int)(bench_bp_lcg(&rng) % (uint32_t)world));
         fixed_t cz = fixed_from_int((int)(bench_bp_lcg(&rng) % (uint32_t)world));
-        vec3_t  c  = vec3_make(cx, cy, cz);
-        vec3_t  e  = vec3_make(fixed_from_int(4), fixed_from_int(4), fixed_from_int(4));
+        fixed_4_t  c  = fixed4_vec3(cx, cy, cz);
+        fixed_4_t  e  = fixed4_vec3(fixed_from_int(4), fixed_from_int(4), fixed_from_int(4));
         ctx->queries[i] = aabb_from_center_extents(c, e);
     }
 

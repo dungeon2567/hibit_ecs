@@ -16,8 +16,8 @@
        broadphase_query_begin / broadphase_query_next */
 
 static aabb_t bp_aabb_xyz_(int x, int y, int z, int half) {
-    vec3_t c = vec3_make(fixed_from_int(x), fixed_from_int(y), fixed_from_int(z));
-    vec3_t e = vec3_make(fixed_from_int(half), fixed_from_int(half), fixed_from_int(half));
+    fixed_4_t c = fixed4_vec3(fixed_from_int(x), fixed_from_int(y), fixed_from_int(z));
+    fixed_4_t e = fixed4_vec3(fixed_from_int(half), fixed_from_int(half), fixed_from_int(half));
     return aabb_from_center_extents(c, e);
 }
 
@@ -150,8 +150,8 @@ static void test_broadphase_multi_level(void) {
     EXPECT(bp.n_nodes >= 13 + 2, "leaves(13) + L1(2) + root or merged");
 
     aabb_t q = {
-        .min = vec3_make(fixed_from_int(-2), fixed_from_int(-2), fixed_from_int(-2)),
-        .max = vec3_make(fixed_from_int(20), fixed_from_int(20), fixed_from_int(2))
+        .min = fixed4_vec3(fixed_from_int(-2), fixed_from_int(-2), fixed_from_int(-2)),
+        .max = fixed4_vec3(fixed_from_int(20), fixed_from_int(20), fixed_from_int(2))
     };
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, q);
@@ -179,14 +179,14 @@ static void test_broadphase_aabb_filter(void) {
     broadphase_t bp; broadphase_init(&bp, 16);
 
     fixed_t f05 = fixed_from_parts(0, 5);
-    vec3_t  e   = vec3_make(f05, f05, f05);
+    fixed_4_t  e   = fixed4_vec3(f05, f05, f05);
 
-    broadphase_insert(&bp, bp_obj_(10), aabb_from_center_extents(vec3_make(0, 0, 0), e));
-    broadphase_insert(&bp, bp_obj_(11), aabb_from_center_extents(vec3_make(fixed_from_int(3), 0, 0), e));
-    broadphase_insert(&bp, bp_obj_(12), aabb_from_center_extents(vec3_make(0, fixed_from_int(3), 0), e));
+    broadphase_insert(&bp, bp_obj_(10), aabb_from_center_extents(fixed4_vec3(0, 0, 0), e));
+    broadphase_insert(&bp, bp_obj_(11), aabb_from_center_extents(fixed4_vec3(fixed_from_int(3), 0, 0), e));
+    broadphase_insert(&bp, bp_obj_(12), aabb_from_center_extents(fixed4_vec3(0, fixed_from_int(3), 0), e));
     broadphase_build(&bp);
 
-    aabb_t q = aabb_from_center_extents(vec3_make(fixed_from_int(3), 0, 0), e);
+    aabb_t q = aabb_from_center_extents(fixed4_vec3(fixed_from_int(3), 0, 0), e);
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, q);
 
@@ -240,8 +240,8 @@ static void test_broadphase_query_far_away(void) {
     broadphase_build(&bp);
 
     aabb_t q = {
-        .min = vec3_make(fixed_from_int(100), fixed_from_int(100), fixed_from_int(100)),
-        .max = vec3_make(fixed_from_int(200), fixed_from_int(200), fixed_from_int(200))
+        .min = fixed4_vec3(fixed_from_int(100), fixed_from_int(100), fixed_from_int(100)),
+        .max = fixed4_vec3(fixed_from_int(200), fixed_from_int(200), fixed_from_int(200))
     };
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, q);
@@ -268,8 +268,8 @@ static void test_broadphase_full_grid(void) {
     EXPECT(id_counter == 27, "27 items inserted");
 
     aabb_t q = {
-        .min = vec3_make(0, 0, 0),
-        .max = vec3_make(fixed_from_int(12), fixed_from_int(12), fixed_from_int(12))
+        .min = fixed4_vec3(0, 0, 0),
+        .max = fixed4_vec3(fixed_from_int(12), fixed_from_int(12), fixed_from_int(12))
     };
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, q);
@@ -380,14 +380,14 @@ static void test_broadphase_query_known_count(void) {
     broadphase_t bp; broadphase_init(&bp, 256);
 
     fixed_t  f05 = fixed_from_parts(0, 5);
-    vec3_t   e   = vec3_make(f05, f05, f05);
+    fixed_4_t   e   = fixed4_vec3(f05, f05, f05);
 
     enum { N = 125 };
     uint32_t id = 0;
     for (int z = 0; z < 5; ++z)
     for (int y = 0; y < 5; ++y)
     for (int x = 0; x < 5; ++x) {
-        vec3_t c = vec3_make(fixed_from_int(2 * x),
+        fixed_4_t c = fixed4_vec3(fixed_from_int(2 * x),
                              fixed_from_int(2 * y),
                              fixed_from_int(2 * z));
         broadphase_insert(&bp, bp_obj_(id++), aabb_from_center_extents(c, e));
@@ -396,8 +396,8 @@ static void test_broadphase_query_known_count(void) {
     EXPECT(id == N, "125 items inserted");
 
     aabb_t q = {
-        .min = vec3_make(fixed_from_int(3), fixed_from_int(3), fixed_from_int(3)),
-        .max = vec3_make(fixed_from_int(9), fixed_from_int(9), fixed_from_int(9))
+        .min = fixed4_vec3(fixed_from_int(3), fixed_from_int(3), fixed_from_int(3)),
+        .max = fixed4_vec3(fixed_from_int(9), fixed_from_int(9), fixed_from_int(9))
     };
     broadphase_iter_t it;
     broadphase_query_begin(&it, &bp, q);
