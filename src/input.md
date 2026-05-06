@@ -7,7 +7,7 @@ flags and a sim-driven frontier.
 
 The module is **slot-keyed**. Callers allocate slots via
 `ecs_input_alloc_slot` and pass slots directly to `set` / `get`. Any
-`pid → slot` mapping (if needed) lives outside this module.
+external identifier mapping lives outside this module.
 
 ---
 
@@ -133,12 +133,11 @@ For typical `active_cap ≤ 64` this is a single instruction.
 
 Consequences:
 
-- No SIMD scan, no `pid → slot` reverse map. The cost of the old
-  lookup (8-lane `fixed_8_t` equality) collapsed to one bit test.
 - Holes are reused lowest-first. Reuse-stable iteration order is
   determined entirely by the alloc/free sequence — peers must replay
   the same membership stream for cross-peer determinism.
-- `active_count = popcount(live_bm)` is maintained as a scalar.
+- `active_count` is maintained as a scalar (incremented on alloc,
+  decremented on free).
 
 ---
 

@@ -25,8 +25,8 @@
 
    Slot membership: live_bm is a single bitmap of width W. Bit `idx`
    set <=> slot idx is registered. alloc_slot finds the lowest 0 bit
-   via word-wise ctz; free_slot clears the bit. No SIMD scan, no
-   pid -> slot lookup -- callers pass slots directly.
+   via word-wise ctz; free_slot clears the bit. Callers pass slots
+   directly -- the engine has no notion of external ids.
    ========================================================================== */
 
 #define IN_HDR_BYTES 8u   /* tick_in_slot prefix size */
@@ -409,6 +409,52 @@ void ecs_input_set(ecs_input_t* it, uint32_t tick, uint32_t slot,
 
     if (confirmed && !was_confirmed) {
         conf[word] |= bit;
+    }
+
+    /* Backward prediction fill. Out-of-order arrivals (tick N received
+       before N-1) leave the in-between rows without this slot's bytes;
+       backfill imprints `value` as PREDICTED at past ticks where this
+       slot is currently absent. Walks T = tick-1, tick-2, ... and stops
+       on the first row where the slot is already present, the row is
+       sealed (T <= frontier), tick falls below 1, or the ring slot is
+       holding a non-evictable foreign tick. Confirmed bit is never set
+       on backfilled rows. */
+    {
+        uint32_t mask = it->buf_mask;
+        uint32_t buf  = it->buf_size;
+        uint32_t T    = tick;
+        for (uint32_t step = 1u; step < buf; step++) {
+            if (T == 0u) break;
+            T--;
+            if (T == 0u) break;                        /* tick 0 reserved */
+            if (T <= it->confirmed_frontier) break;    /* sealed past */
+
+            uint32_t rid    = T & mask;
+            uint8_t* prow   = in_row_ptr(it, rid);
+            uint32_t cur    = *in_row_tick(prow);
+
+            if (cur == T) {
+                /* Row resident for this past tick. Imprint slot if absent. */
+                uint64_t* p_pres = in_row_present(prow);
+                if ((p_pres[word] & bit) != 0ull) break;   /* already filled */
+                memcpy(in_row_cell(prow, W, slot, it->stride), value, it->stride);
+                p_pres[word] |= bit;
+                continue;
+            }
+
+            /* Row holds something else. Only safe to claim if NIL or holds
+               a sealed tick. Holding a different live tick (predicted future
+               or a still-live past) -> stop, do not evict. */
+            bool can_claim = (cur == ECS_INPUT_TICK_NIL) ||
+                             (cur != tick && cur <= it->confirmed_frontier);
+            if (!can_claim) break;
+
+            in_advance_row(it, rid, T);
+            *in_row_tick(prow) = T;
+            uint64_t* p_pres = in_row_present(prow);
+            memcpy(in_row_cell(prow, W, slot, it->stride), value, it->stride);
+            p_pres[word] |= bit;
+        }
     }
 }
 

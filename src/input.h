@@ -17,8 +17,8 @@
                        picks the now-empty position.
      opaque payload  : caller defines stride at init; engine never inspects.
 
-   Slot identity     : caller is responsible for any pid -> slot mapping
-                       outside this module. The engine only knows slots.
+   Slot identity     : the engine only knows slots. Any external
+                       identifier mapping lives outside this module.
 
    Storage           : single 2D table, row-major. Each row = one tick
                        slot * active_cap * stride bytes (full roster for
@@ -42,7 +42,7 @@
    Live mask         : live_bm is a single bitmap of width words_per_row.
                        Bit `idx` set <=> slot idx is currently registered.
                        Membership ops are O(1) on a single u64 word; alloc
-                       finds the first 0 bit via ctz. No SIMD search.
+                       finds the first 0 bit via word-wise ctz.
 
    Frontier          : confirmed_frontier is sim-driven via
                        ecs_input_advance_to_tick. Input does NOT auto-track
@@ -227,6 +227,16 @@ bool ecs_input_iter_next(ecs_input_iter_t* iter);
    Predicted-after-confirmed: if (tick, slot) is already confirmed and
    this call has confirmed=false, the call is a no-op (confirmed bytes
    are authoritative).
+
+   Backward prediction fill: after the write at `tick`, the call walks
+   past ticks (tick-1, tick-2, ...) and imprints `value` as PREDICTED
+   at every row where this slot is currently absent. Stops at the first
+   row where the slot is already present, the tick is sealed
+   (<= frontier), tick falls below 1, the buf_size limit is reached,
+   or the ring slot holds a non-evictable foreign tick. The confirmed
+   bit is NEVER set on backfilled rows. This makes out-of-order
+   arrivals (tick N received before N-1) recover predictive carry that
+   first-touch alone would have missed.
 
    No-op if slot is out of range or not live. */
 void ecs_input_set(ecs_input_t* it, uint32_t tick, uint32_t slot,

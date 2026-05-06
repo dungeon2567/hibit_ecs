@@ -504,6 +504,57 @@ static void test_input_persistence(void) {
     ecs_input_destroy(&it);
 }
 
+/* --- out-of-order arrival: backward predicted walk -------------------- */
+
+static void test_input_ooo_backward_fill(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    /* Tick 5 arrives first, no prior history. Backfill must imprint
+       v at ticks 4,3,2,1 as predicted (not confirmed). */
+    ti_input_t v = ti_make(0xAB, 7, 7);
+    ecs_input_set(&it, 5, s, &v, true);
+
+    for (uint32_t t = 1; t <= 4; t++) {
+        ecs_input_view_t view = ecs_input_get_view(&it, t, s);
+        EXPECT(view.present,                "OOO backfill: past tick has slot present");
+        EXPECT(!view.confirmed,             "OOO backfill: past tick predicted only");
+        EXPECT(ti_eq(ti_get(&it, t, s), v), "OOO backfill: bytes match current");
+    }
+    ecs_input_view_t at5 = ecs_input_get_view(&it, 5, s);
+    EXPECT(at5.present && at5.confirmed,    "OOO backfill: source tick still confirmed");
+
+    /* Already-present blocks further backfill. Tick 10 arrives: walk
+       9,8,7,6 (all NIL -> claim + write w predicted), then T=5 is
+       present -> stop. Tick 5 must NOT be overwritten. */
+    ti_input_t w = ti_make(0xCD, 1, 1);
+    ecs_input_set(&it, 10, s, &w, true);
+    for (uint32_t t = 6; t <= 9; t++) {
+        ecs_input_view_t view = ecs_input_get_view(&it, t, s);
+        EXPECT(view.present && !view.confirmed, "OOO backfill: predicted in gap");
+        EXPECT(ti_eq(ti_get(&it, t, s), w),     "OOO backfill: gap bytes match w");
+    }
+    EXPECT(ti_eq(ti_get(&it, 5, s), v),         "OOO backfill: tick 5 not overwritten");
+    ecs_input_view_t at5b = ecs_input_get_view(&it, 5, s);
+    EXPECT(at5b.confirmed,                      "OOO backfill: tick 5 still confirmed");
+
+    /* Frontier blocks backfill below it. Advance frontier to 12, set
+       tick 20: walk 19..13 fills predicted z, T=12 <= frontier stops. */
+    ecs_input_advance_to_tick(&it, 12);
+    ti_input_t z = ti_make(0xEF, 2, 2);
+    ecs_input_set(&it, 20, s, &z, true);
+    for (uint32_t t = 13; t <= 19; t++) {
+        ecs_input_view_t view = ecs_input_get_view(&it, t, s);
+        EXPECT(view.present && !view.confirmed, "OOO backfill: predicted above frontier");
+        EXPECT(ti_eq(ti_get(&it, t, s), z),     "OOO backfill: above-frontier bytes match z");
+    }
+    /* Frontier seal: tick 12 was never written; ring slot is NIL or
+       holds an unrelated tick. get must return NULL (not resident). */
+    EXPECT(ecs_input_get(&it, 12, s) == NULL,   "OOO backfill: frontier sealed tick not touched");
+
+    ecs_input_destroy(&it);
+}
+
 /* --- auto-grow on burst of predictions -------------------------------- */
 
 static void test_input_auto_grow_burst(void) {
@@ -1092,6 +1143,7 @@ static int test_input_all(void) {
     RUN_TEST(test_input_iterator);
     RUN_TEST(test_input_player_cap);
     RUN_TEST(test_input_persistence);
+    RUN_TEST(test_input_ooo_backward_fill);
     RUN_TEST(test_input_auto_grow_burst);
     RUN_TEST(test_input_grow_buf_preemptive);
     RUN_TEST(test_input_grow_player_cap_consistency);
