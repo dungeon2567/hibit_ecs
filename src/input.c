@@ -256,8 +256,8 @@ static void in_realloc_table(ecs_input_t* it, uint32_t new_cap,
             const uint8_t* old_payload = old_row + IN_HDR_BYTES + (size_t)old_W * 16u + (size_t)old_cap * 8u;
             memcpy(new_payload, old_payload, (size_t)copy_cap * (size_t)it->stride);
         }
-        ecs_free(it->table);
     }
+    if (it->table) ecs_free(it->table);
     it->table         = new_table;
     it->row_bytes     = new_row_bytes;
     it->words_per_row = new_W;
