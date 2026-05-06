@@ -823,7 +823,7 @@ static void test_input_serialize_roundtrip(void) {
     uint64_t buf[64] = {0};
     ecs_serializer_t s;
     ecs_serializer_init(&s, buf, sizeof(buf));
-    ecs_input_serialize_tick(&a, &s, 11, 1);
+    ecs_input_serialize_tick(&a, &s, 11, 8);
     ecs_serializer_flush_bits(&s);
     int32_t bits_written = ecs_serializer_get_bits_written(&s);
     EXPECT(bits_written > 0,                  "serializer wrote some bits");
@@ -937,6 +937,108 @@ static void test_input_serialize_unregistered_skipped(void) {
     ecs_input_destroy(&b);
 }
 
+/* --- serialize: redundancy=8 wire size per cascade level -------------- */
+
+static void test_input_serialize_redundancy_eight(void) {
+    /* 1 registered pid -> active_cap = 16 (init grow). 15 NIL slots
+       always emit 1 baseline bit each. Header is 64 (tick) + 8
+       (redundancy) = 72 bits. So the per-test wire size is:
+           72 + 15 (NIL slots) + slot_0_cost
+       slot_0_cost depends on which cascade level matches. */
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+    ecs_input_register_player(&a, 1);
+    ecs_input_register_player(&b, 1);
+
+    /* Mirror ticks 1..9 on both peers, all distinct payloads. */
+    ti_input_t vs[10];
+    vs[0] = ti_make(0, 0, 0);   /* unused, tick 0 reserved */
+    for (uint64_t t = 1; t <= 9; t++) {
+        vs[t] = ti_make((uint32_t)(t * 0x1111u), (int16_t)t, (int16_t)(-(int)t));
+        ecs_input_set(&a, t, 1, &vs[t], true);
+        ecs_input_set(&b, t, 1, &vs[t], true);
+    }
+
+    uint64_t buf[16];
+    ecs_serializer_t s;
+    ecs_deserializer_t d;
+    int32_t bits;
+
+    /* (A) Unique payload at tick 10: no cascade match -> 9 cascade
+           bits (8 ones + signal-end one) + 64 raw payload bits.
+       72 header + 15 NIL + 9 cascade + 64 raw = 160 bits. */
+    ti_input_t unique = ti_make(0xDEADBEEFu, 999, -999);
+    ecs_input_set(&a, 10, 1, &unique, true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 10, 8);
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 160,                       "redundancy=8 unique slot: 160 bits");
+
+    ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 10, 1), unique),  "redundancy=8 unique: round-trip");
+
+    /* (B) Tick 11 == tick 10 -> matches T-1: 2 cascade bits (1, 0).
+       72 + 15 + 2 = 89 bits. */
+    ecs_input_set(&a, 11, 1, &unique, true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 11, 8);
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 89,                        "redundancy=8 T-1 match: 89 bits");
+
+    ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 11, 1), unique),  "redundancy=8 T-1 match: round-trip");
+
+    /* (C) Tick 12 == tick 4 -> matches T-8 (deepest cascade): 9
+           cascade bits (8 ones + ending zero). 72 + 15 + 9 = 96 bits. */
+    ecs_input_set(&a, 12, 1, &vs[4], true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 12, 8);
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 96,                        "redundancy=8 T-8 match: 96 bits");
+
+    ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 12, 1), vs[4]),   "redundancy=8 T-8 match: round-trip");
+
+    /* (D) Tick 13 == zero -> baseline match: 1 cascade bit.
+       72 + 16 = 88 bits (slot 0 collapses to a single baseline bit
+       just like the NIL slots). */
+    ti_input_t zero = ti_make(0, 0, 0);
+    ecs_input_set(&a, 13, 1, &zero, true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 13, 8);
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 88,                        "redundancy=8 baseline match: 88 bits");
+
+    ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 13, 1), zero),    "redundancy=8 baseline match: round-trip");
+
+    /* Sanity: across all four scenarios receiver tick is fully confirmed. */
+    EXPECT(ecs_input_tick_confirmed(&b, 10),  "tick 10 confirmed on receiver");
+    EXPECT(ecs_input_tick_confirmed(&b, 11),  "tick 11 confirmed on receiver");
+    EXPECT(ecs_input_tick_confirmed(&b, 12),  "tick 12 confirmed on receiver");
+    EXPECT(ecs_input_tick_confirmed(&b, 13),  "tick 13 confirmed on receiver");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
 /* --- entry point ------------------------------------------------------- */
 
 static int test_input_all(void) {
@@ -969,6 +1071,7 @@ static int test_input_all(void) {
     RUN_TEST(test_input_serialize_redundancy_zero);
     RUN_TEST(test_input_serialize_all_zero_compact);
     RUN_TEST(test_input_serialize_unregistered_skipped);
+    RUN_TEST(test_input_serialize_redundancy_eight);
     int failed = g_failed - before;
     printf("\ninput: %d failed\n", failed);
     return failed ? 1 : 0;
