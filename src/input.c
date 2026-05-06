@@ -625,26 +625,43 @@ void ecs_input_advance_to_tick(ecs_input_t* it, uint32_t tick) {
 /* ==========================================================================
    Command stream
 
-   Per-(tick, slot) FIFO list of opaque variable-bit-length commands.
-   Authoritative-only -- never carried forward across ticks. Each ring
-   row owns one bump arena; per-slot head/tail offsets in the row index
-   into it. Append is O(1), iter is O(commands per slot). Reset on
-   first-touch eviction (arena.len = 0, head/tail = 0; arena.buf retained).
+   Per-(tick, slot) FIFO list of opaque commands. Each command's
+   payload bit length is fetched from the per-input registry by type
+   id; the wire carries (type_id, payload) only -- no per-command
+   bit_len. Authoritative-only -- never carried forward across ticks.
+   Each ring row owns one bump arena; per-slot head/tail offsets in
+   the row index into it. Append is O(1), iter is O(commands per slot).
+   Reset on first-touch eviction (arena.len = 0, head/tail = 0;
+   arena.buf retained).
 
    Node layout in arena (byte-packed):
-     u32 next_off     offset+1 of next node in this slot's chain, 0 = end 
-     u32 bit_len      exact payload bit count 
-     u8  bytes[ceil(bit_len/8)]
+     u32 next_off     offset+1 of next node in this slot's chain, 0 = end
+     u32 type_id      command type id (only low 8 bits used; pad keeps alignment)
+     u8  bytes[ceil(bit_len/8)]   bit_len fetched from registry by type_id
    ========================================================================== */
 
+void ecs_input_register_command_type(ecs_input_t* it, uint8_t type_id, uint32_t bit_len) {
+    assert(it);
+    assert(type_id != 0u);
+    assert(bit_len > 0u && bit_len <= ECS_INPUT_CMD_MAX_BITS);
+    it->cmd_type_bits[type_id] = (uint16_t)bit_len;
+}
+
+uint32_t ecs_input_command_type_bit_len(const ecs_input_t* it, uint8_t type_id) {
+    assert(it);
+    return (uint32_t)it->cmd_type_bits[type_id];
+}
+
 void ecs_input_cmd_append(ecs_input_t* it, uint32_t tick, uint32_t slot,
-                          const void* bytes, uint32_t bit_len)
+                          uint8_t type_id, const void* bytes)
 {
     assert(it);
     assert(tick != ECS_INPUT_TICK_NIL);
     assert(tick >= 1u);
-    assert(bit_len <= ECS_INPUT_CMD_MAX_BITS);
-    assert(bytes || bit_len == 0u);
+
+    uint32_t bit_len = (uint32_t)it->cmd_type_bits[type_id];
+    if (bit_len == 0u) return;                        /* unregistered -- drop */
+    assert(bytes);
 
     if (tick <= it->confirmed_frontier) return;       /* sealed -- drop */
     if (!in_slot_live(it, slot)) return;
@@ -693,10 +710,11 @@ void ecs_input_cmd_append(ecs_input_t* it, uint32_t tick, uint32_t slot,
     uint32_t* heads = in_row_cmd_head(row, W);
     uint32_t* tails = in_row_cmd_tail(row, W, A);
 
-    /* Write node: next=0 (becomes new tail), bit_len, payload. */
+    /* Write node: next=0 (becomes new tail), type_id (zero-extended), payload. */
     uint32_t zero = 0u;
-    memcpy(a->buf + off,     &zero,    4);
-    memcpy(a->buf + off + 4, &bit_len, 4);
+    uint32_t tid32 = (uint32_t)type_id;
+    memcpy(a->buf + off,     &zero,  4);
+    memcpy(a->buf + off + 4, &tid32, 4);
     if (store_bytes) memcpy(a->buf + off + 8, bytes, store_bytes);
 
     if (heads[slot] == 0u) {
@@ -730,20 +748,24 @@ ecs_input_cmd_iter_t ecs_input_cmd_iter_begin(const ecs_input_t* it,
 }
 
 bool ecs_input_cmd_iter_next(ecs_input_cmd_iter_t* iter,
+                             uint8_t* out_type,
                              const void** out_bytes,
                              uint32_t* out_bit_len)
 {
     if (!iter || !iter->arena || iter->next_off == 0u) {
+        if (out_type)    *out_type    = 0u;
         if (out_bytes)   *out_bytes   = NULL;
         if (out_bit_len) *out_bit_len = 0u;
         return false;
     }
     uint32_t off = iter->next_off - 1u;
-    uint32_t next, bit_len;
-    memcpy(&next,    iter->arena + off,     4);
-    memcpy(&bit_len, iter->arena + off + 4, 4);
+    uint32_t next, tid32;
+    memcpy(&next,  iter->arena + off,     4);
+    memcpy(&tid32, iter->arena + off + 4, 4);
+    uint8_t type_id = (uint8_t)tid32;
+    if (out_type)    *out_type    = type_id;
     if (out_bytes)   *out_bytes   = iter->arena + off + 8;
-    if (out_bit_len) *out_bit_len = bit_len;
+    if (out_bit_len) *out_bit_len = (uint32_t)iter->it->cmd_type_bits[type_id];
     iter->next_off = next;
     return true;
 }
@@ -836,116 +858,219 @@ static inline void in_read_cmd_bits(ecs_deserializer_t* d,
     }
 }
 
-void ecs_input_serialize_tick(const ecs_input_t* it,
-                              ecs_serializer_t* s,
-                              uint32_t tick,
-                              uint32_t redundancy)
+/* Resolve cascade tick t' = tick - r for slot idx. Returns row pointer
+   if t' >= 1 and the ring slot holds t', else NULL. Sets *out_bytes
+   to the slot value at t' (zero baseline if missing or unset). */
+static const uint8_t* in_resolve_cascade_slot(const ecs_input_t* it,
+                                              uint32_t tick, uint32_t r,
+                                              uint32_t idx, uint32_t W,
+                                              uint32_t cap, uint32_t mask,
+                                              const uint8_t* zero_buf,
+                                              uint8_t** out_row)
+{
+    *out_row = NULL;
+    if (r > tick - 1u) return zero_buf;
+    uint32_t t_prime = tick - r;
+    uint32_t tp = t_prime & mask;
+    uint8_t* row_p = in_row_ptr(it, tp);
+    if (*in_row_tick(row_p) != t_prime) return zero_buf;
+    *out_row = row_p;
+    uint32_t w = idx >> 6;
+    uint64_t b = 1ull << (idx & 63u);
+    const uint64_t* pres_p = in_row_present(row_p);
+    if ((pres_p[w] & b) == 0ull) return zero_buf;
+    return in_row_payload(row_p, W, cap) + (size_t)idx * (size_t)it->stride;
+}
+
+/* True iff slot idx has any non-zero state across the cascade
+   [T, T-1, ..., T-R]: a present cell with non-zero value, or any
+   commands at any cascade tick. False -> slot encodes as a single
+   "0" gate bit. */
+static bool in_slot_has_any_data(const ecs_input_t* it, uint32_t idx,
+                                 uint32_t tick, uint32_t redundancy)
+{
+    uint32_t W      = it->words_per_row;
+    uint32_t cap    = it->active_cap;
+    uint32_t stride = it->stride;
+    uint32_t mask   = it->buf_mask;
+
+    if (idx >= cap) return false;
+
+    uint32_t w = idx >> 6;
+    uint64_t b = 1ull << (idx & 63u);
+
+    uint8_t zero_buf[256] = {0};
+
+    for (uint32_t r = 0; r <= redundancy; r++) {
+        if (r > tick - 1u) continue;
+        uint32_t t_prime = tick - r;
+        uint32_t tp = t_prime & mask;
+        uint8_t* row_p = in_row_ptr(it, tp);
+        if (*in_row_tick(row_p) != t_prime) continue;
+
+        const uint64_t* pres_p = in_row_present(row_p);
+        if (pres_p[w] & b) {
+            const uint8_t* payload = in_row_payload(row_p, W, cap)
+                                   + (size_t)idx * stride;
+            if (memcmp(payload, zero_buf, stride) != 0) return true;
+        }
+
+        uint32_t* heads = in_row_cmd_head(row_p, W);
+        if (heads[idx]) return true;
+    }
+    return false;
+}
+
+/* Compute exact bit cost of one slot's full encoded body (excluding
+   the leading any_data gate bit). Walks the same path as the writer. */
+static uint32_t in_slot_bit_cost(const ecs_input_t* it, uint32_t idx,
+                                 uint32_t tick, uint32_t redundancy)
+{
+    uint32_t W      = it->words_per_row;
+    uint32_t cap    = it->active_cap;
+    uint32_t stride = it->stride;
+    uint32_t mask   = it->buf_mask;
+
+    uint8_t zero_buf[256] = {0};
+    uint8_t prev_buf[256] = {0};
+    const uint8_t* prev = prev_buf;
+
+    uint32_t cost = 0;
+    for (uint32_t r = 0; r <= redundancy; r++) {
+        uint8_t* row_p = NULL;
+        const uint8_t* cur = in_resolve_cascade_slot(
+            it, tick, r, idx, W, cap, mask, zero_buf, &row_p);
+
+        cost += 1u; /* diff_prev */
+        if (memcmp(cur, prev, stride) != 0) {
+            cost += stride * 8u;
+            memcpy(prev_buf, cur, stride);
+            prev = prev_buf;
+        }
+
+        cost += 1u; /* has_cmds */
+        if (row_p) {
+            uint32_t* heads = in_row_cmd_head(row_p, W);
+            uint32_t off_plus = heads[idx];
+            if (off_plus) {
+                uint32_t tp = (tick - r) & mask;
+                const uint8_t* arena_buf = it->cmd_arenas[tp].buf;
+                while (off_plus) {
+                    uint32_t off = off_plus - 1u;
+                    uint32_t next, tid32;
+                    memcpy(&next,  arena_buf + off,     4);
+                    memcpy(&tid32, arena_buf + off + 4, 4);
+                    uint8_t type_id = (uint8_t)tid32;
+                    uint32_t bit_len = (uint32_t)it->cmd_type_bits[type_id];
+                    cost += ECS_INPUT_CMD_TYPE_BITS + bit_len + 1u;
+                    off_plus = next;
+                }
+            }
+        }
+    }
+    return cost;
+}
+
+int32_t ecs_input_serialize_tick(const ecs_input_t* it,
+                                 ecs_serializer_t* s,
+                                 uint32_t tick,
+                                 uint32_t redundancy,
+                                 uint32_t mtu_bytes)
 {
     assert(it);
     assert(s);
     assert(tick >= 1u);
+    assert(redundancy <= 0xFu);
+    assert(mtu_bytes > 0u);
 
-    /* Header. Caller is responsible for ensuring peer agrees on
-       active_cap and stride out-of-band. */
+    int32_t start_bits = ecs_serializer_get_bits_written(s);
+    int32_t mtu_bits   = (int32_t)(mtu_bytes * 8u);
+
+    /* Header: u32 tick + u4 R + u10 first_slot = 46 bits. */
     ecs_serializer_write_bits(s, tick, 32);
-    ecs_serializer_write_bits(s, (uint64_t)redundancy, 8);
+    ecs_serializer_write_bits(s, (uint64_t)redundancy, 4);
+    uint32_t first_slot = 0u;
+    assert(first_slot <= 0x3FFu);
+    ecs_serializer_write_bits(s, (uint64_t)first_slot, 10);
 
     uint32_t cap = it->active_cap;
-    if (cap == 0u) return;
+    if (cap == 0u) return -1;
 
     uint32_t W      = it->words_per_row;
     uint32_t stride = it->stride;
     uint32_t mask   = it->buf_mask;
 
-    /* Resolve current row. If the ring slot does not hold this tick
-       every slot is treated as zeros (matches baseline -> 1 bit each). */
-    uint32_t t_cur   = tick & mask;
-    uint8_t* row_cur = in_row_ptr(it, t_cur);
-    int cur_valid   = (*in_row_tick(row_cur) == tick);
-    const uint64_t* pres_cur = cur_valid ? in_row_present(row_cur)         : NULL;
-    const uint8_t*  pay_cur  = cur_valid ? in_row_payload(row_cur, W, cap) : NULL;
-
     uint8_t zero_buf[256] = {0};
+    uint8_t prev_buf[256];
     assert(stride <= sizeof(zero_buf));
 
-    for (uint32_t idx = 0; idx < cap; idx++) {
-        uint32_t w = idx >> 6;
-        uint64_t b = 1ull << (idx & 63u);
+    int32_t last_written = -1;
 
-        const uint8_t* cur_bytes = zero_buf;
-        if (cur_valid && (pres_cur[w] & b)) {
-            cur_bytes = pay_cur + (size_t)idx * stride;
-        }
+    for (uint32_t idx = first_slot; idx < cap; idx++) {
+        bool has_data = in_slot_has_any_data(it, idx, tick, redundancy);
 
-        /* Bit 0: differs from baseline (all zeros). */
-        int diff_baseline = (cur_bytes != zero_buf) &&
-                            (memcmp(cur_bytes, zero_buf, stride) != 0);
-        if (!diff_baseline) {
+        /* Total slot cost: 1 leading gate bit + (body if has_data). */
+        uint32_t total = 1u + (has_data ? in_slot_bit_cost(it, idx, tick, redundancy) : 0u);
+        int32_t used = ecs_serializer_get_bits_written(s) - start_bits;
+        if (used + (int32_t)total > mtu_bits) break;
+        if (ecs_serializer_get_bits_available(s) < (int32_t)total) break;
+
+        if (!has_data) {
             ecs_serializer_write_bits(s, 0u, 1);
+            last_written = (int32_t)idx;
             continue;
         }
         ecs_serializer_write_bits(s, 1u, 1);
 
-        /* Cascade: emit one bit per redundancy ref, stop on match.
-           Past-tick row resolved on demand; unresolved == zero baseline. */
-        int matched = 0;
-        for (uint32_t r = 0; r < redundancy; r++) {
-            const uint8_t* ref_bytes = zero_buf;
-            uint32_t off = r + 1u;
-            if (tick > off) {
-                uint32_t past   = tick - off;
-                uint32_t tp     = past & mask;
-                uint8_t* row_p  = in_row_ptr(it, tp);
-                if (*in_row_tick(row_p) == past) {
-                    const uint64_t* pres_p = in_row_present(row_p);
-                    if (pres_p[w] & b) {
-                        ref_bytes = in_row_payload(row_p, W, cap)
-                                  + (size_t)idx * stride;
-                    }
+        memset(prev_buf, 0, stride);
+        const uint8_t* prev = prev_buf;
+
+        for (uint32_t r = 0; r <= redundancy; r++) {
+            uint8_t* row_p = NULL;
+            const uint8_t* cur = in_resolve_cascade_slot(
+                it, tick, r, idx, W, cap, mask, zero_buf, &row_p);
+
+            int diff = memcmp(cur, prev, stride) != 0;
+            ecs_serializer_write_bits(s, diff ? 1u : 0u, 1);
+            if (diff) {
+                in_write_payload_bits(s, cur, stride);
+                memcpy(prev_buf, cur, stride);
+                prev = prev_buf;
+            }
+
+            int has_cmds = 0;
+            uint32_t head = 0;
+            if (row_p) {
+                uint32_t* heads = in_row_cmd_head(row_p, W);
+                head = heads[idx];
+                if (head) has_cmds = 1;
+            }
+            ecs_serializer_write_bits(s, has_cmds ? 1u : 0u, 1);
+
+            if (has_cmds) {
+                uint32_t tp = (tick - r) & mask;
+                const uint8_t* arena_buf = it->cmd_arenas[tp].buf;
+                uint32_t off_plus = head;
+                while (off_plus) {
+                    uint32_t off = off_plus - 1u;
+                    uint32_t next, tid32;
+                    memcpy(&next,  arena_buf + off,     4);
+                    memcpy(&tid32, arena_buf + off + 4, 4);
+                    uint8_t  type_id = (uint8_t)tid32;
+                    uint32_t bit_len = (uint32_t)it->cmd_type_bits[type_id];
+                    const uint8_t* p = arena_buf + off + 8;
+                    ecs_serializer_write_bits(s, (uint64_t)type_id, ECS_INPUT_CMD_TYPE_BITS);
+                    if (bit_len) in_write_cmd_bits(s, p, bit_len);
+                    ecs_serializer_write_bits(s, next ? 1u : 0u, 1);
+                    off_plus = next;
                 }
             }
-            int diff_ref = memcmp(cur_bytes, ref_bytes, stride) != 0;
-            ecs_serializer_write_bits(s, diff_ref ? 1u : 0u, 1);
-            if (!diff_ref) { matched = 1; break; }
         }
 
-        if (!matched) {
-            in_write_payload_bits(s, cur_bytes, stride);
-        }
+        last_written = (int32_t)idx;
     }
 
-    /* Commands. 1-bit gate: any commands at this tick? */
-    int any_cmds = 0;
-    if (cur_valid) {
-        const uint32_t* heads = in_row_cmd_head(row_cur, W);
-        for (uint32_t idx = 0; idx < cap; idx++) {
-            if (heads[idx]) { any_cmds = 1; break; }
-        }
-    }
-    ecs_serializer_write_bits(s, any_cmds ? 1u : 0u, 1);
-    if (!any_cmds) return;
-
-    const uint32_t* heads = in_row_cmd_head(row_cur, W);
-    const uint8_t*  arena_buf = it->cmd_arenas[t_cur].buf;
-    for (uint32_t idx = 0; idx < cap; idx++) {
-        uint32_t off_plus = heads[idx];
-        if (off_plus == 0u) {
-            ecs_serializer_write_bits(s, 0u, 1);
-            continue;
-        }
-        ecs_serializer_write_bits(s, 1u, 1);
-        while (off_plus) {
-            uint32_t off = off_plus - 1u;
-            uint32_t next, bit_len;
-            memcpy(&next,    arena_buf + off,     4);
-            memcpy(&bit_len, arena_buf + off + 4, 4);
-            const uint8_t* p = arena_buf + off + 8;
-            ecs_serializer_write_bits(s, bit_len, ECS_INPUT_CMD_BIT_LEN_BITS);
-            in_write_cmd_bits(s, p, bit_len);
-            ecs_serializer_write_bits(s, next ? 1u : 0u, 1);
-            off_plus = next;
-        }
-    }
+    return last_written;
 }
 
 void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d) {
@@ -953,92 +1078,94 @@ void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d) {
     assert(d);
 
     uint32_t tick       = (uint32_t)ecs_deserializer_read_bits(d, 32);
-    uint32_t redundancy = (uint32_t)ecs_deserializer_read_bits(d, 8);
+    uint32_t redundancy = (uint32_t)ecs_deserializer_read_bits(d, 4);
+    uint32_t first_slot = (uint32_t)ecs_deserializer_read_bits(d, 10);
     assert(tick >= 1u);
 
-    uint32_t cap = it->active_cap;
-    if (cap == 0u) return;
-
+    uint32_t cap    = it->active_cap;
     uint32_t W      = it->words_per_row;
     uint32_t stride = it->stride;
     uint32_t mask   = it->buf_mask;
 
-    uint8_t zero_buf[256] = {0};
-    assert(stride <= sizeof(zero_buf));
     uint8_t value_buf[256];
+    uint8_t prev_buf[256];
+    assert(stride <= sizeof(value_buf));
+    uint8_t cmd_buf[ECS_INPUT_CMD_MAX_BYTES];
 
-    for (uint32_t idx = 0; idx < cap; idx++) {
-        uint32_t w = idx >> 6;
-        uint64_t b = 1ull << (idx & 63u);
-        const uint8_t* value_bytes;
+    /* Decoder reads slots while bits remain. Each slot is preceded
+       by a 1-bit gate: 0 = empty slot (no body, advance idx), 1 =
+       body follows. Trailing zero-pad bits (when caller uses byte-
+       aligned init) parse as empty slots past active_cap and are
+       no-ops. */
+    uint32_t idx = first_slot;
 
-        /* Bit 0: differs from baseline? */
+    while (ecs_deserializer_get_bits_remaining(d) > 0) {
         if (ecs_deserializer_read_bits(d, 1) == 0ull) {
-            value_bytes = zero_buf;
-        } else {
-            int matched = 0;
-            for (uint32_t r = 0; r < redundancy; r++) {
-                if (ecs_deserializer_read_bits(d, 1) == 0ull) {
-                    /* Slot equals tick T-r in receiver's ring; resolve. */
-                    value_bytes = zero_buf;
-                    uint32_t off = r + 1u;
-                    if (tick > off) {
-                        uint32_t past = tick - off;
-                        uint32_t tp = past & mask;
-                        uint8_t* row_p = in_row_ptr(it, tp);
-                        if (*in_row_tick(row_p) == past) {
-                            const uint64_t* pres_p = in_row_present(row_p);
-                            if (pres_p[w] & b) {
-                                value_bytes = in_row_payload(row_p, W, cap)
-                                            + (size_t)idx * stride;
-                            }
-                        }
-                    }
-                    matched = 1;
-                    break;
+            idx++;
+            continue;
+        }
+
+        memset(prev_buf, 0, stride);
+        bool live_here = (idx < cap) && in_slot_live(it, idx);
+
+        for (uint32_t r = 0; r <= redundancy; r++) {
+            uint32_t t_prime = (r <= tick - 1u) ? (tick - r) : 0u;
+            int valid_tick = (t_prime != 0u);
+
+            const uint8_t* val;
+            if (ecs_deserializer_read_bits(d, 1) == 0ull) {
+                val = prev_buf; /* equals previously emitted */
+            } else {
+                in_read_payload_bits(d, value_buf, stride);
+                memcpy(prev_buf, value_buf, stride);
+                val = value_buf;
+            }
+
+            /* Snapshot per-slot cmd head BEFORE input apply: input apply
+               can first-touch the row, which resets heads. We need the
+               pre-apply head to detect "already received commands for
+               this (tick, slot) on a prior packet" -- the idempotency
+               signal. */
+            bool slot_had_cmds_before = false;
+            if (valid_tick) {
+                uint32_t tp = t_prime & mask;
+                uint8_t* row_p = in_row_ptr(it, tp);
+                if (*in_row_tick(row_p) == t_prime) {
+                    uint32_t* heads = in_row_cmd_head(row_p, W);
+                    if (idx < cap && heads[idx] != 0u) slot_had_cmds_before = true;
                 }
             }
-            if (!matched) {
-                /* All cascade bits 1: raw payload follows. */
-                in_read_payload_bits(d, value_buf, stride);
-                value_bytes = value_buf;
+
+            if (valid_tick && live_here) {
+                ecs_input_set(it, t_prime, idx, val, true);
+            }
+
+            uint64_t has_cmds = ecs_deserializer_read_bits(d, 1);
+
+            /* Per-(tick, slot) idempotency: if this slot already had
+               commands appended at this tick from a prior packet, skip
+               apply to avoid double-delivery. Wire still consumed. */
+            bool skip_cmd_apply = slot_had_cmds_before;
+
+            if (has_cmds) {
+                while (1) {
+                    uint8_t type_id = (uint8_t)ecs_deserializer_read_bits(
+                        d, ECS_INPUT_CMD_TYPE_BITS);
+                    uint32_t bit_len = (uint32_t)it->cmd_type_bits[type_id];
+                    /* type_id must be registered on receiver -- otherwise
+                       the decoder cannot know the payload size and the
+                       wire is unrecoverable. */
+                    assert(bit_len > 0u);
+                    if (bit_len) in_read_cmd_bits(d, cmd_buf, bit_len);
+                    if (valid_tick && live_here && !skip_cmd_apply) {
+                        ecs_input_cmd_append(it, t_prime, idx, type_id, cmd_buf);
+                    }
+                    if (ecs_deserializer_read_bits(d, 1) == 0ull) break;
+                }
             }
         }
 
-        /* Apply as confirmed. Skip slots whose live bit is clear. */
-        if (!in_slot_live(it, idx)) continue;
-        ecs_input_set(it, tick, idx, value_bytes, true);
-    }
-
-    /* Commands. */
-    if (ecs_deserializer_read_bits(d, 1) == 0ull) return;
-
-    /* Idempotent re-receive: assume every packet for the same tick
-       carries the same authoritative command set (server-authoritative
-       model). If we already have a populated cmd arena at this tick
-       row, treat the packet as a duplicate and walk the wire without
-       applying. State stays untouched -- no clear, no double-append. */
-    uint32_t t_cur = tick & mask;
-    uint8_t* row_cur = in_row_ptr(it, t_cur);
-    bool skip_apply = (*in_row_tick(row_cur) == tick) &&
-                      it->cmd_arenas &&
-                      it->cmd_arenas[t_cur].len > 0u;
-
-    uint8_t cmd_buf[ECS_INPUT_CMD_MAX_BYTES];
-    for (uint32_t idx = 0; idx < cap; idx++) {
-        if (ecs_deserializer_read_bits(d, 1) == 0ull) continue;
-        while (1) {
-            uint32_t bit_len = (uint32_t)ecs_deserializer_read_bits(
-                d, ECS_INPUT_CMD_BIT_LEN_BITS);
-            if (bit_len) {
-                in_read_cmd_bits(d, cmd_buf, bit_len);
-            }
-            if (!skip_apply) {
-                /* Live-bit skip mirrors input apply (bits already consumed). */
-                ecs_input_cmd_append(it, tick, idx, cmd_buf, bit_len);
-            }
-            if (ecs_deserializer_read_bits(d, 1) == 0ull) break;
-        }
+        idx++;
     }
 }
 

@@ -129,10 +129,12 @@
 /* Sentinel for "slot allocation failed / unknown slot". */
 #define ECS_INPUT_SLOT_NIL  0xFFFFFFFFu
 
-/* Bits used to encode each command's bit_len on the wire. 12 = max
-   4095-bit command (~511 B). Storage is byte-rounded; wire is exact. */
-#define ECS_INPUT_CMD_BIT_LEN_BITS 12u
-#define ECS_INPUT_CMD_MAX_BITS    ((1u << ECS_INPUT_CMD_BIT_LEN_BITS) - 1u)
+/* Bits used to encode each command's type id on the wire. 8 = 256
+   distinct registered command types (id 0 reserved as "unregistered").
+   Payload bit length per type is fetched from the per-input registry
+   on both peers; not encoded on the wire. */
+#define ECS_INPUT_CMD_TYPE_BITS   8u
+#define ECS_INPUT_CMD_MAX_BITS    4095u
 #define ECS_INPUT_CMD_MAX_BYTES   ((ECS_INPUT_CMD_MAX_BITS + 7u) / 8u)
 
 /* Per-ring-slot command arena. Bumped on append, reset (len=0, buf
@@ -181,6 +183,13 @@ typedef struct ecs_input_t {
        (sim starts at tick 1; tick 0 is reserved as the "no frontier"
        sentinel and is invalid as an actual tick id). */
     uint32_t  confirmed_frontier;
+
+    /* Command type registry: cmd_type_bits[id] = exact payload bit
+       length for commands with that type id. 0 = unregistered (not
+       a valid command type). Type id 0 is reserved as "unregistered"
+       sentinel. Both peers must register identical type ids before
+       exchanging packets. */
+    uint16_t  cmd_type_bits[256];
 } ecs_input_t;
 
 /* View returned by ecs_input_get_view -- caller can branch on flags
@@ -333,17 +342,35 @@ void ecs_input_grow_player_cap(ecs_input_t* it, uint32_t new_player_cap);
 
 /* --- Command stream ----------------------------------------------------- */
 
-/* Append a command of `bit_len` bits to (tick, slot). Storage is byte-
-   rounded (ceil(bit_len/8)); wire is exact bit_len.
+/* Register command type id `type_id` (1..255) with payload bit length
+   `bit_len`. Both peers must register identical mappings before
+   exchanging packets. Type id 0 is reserved as "unregistered". The
+   wire encodes only type_id + payload (no per-command bit_len), so the
+   decoder relies on this registry to know how many payload bits to
+   consume per command.
+
+   bit_len must be 1..ECS_INPUT_CMD_MAX_BITS (4095). Re-registering the
+   same id with a different bit_len is allowed (replaces) but should be
+   avoided after any cmd_append at that id. */
+void ecs_input_register_command_type(ecs_input_t* it, uint8_t type_id, uint32_t bit_len);
+
+/* Returns the registered bit_len for `type_id`, or 0 if unregistered. */
+uint32_t ecs_input_command_type_bit_len(const ecs_input_t* it, uint8_t type_id);
+
+/* Append a command of registered type `type_id` to (tick, slot).
+   Payload `bytes` must be at least ceil(bit_len/8) bytes (where
+   bit_len is from the registry for this type_id). Storage is byte-
+   rounded; wire emits exact bit_len bits.
 
    Authoritative-only: no predicted/confirmed flag. Caller responsible
    for invoking only on commands that the sim will replay deterministically.
-   No-op if slot is dead or tick <= confirmed_frontier (sealed). On
-   first-touch of `tick`, the row is reset (advance_row): cmd_head/tail
-   zeroed, arena.len = 0; arena.buf retained for reuse.
+   No-op if slot is dead, tick <= confirmed_frontier (sealed), or
+   type_id is unregistered. On first-touch of `tick`, the row is reset
+   (advance_row): cmd_head/tail zeroed, arena.len = 0; arena.buf
+   retained for reuse.
 
-   `bytes` may be NULL iff bit_len == 0. bit_len must be <=
-   ECS_INPUT_CMD_MAX_BITS (4095).
+   `bytes` may be NULL iff bit_len == 0. (bit_len = 0 means unregistered;
+   no-op.)
 
    Order is preserved across append: iter visits commands in the same
    order they were appended, even after serialize/deserialize round-trip
@@ -354,7 +381,7 @@ void ecs_input_grow_player_cap(ecs_input_t* it, uint32_t new_player_cap);
    only at the deserialize layer (duplicate packet receive). Callers
    must ensure cmd_append is invoked exactly once per logical command. */
 void ecs_input_cmd_append(ecs_input_t* it, uint32_t tick, uint32_t slot,
-                          const void* bytes, uint32_t bit_len);
+                          uint8_t type_id, const void* bytes);
 
 /* Forward iterator over commands at (tick, slot). Visits in append
    (FIFO) order. Empty if slot dead, tick not resident, or no commands.
@@ -369,77 +396,83 @@ typedef struct ecs_input_cmd_iter_t {
 ecs_input_cmd_iter_t ecs_input_cmd_iter_begin(const ecs_input_t* it,
                                               uint32_t tick, uint32_t slot);
 
-/* Advance iterator. Returns true and sets *out_bytes / *out_bit_len
-   on success; false on end-of-chain. */
+/* Advance iterator. Returns true and sets *out_type, *out_bytes, and
+   *out_bit_len on success; false on end-of-chain. bit_len is looked
+   up from the type registry at iter time. */
 bool ecs_input_cmd_iter_next(ecs_input_cmd_iter_t* iter,
+                             uint8_t* out_type,
                              const void** out_bytes,
                              uint32_t* out_bit_len);
 
 /* --- Serialization ------------------------------------------------------ */
 
-/* Serialize tick `tick` into `s` using cascading delta compression
-   against up to `redundancy` past ticks (T-1, T-2, ..., T-redundancy)
-   already held in the ring.
+/* Serialize tick `tick` into `s` plus a chained-delta cascade across
+   the R+1 ticks [T, T-1, ..., T-R] (newest first, R = redundancy).
+   Slot is the outer loop -- each slot's full per-tick block (input +
+   commands across the cascade) is emitted contiguously and atomically.
+   `mtu_bytes` caps the bytes the encoder may emit for this packet
+   (including the 46-bit header). If the next slot would not fit, the
+   encoder stops on a slot boundary -- no mid-slot truncation.
+
+   Returns the dense index of the LAST slot written, or -1 if no slot
+   fit (or active_cap == 0). Caller resumes coverage by calling again
+   with first_slot = (return + 1) on the next packet.
 
    Wire layout
    -----------
-     u32 tick                                (header)
-     u8  redundancy                          (header)
-     for each slot idx in [0, active_cap):
-       1 bit: differs from baseline (all zeros)?
-         0 -> slot value IS zeros, done.
-         1 -> for r in 1..redundancy:
-                1 bit: differs from tick T-r?
-                  0 -> slot value EQUALS tick T-r, done.
-                  1 -> continue to next r.
-              All redundancy+1 bits = 1 -> raw stride bytes (bit-packed).
-     1 bit: any commands this tick?
-       0 -> done.
-       1 -> for each slot idx in [0, active_cap):
-              1 bit: slot has commands?
-                0 -> done with this slot.
-                1 -> loop:
-                       12 bits: bit_len
-                       bit_len bits: payload (bit-packed)
-                       1 bit: more commands in this slot?
+     u32 tick T                              (header, newest in cascade)
+     u4  R                                   (header, redundancy count, 0..15)
+     u10 first_slot                          (header, dense slot to start at, 0..1023)
 
-   Past tick rows that are not currently resident in the ring are
-   treated as "all zeros" by the encoder; the decoder uses the same
-   rule, so caller need not coordinate visibility of past ticks beyond
-   maintaining a peer ring of the same size.
+     slot stream, starting at idx = first_slot, idx++ per slot.
+     No per-slot framing bit. Receiver knows the packet's exact bit
+     count out-of-band and inits the deserializer with that count;
+     the slot loop reads while bits_remaining > 0.
 
-   No slot id is emitted -- the wire is keyed by dense slot.
-   Caller must guarantee both peers share active_cap and stride at
-   decode time. Slots that are not live (live_bm bit clear) are
-   serialized as if their value were zeros (same single bit as baseline
-   match), so the wire size is independent of which columns are live.
+     slot body (per slot):
+       for each tick t' in [T, T-1, ..., T-R]:
+         1 bit  diff_prev
+                 t' = T          -> "value at T differs from baseline (all 0)?"
+                 t' < T          -> "value at t' differs from value at t'+1 (the
+                                     previously-emitted tick)?"
+           0 -> value equals previously-emitted (or baseline at t'=T).
+           1 -> raw stride bytes (bit-packed).
+         1 bit  has_cmds_at_t'
+           0 -> no commands at t'.
+           1 -> loop:
+                  12 bits  bit_len
+                  bit_len bits  payload (bit-packed)
+                  1 bit  more_in_slot_tick
 
-   Performance notes
-   -----------------
-   - O(active_cap * redundancy) memcmps. For typical strides (4-16 B)
-     each memcmp lowers to one or two integer compares.
-   - One small stack scratch (256 B max) for the zero baseline; stride
-     must fit. The redundancy refs table is `redundancy` pointer pairs
-     on stack.
+   Cascade ticks below 1 (when R >= T) collapse to all-zero baseline
+   on both peers. Past-tick rows not resident in the ring are treated
+   as zeros by both sides.
 
-   Precondition: tick >= 1.
-   The serializer must have room for the worst-case payload:
-     header + cap * (redundancy + 1) bits + cap * stride * 8 bits.
+   Dead slots emit as all-zero across the cascade (every diff_prev=0,
+   every has_cmds=0) so the wire is independent of which columns are
+   live within the emitted slot range.
+
+   Precondition: tick >= 1, redundancy <= 15, mtu_bytes > 0.
 */
-void ecs_input_serialize_tick(const ecs_input_t* it,
-                              ecs_serializer_t* s,
-                              uint32_t tick,
-                              uint32_t redundancy);
+int32_t ecs_input_serialize_tick(const ecs_input_t* it,
+                                 ecs_serializer_t* s,
+                                 uint32_t tick,
+                                 uint32_t redundancy,
+                                 uint32_t mtu_bytes);
 
-/* Inverse of ecs_input_serialize_tick. Reads the wire format from `d`
-   and applies every slot to `it` as a CONFIRMED write at the decoded
-   tick. Slots whose live bit is clear on the receiver are skipped on
-   apply -- their wire bits are still consumed.
+/* Inverse of ecs_input_serialize_tick. Reads the header + slot stream
+   from `d` and applies inputs as CONFIRMED writes plus commands as
+   appends, at every cascade tick the wire carries (T, T-1, ..., T-R).
+   Slots whose live bit is clear on the receiver have their wire bits
+   consumed but not applied.
 
-   Past-tick references for the cascade are resolved against the
-   receiver's own ring; any reference not currently resident is treated
-   as zeros (same rule as the encoder).
+   Idempotent on duplicate packets per cascade tick: if the receiver's
+   per-row arena already has length > 0 at a tick (from a prior
+   receive), the wire is consumed but commands are not re-appended.
+   Inputs are reapplied (ecs_input_set on identical bytes is a no-op
+   for confirmed values).
 
-   Caller must guarantee active_cap and stride match the sender at the
-   moment of encode. */
+   Caller must guarantee active_cap and stride match the sender at
+   the moment of encode. The deserializer's byte buffer length governs
+   end-of-packet (terminator bit + flush padding both read as 0). */
 void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d);

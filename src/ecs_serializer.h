@@ -258,6 +258,24 @@ ECS_SER_FORCE_INLINE void ecs_deserializer_init(ecs_deserializer_t* r, const voi
     r->word_index   = 0;
 }
 
+/* Bit-precise variant. Caller passes the exact number of bits in the
+   stream (typically `ecs_serializer_get_bits_written` from the sender).
+   The deserializer treats reads past `num_bits` as out-of-bounds, so
+   trailing byte-alignment pad is invisible to consumers that only
+   loop while `bits_remaining > 0`. */
+ECS_SER_FORCE_INLINE void ecs_deserializer_init_bits(ecs_deserializer_t* r, const void* data, int32_t num_bits) {
+    ecs_ser_assert(data);
+    ecs_ser_assert(num_bits >= 0);
+    r->data         = (const uint64_t*)data;
+    r->scratch      = 0;
+    r->num_bytes    = (num_bits + 7) / 8;
+    r->num_words    = (r->num_bytes + 7) / 8;
+    r->num_bits     = num_bits;
+    r->bits_read    = 0;
+    r->scratch_bits = 0;
+    r->word_index   = 0;
+}
+
 ECS_SER_FORCE_INLINE int ecs_deserializer_would_read_past_end(const ecs_deserializer_t* r, int32_t bits) {
     return r->bits_read + bits > r->num_bits;
 }
