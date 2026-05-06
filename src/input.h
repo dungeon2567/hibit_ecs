@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ecs_serializer.h"
+
 /* ==========================================================================
    ecs_input -- per-tick player input + command store.
 
@@ -287,3 +289,64 @@ void ecs_input_grow_buf(ecs_input_t* it, uint32_t new_buf_size);
    high-water-mark allocation; callers may grow preemptively before a
    known roster expansion. No-op if new_player_cap <= current. */
 void ecs_input_grow_player_cap(ecs_input_t* it, uint32_t new_player_cap);
+
+/* --- Serialization ------------------------------------------------------ */
+
+/* Serialize tick `tick` into `s` using cascading delta compression
+   against up to `redundancy` past ticks (T-1, T-2, ..., T-redundancy)
+   already held in the ring.
+
+   Wire layout
+   -----------
+     u64 tick                                (header)
+     u8  redundancy                          (header)
+     for each slot idx in [0, active_cap):
+       1 bit: differs from baseline (all zeros)?
+         0 -> slot value IS zeros, done.
+         1 -> for r in 1..redundancy:
+                1 bit: differs from tick T-r?
+                  0 -> slot value EQUALS tick T-r, done.
+                  1 -> continue to next r.
+              All redundancy+1 bits = 1 -> raw stride bytes (bit-packed).
+
+   Past tick rows that are not currently resident in the ring are
+   treated as "all zeros" by the encoder; the decoder uses the same
+   rule, so caller need not coordinate visibility of past ticks beyond
+   maintaining a peer ring of the same size.
+
+   No index per player is emitted -- the wire is keyed by dense slot.
+   Caller must guarantee both peers share active_cap and stride at
+   decode time. Slots that are unregistered (dense_ids[idx] == NIL) are
+   serialized as if their value were zeros (same single bit as baseline
+   match), so the wire size is independent of which columns are live.
+
+   Performance notes
+   -----------------
+   - O(active_cap * redundancy) memcmps. For typical strides (4-16 B)
+     each memcmp lowers to one or two integer compares.
+   - One small stack scratch (256 B max) for the zero baseline; stride
+     must fit. The redundancy refs table is `redundancy` pointer pairs
+     on stack.
+
+   Precondition: tick >= 1.
+   The serializer must have room for the worst-case payload:
+     header + cap * (redundancy + 1) bits + cap * stride * 8 bits.
+*/
+void ecs_input_serialize_tick(const ecs_input_t* it,
+                              ecs_serializer_t* s,
+                              uint64_t tick,
+                              uint32_t redundancy);
+
+/* Inverse of ecs_input_serialize_tick. Reads the wire format from `d`
+   and applies every slot to `it` as a CONFIRMED write at the decoded
+   tick. Slots whose dense column is currently unregistered
+   (dense_ids[idx] == NIL) are skipped on apply -- their wire bits are
+   still consumed.
+
+   Past-tick references for the cascade are resolved against the
+   receiver's own ring; any reference not currently resident is treated
+   as zeros (same rule as the encoder).
+
+   Caller must guarantee active_cap and stride match the sender at the
+   moment of encode. */
+void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d);

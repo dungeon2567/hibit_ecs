@@ -781,6 +781,162 @@ static void test_input_grow_combined_consistency(void) {
     ecs_input_destroy(&it);
 }
 
+/* --- serialize/deserialize round-trip --------------------------------- */
+
+static void test_input_serialize_roundtrip(void) {
+    /* Two peers. Mirror past ticks so cascade refs resolve identically
+       on both sides. */
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+
+    const uint32_t pids[4] = { 1, 2, 3, 4 };
+    for (int i = 0; i < 4; i++) {
+        ecs_input_register_player(&a, pids[i]);
+        ecs_input_register_player(&b, pids[i]);
+    }
+
+    ti_input_t v1 = ti_make(0xAA, 1, 1);
+    ti_input_t v2 = ti_make(0xBB, 2, 2);
+    ti_input_t v3 = ti_make(0xCC, 3, 3);
+    ti_input_t v4 = ti_make(0xDD, 4, 4);
+
+    /* Both peers know tick 10. */
+    for (int i = 0; i < 4; i++) {
+        ti_input_t* vs[4] = { &v1, &v2, &v3, &v4 };
+        ecs_input_set(&a, 10, pids[i], vs[i], true);
+        ecs_input_set(&b, 10, pids[i], vs[i], true);
+    }
+
+    /* Tick 11 on sender:
+         pid 1: same as tick 10  -> cascade match (1+1 bit)
+         pid 2: zero              -> baseline match (1 bit)
+         pid 3: new payload       -> all-1 bits + raw stride bytes
+         pid 4: same as tick 10   -> cascade match (1+1 bit). */
+    ti_input_t zero = ti_make(0, 0, 0);
+    ti_input_t v3b  = ti_make(0xCAFEu, -100, 200);
+    ecs_input_set(&a, 11, 1, &v1,  true);
+    ecs_input_set(&a, 11, 2, &zero,true);
+    ecs_input_set(&a, 11, 3, &v3b, true);
+    ecs_input_set(&a, 11, 4, &v4,  true);
+
+    uint64_t buf[64] = {0};
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 11, 1);
+    ecs_serializer_flush_bits(&s);
+    int32_t bits_written = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits_written > 0,                  "serializer wrote some bits");
+
+    ecs_deserializer_t d;
+    ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+
+    EXPECT(ti_eq(ti_get(&b, 11, 1), v1),      "pid 1: cascade-match round-trip");
+    EXPECT(ti_eq(ti_get(&b, 11, 2), zero),    "pid 2: baseline-match round-trip");
+    EXPECT(ti_eq(ti_get(&b, 11, 3), v3b),     "pid 3: raw-payload round-trip");
+    EXPECT(ti_eq(ti_get(&b, 11, 4), v4),      "pid 4: cascade-match round-trip");
+
+    /* Deserialized tick must be marked confirmed (per spec). */
+    for (int i = 0; i < 4; i++) {
+        ecs_input_view_t v = ecs_input_get_view(&b, 11, pids[i]);
+        EXPECT(v.present && v.confirmed,      "deserialized slot: present + confirmed");
+    }
+    EXPECT(ecs_input_tick_confirmed(&b, 11),  "tick fully confirmed after deserialize");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- serialize: redundancy=0 (just baseline vs raw) ------------------- */
+
+static void test_input_serialize_redundancy_zero(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_init(&b, sizeof(ti_input_t), 16);
+    ecs_input_register_player(&a, 1);
+    ecs_input_register_player(&b, 1);
+
+    ti_input_t v = ti_make(0xBEEFu, 7, 7);
+    ecs_input_set(&a, 5, 1, &v, true);
+
+    uint64_t buf[16] = {0};
+    ecs_serializer_t s;   ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 5, 0);
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d; ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+
+    EXPECT(ti_eq(ti_get(&b, 5, 1), v),        "redundancy=0: raw round-trip");
+    EXPECT(ecs_input_tick_confirmed(&b, 5),   "tick 5 confirmed on receiver");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- serialize: all-zero tick compresses to 1 bit per slot ------------ */
+
+static void test_input_serialize_all_zero_compact(void) {
+    ecs_input_t it;
+    ecs_input_init(&it, sizeof(ti_input_t), 16);
+    for (uint32_t i = 1; i <= 5; i++) ecs_input_register_player(&it, i);
+
+    ti_input_t z = ti_make(0, 0, 0);
+    for (uint32_t i = 1; i <= 5; i++) ecs_input_set(&it, 1, i, &z, true);
+
+    uint64_t buf[16] = {0};
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&it, &s, 1, 3);
+    ecs_serializer_flush_bits(&s);
+
+    int32_t bits = ecs_serializer_get_bits_written(&s);
+    /* Header: 64 (tick) + 8 (redundancy) = 72. Per slot: 1 bit baseline.
+       active_cap = 16 (init grow). Total = 72 + 16 = 88 bits. */
+    EXPECT(bits == 88,                        "all-zero tick: header(72) + cap(16) = 88 bits");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- serialize: NIL columns consume bits but don't apply -------------- */
+
+static void test_input_serialize_unregistered_skipped(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_init(&b, sizeof(ti_input_t), 16);
+
+    /* Register 3 pids on a, only 2 on b. Slot for pid 3 on b is NIL. */
+    ecs_input_register_player(&a, 1);
+    ecs_input_register_player(&a, 2);
+    ecs_input_register_player(&a, 3);
+    ecs_input_register_player(&b, 1);
+    ecs_input_register_player(&b, 2);
+
+    ti_input_t v1 = ti_make(0x11u, 1, 1);
+    ti_input_t v2 = ti_make(0x22u, 2, 2);
+    ti_input_t v3 = ti_make(0x33u, 3, 3);
+    ecs_input_set(&a, 1, 1, &v1, true);
+    ecs_input_set(&a, 1, 2, &v2, true);
+    ecs_input_set(&a, 1, 3, &v3, true);
+
+    uint64_t buf[16] = {0};
+    ecs_serializer_t s;   ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 1, 0);
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d; ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+
+    EXPECT(ti_eq(ti_get(&b, 1, 1), v1),       "pid 1 applied on receiver");
+    EXPECT(ti_eq(ti_get(&b, 1, 2), v2),       "pid 2 applied on receiver");
+    EXPECT(ecs_input_get(&b, 1, 3) == NULL,   "pid 3 not on receiver -- not registered");
+    /* Crucially: deserialize must not have crashed or written to a NIL column. */
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
 /* --- entry point ------------------------------------------------------- */
 
 static int test_input_all(void) {
@@ -809,6 +965,10 @@ static int test_input_all(void) {
     RUN_TEST(test_input_grow_player_cap_consistency);
     RUN_TEST(test_input_grow_buf_consistency);
     RUN_TEST(test_input_grow_combined_consistency);
+    RUN_TEST(test_input_serialize_roundtrip);
+    RUN_TEST(test_input_serialize_redundancy_zero);
+    RUN_TEST(test_input_serialize_all_zero_compact);
+    RUN_TEST(test_input_serialize_unregistered_skipped);
     int failed = g_failed - before;
     printf("\ninput: %d failed\n", failed);
     return failed ? 1 : 0;

@@ -496,6 +496,194 @@ bool ecs_input_is_registered(const ecs_input_t* it, ecs_pid_t pid) {
     return in_pid_lookup(it, pid) != ECS_INPUT_PID_NIL;
 }
 
+/* ==========================================================================
+   Serialization
+
+   Cascading delta compression. Per slot the encoder emits a unary
+   prefix selecting the matching reference (baseline = zeros, then
+   each of T-1 .. T-redundancy), followed by raw bit-packed bytes if
+   no reference matches.
+
+   Past ticks not currently resident in the ring are treated as the
+   zero baseline by both encoder and decoder, so the wire is the same
+   regardless of ring eviction state.
+   ========================================================================== */
+
+static inline void in_read_payload_bits(ecs_deserializer_t* d,
+                                        uint8_t* p, uint32_t stride) {
+    uint32_t left = stride;
+    while (left >= 8u) {
+        uint64_t v = ecs_deserializer_read_bits(d, 64);
+        memcpy(p, &v, 8);
+        p += 8;
+        left -= 8u;
+    }
+    if (left) {
+        uint64_t v = ecs_deserializer_read_bits(d, (int32_t)(left * 8u));
+        memcpy(p, &v, left);
+    }
+}
+
+static inline void in_write_payload_bits(ecs_serializer_t* s,
+                                         const uint8_t* p, uint32_t stride) {
+    uint32_t left = stride;
+    while (left >= 8u) {
+        uint64_t v;
+        memcpy(&v, p, 8);
+        ecs_serializer_write_bits(s, v, 64);
+        p += 8;
+        left -= 8u;
+    }
+    if (left) {
+        uint64_t v = 0;
+        memcpy(&v, p, left);
+        ecs_serializer_write_bits(s, v, (int32_t)(left * 8u));
+    }
+}
+
+void ecs_input_serialize_tick(const ecs_input_t* it,
+                              ecs_serializer_t* s,
+                              uint64_t tick,
+                              uint32_t redundancy)
+{
+    assert(it);
+    assert(s);
+    assert(tick >= 1ull);
+
+    /* Header. Caller is responsible for ensuring peer agrees on
+       active_cap and stride out-of-band. */
+    ecs_serializer_write_bits(s, tick, 64);
+    ecs_serializer_write_bits(s, (uint64_t)redundancy, 8);
+
+    uint32_t cap = it->active_cap;
+    if (cap == 0u) return;
+
+    uint32_t W      = it->words_per_row;
+    uint32_t stride = it->stride;
+    uint32_t mask   = it->buf_mask;
+
+    /* Resolve current row. If the ring slot does not hold this tick
+       every slot is treated as zeros (matches baseline -> 1 bit each). */
+    uint32_t t_cur   = (uint32_t)(tick & mask);
+    uint8_t* row_cur = in_row_ptr(it, t_cur);
+    int cur_valid   = (*in_row_tick(row_cur) == tick);
+    const uint64_t* pres_cur = cur_valid ? in_row_present(row_cur)    : NULL;
+    const uint8_t*  pay_cur  = cur_valid ? in_row_payload(row_cur, W) : NULL;
+
+    uint8_t zero_buf[256] = {0};
+    assert(stride <= sizeof(zero_buf));
+
+    for (uint32_t idx = 0; idx < cap; idx++) {
+        uint32_t w = idx >> 6;
+        uint64_t b = 1ull << (idx & 63u);
+
+        const uint8_t* cur_bytes = zero_buf;
+        if (cur_valid && (pres_cur[w] & b)) {
+            cur_bytes = pay_cur + (size_t)idx * stride;
+        }
+
+        /* Bit 0: differs from baseline (all zeros). */
+        int diff_baseline = (cur_bytes != zero_buf) &&
+                            (memcmp(cur_bytes, zero_buf, stride) != 0);
+        if (!diff_baseline) {
+            ecs_serializer_write_bits(s, 0u, 1);
+            continue;
+        }
+        ecs_serializer_write_bits(s, 1u, 1);
+
+        /* Cascade: emit one bit per redundancy ref, stop on match.
+           Past-tick row resolved on demand; unresolved == zero baseline. */
+        int matched = 0;
+        for (uint32_t r = 0; r < redundancy; r++) {
+            const uint8_t* ref_bytes = zero_buf;
+            uint64_t off = (uint64_t)(r + 1u);
+            if (tick > off) {
+                uint64_t past   = tick - off;
+                uint32_t tp     = (uint32_t)(past & mask);
+                uint8_t* row_p  = in_row_ptr(it, tp);
+                if (*in_row_tick(row_p) == past) {
+                    const uint64_t* pres_p = in_row_present(row_p);
+                    if (pres_p[w] & b) {
+                        ref_bytes = in_row_payload(row_p, W)
+                                  + (size_t)idx * stride;
+                    }
+                }
+            }
+            int diff_ref = memcmp(cur_bytes, ref_bytes, stride) != 0;
+            ecs_serializer_write_bits(s, diff_ref ? 1u : 0u, 1);
+            if (!diff_ref) { matched = 1; break; }
+        }
+
+        if (!matched) {
+            in_write_payload_bits(s, cur_bytes, stride);
+        }
+    }
+}
+
+void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d) {
+    assert(it);
+    assert(d);
+
+    uint64_t tick       = ecs_deserializer_read_bits(d, 64);
+    uint32_t redundancy = (uint32_t)ecs_deserializer_read_bits(d, 8);
+    assert(tick >= 1ull);
+
+    uint32_t cap = it->active_cap;
+    if (cap == 0u) return;
+
+    uint32_t W      = it->words_per_row;
+    uint32_t stride = it->stride;
+    uint32_t mask   = it->buf_mask;
+
+    uint8_t zero_buf[256] = {0};
+    assert(stride <= sizeof(zero_buf));
+    uint8_t value_buf[256];
+
+    for (uint32_t idx = 0; idx < cap; idx++) {
+        uint32_t w = idx >> 6;
+        uint64_t b = 1ull << (idx & 63u);
+        const uint8_t* value_bytes;
+
+        /* Bit 0: differs from baseline? */
+        if (ecs_deserializer_read_bits(d, 1) == 0ull) {
+            value_bytes = zero_buf;
+        } else {
+            int matched = 0;
+            for (uint32_t r = 0; r < redundancy; r++) {
+                if (ecs_deserializer_read_bits(d, 1) == 0ull) {
+                    /* Slot equals tick T-r in receiver's ring; resolve. */
+                    value_bytes = zero_buf;
+                    uint64_t off = (uint64_t)(r + 1u);
+                    if (tick > off) {
+                        uint64_t past = tick - off;
+                        uint32_t tp = (uint32_t)(past & mask);
+                        uint8_t* row_p = in_row_ptr(it, tp);
+                        if (*in_row_tick(row_p) == past) {
+                            const uint64_t* pres_p = in_row_present(row_p);
+                            if (pres_p[w] & b) {
+                                value_bytes = in_row_payload(row_p, W)
+                                            + (size_t)idx * stride;
+                            }
+                        }
+                    }
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) {
+                /* All cascade bits 1: raw payload follows. */
+                in_read_payload_bits(d, value_buf, stride);
+                value_bytes = value_buf;
+            }
+        }
+
+        /* Apply as confirmed. Skip slots without a registered pid. */
+        ecs_pid_t pid = it->dense_ids[idx];
+        if (pid == ECS_INPUT_PID_NIL) continue;
+        ecs_input_set(it, tick, pid, value_bytes, true);
+    }
+}
+
 bool ecs_input_iter_next(ecs_input_iter_t* iter) {
     assert(iter && iter->it);
     const ecs_input_t* it = iter->it;
