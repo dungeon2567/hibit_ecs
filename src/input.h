@@ -6,7 +6,7 @@
 #include "ecs_serializer.h"
 
 /* ==========================================================================
-   ecs_input -- per-tick player input + command store.
+   ecs_input -- per-tick player input + per-(tick,slot) command stream.
 
    Design summary
    --------------
@@ -16,6 +16,19 @@
                        freed by ecs_input_free_slot AND a subsequent alloc
                        picks the now-empty position.
      opaque payload  : caller defines stride at init; engine never inspects.
+     command stream  : zero-or-more variable-size opaque commands per
+                       (tick, slot). Authoritative-only -- no prediction
+                       carry-forward. Arena-bumped per ring slot, FIFO
+                       linked-list per dense slot. Reset on first-touch
+                       eviction. Serialized into the same tick packet
+                       (bit-packed) and applied verbatim on the receiver.
+                       Idempotent under duplicate-packet receive:
+                       deserialize_tick assumes every packet for a
+                       given tick is the same authoritative set, so on
+                       re-receive (cmd arena already populated for
+                       this tick) it walks the wire without applying.
+                       No clear, no double-append. FIFO order preserved
+                       across serialize/deserialize.
 
    Slot identity     : the engine only knows slots. Any external
                        identifier mapping lives outside this module.
@@ -116,17 +129,37 @@
 /* Sentinel for "slot allocation failed / unknown slot". */
 #define ECS_INPUT_SLOT_NIL  0xFFFFFFFFu
 
+/* Bits used to encode each command's bit_len on the wire. 12 = max
+   4095-bit command (~511 B). Storage is byte-rounded; wire is exact. */
+#define ECS_INPUT_CMD_BIT_LEN_BITS 12u
+#define ECS_INPUT_CMD_MAX_BITS    ((1u << ECS_INPUT_CMD_BIT_LEN_BITS) - 1u)
+#define ECS_INPUT_CMD_MAX_BYTES   ((ECS_INPUT_CMD_MAX_BITS + 7u) / 8u)
+
+/* Per-ring-slot command arena. Bumped on append, reset (len=0, buf
+   retained) on first-touch row eviction. cap grows pow2 on demand. */
+typedef struct ecs_input_cmd_arena_t {
+    uint8_t* buf;
+    uint32_t len;
+    uint32_t cap;
+} ecs_input_cmd_arena_t;
+
 typedef struct ecs_input_t {
     /* Single packed table. One row per ring slot, layout:
          u32 tick_in_slot   (+ 4 bytes pad to keep bitmaps 8-byte aligned)
          u64 present[words_per_row]
          u64 confirmed[words_per_row]
+         u32 cmd_head[active_cap]   (offset+1 into cmd_arenas[t].buf, 0=empty)
+         u32 cmd_tail[active_cap]   (offset+1 of FIFO tail node, 0=empty)
          u8  payload[active_cap * stride]
-       row_bytes = 8 + 2*words_per_row*8 + active_cap*stride (rounded
-       up to 8). Single contiguous allocation; per-slot ops touch one
-       row = warm cache. Both dimensions grow pow2 on demand. */
+       row_bytes = 8 + 2*W*8 + 2*A*4 + A*S (rounded up to 8). Single
+       contiguous allocation; per-slot ops touch one row = warm cache.
+       Both dimensions grow pow2 on demand. */
     uint8_t*  table;
     uint32_t  row_bytes;     /* bytes per row, cached */
+
+    /* Parallel array, length = buf_size. Per ring slot bump arena
+       holding command nodes { u32 next_off, u32 bit_len, bytes }. */
+    ecs_input_cmd_arena_t* cmd_arenas;
 
     /* live_bm[w] bit b set <=> slot (w*64+b) is currently registered.
        Length = words_per_row u64 words. alloc_slot finds the first 0
@@ -298,6 +331,50 @@ void ecs_input_grow_buf(ecs_input_t* it, uint32_t new_buf_size);
    known roster expansion. No-op if new_player_cap <= current. */
 void ecs_input_grow_player_cap(ecs_input_t* it, uint32_t new_player_cap);
 
+/* --- Command stream ----------------------------------------------------- */
+
+/* Append a command of `bit_len` bits to (tick, slot). Storage is byte-
+   rounded (ceil(bit_len/8)); wire is exact bit_len.
+
+   Authoritative-only: no predicted/confirmed flag. Caller responsible
+   for invoking only on commands that the sim will replay deterministically.
+   No-op if slot is dead or tick <= confirmed_frontier (sealed). On
+   first-touch of `tick`, the row is reset (advance_row): cmd_head/tail
+   zeroed, arena.len = 0; arena.buf retained for reuse.
+
+   `bytes` may be NULL iff bit_len == 0. bit_len must be <=
+   ECS_INPUT_CMD_MAX_BITS (4095).
+
+   Order is preserved across append: iter visits commands in the same
+   order they were appended, even after serialize/deserialize round-trip
+   (FIFO).
+
+   NOTE: append is NOT idempotent on its own. Calling with the same
+   bytes twice yields two separate commands. Idempotency is provided
+   only at the deserialize layer (duplicate packet receive). Callers
+   must ensure cmd_append is invoked exactly once per logical command. */
+void ecs_input_cmd_append(ecs_input_t* it, uint32_t tick, uint32_t slot,
+                          const void* bytes, uint32_t bit_len);
+
+/* Forward iterator over commands at (tick, slot). Visits in append
+   (FIFO) order. Empty if slot dead, tick not resident, or no commands.
+   `out_bytes` points into the per-row arena; valid until the next
+   first-touch eviction of that ring slot. */
+typedef struct ecs_input_cmd_iter_t {
+    const ecs_input_t* it;
+    const uint8_t*     arena;     /* per-row arena base, NULL if empty */
+    uint32_t           next_off;  /* offset+1 into arena, 0 = end */
+} ecs_input_cmd_iter_t;
+
+ecs_input_cmd_iter_t ecs_input_cmd_iter_begin(const ecs_input_t* it,
+                                              uint32_t tick, uint32_t slot);
+
+/* Advance iterator. Returns true and sets *out_bytes / *out_bit_len
+   on success; false on end-of-chain. */
+bool ecs_input_cmd_iter_next(ecs_input_cmd_iter_t* iter,
+                             const void** out_bytes,
+                             uint32_t* out_bit_len);
+
 /* --- Serialization ------------------------------------------------------ */
 
 /* Serialize tick `tick` into `s` using cascading delta compression
@@ -316,6 +393,15 @@ void ecs_input_grow_player_cap(ecs_input_t* it, uint32_t new_player_cap);
                   0 -> slot value EQUALS tick T-r, done.
                   1 -> continue to next r.
               All redundancy+1 bits = 1 -> raw stride bytes (bit-packed).
+     1 bit: any commands this tick?
+       0 -> done.
+       1 -> for each slot idx in [0, active_cap):
+              1 bit: slot has commands?
+                0 -> done with this slot.
+                1 -> loop:
+                       12 bits: bit_len
+                       bit_len bits: payload (bit-packed)
+                       1 bit: more commands in this slot?
 
    Past tick rows that are not currently resident in the ring are
    treated as "all zeros" by the encoder; the decoder uses the same

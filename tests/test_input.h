@@ -967,8 +967,9 @@ static void test_input_serialize_all_zero_compact(void) {
 
     int32_t bits = ecs_serializer_get_bits_written(&s);
     /* Header: 32 (tick) + 8 (redundancy) = 40. Per slot: 1 bit baseline.
-       active_cap = 16 (init grow). Total = 40 + 16 = 56 bits. */
-    EXPECT(bits == 56,                        "all-zero tick: header(40) + cap(16) = 56 bits");
+       active_cap = 16 (init grow). +1 bit cmd "any?" gate (0 = none).
+       Total = 40 + 16 + 1 = 57 bits. */
+    EXPECT(bits == 57,                        "all-zero tick: header(40) + cap(16) + cmd-gate(1) = 57 bits");
 
     ecs_input_destroy(&it);
 }
@@ -1048,7 +1049,7 @@ static void test_input_serialize_redundancy_eight(void) {
 
     /* (A) Unique payload at tick 10: no cascade match -> 9 cascade
            bits (8 ones + signal-end one) + 64 raw payload bits.
-       40 header + 15 dead + 9 cascade + 64 raw = 128 bits. */
+       40 header + 15 dead + 9 cascade + 64 raw + 1 cmd-gate = 129 bits. */
     ti_input_t unique = ti_make(0xDEADBEEFu, 999, -999);
     ecs_input_set(&a, 10, sa, &unique, true);
 
@@ -1057,14 +1058,14 @@ static void test_input_serialize_redundancy_eight(void) {
     ecs_input_serialize_tick(&a, &s, 10, 8);
     ecs_serializer_flush_bits(&s);
     bits = ecs_serializer_get_bits_written(&s);
-    EXPECT(bits == 128,                       "redundancy=8 unique slot: 128 bits");
+    EXPECT(bits == 129,                       "redundancy=8 unique slot: 129 bits (incl cmd-gate)");
 
     ecs_deserializer_init(&d, buf, sizeof(buf));
     ecs_input_deserialize_tick(&b, &d);
     EXPECT(ti_eq(ti_get(&b, 10, sb), unique), "redundancy=8 unique: round-trip");
 
     /* (B) Tick 11 == tick 10 -> matches T-1: 2 cascade bits (1, 0).
-       40 + 15 + 2 = 57 bits. */
+       40 + 15 + 2 + 1 cmd-gate = 58 bits. */
     ecs_input_set(&a, 11, sa, &unique, true);
 
     memset(buf, 0, sizeof(buf));
@@ -1072,14 +1073,14 @@ static void test_input_serialize_redundancy_eight(void) {
     ecs_input_serialize_tick(&a, &s, 11, 8);
     ecs_serializer_flush_bits(&s);
     bits = ecs_serializer_get_bits_written(&s);
-    EXPECT(bits == 57,                        "redundancy=8 T-1 match: 57 bits");
+    EXPECT(bits == 58,                        "redundancy=8 T-1 match: 58 bits (incl cmd-gate)");
 
     ecs_deserializer_init(&d, buf, sizeof(buf));
     ecs_input_deserialize_tick(&b, &d);
     EXPECT(ti_eq(ti_get(&b, 11, sb), unique), "redundancy=8 T-1 match: round-trip");
 
     /* (C) Tick 12 == tick 4 -> matches T-8 (deepest cascade): 9
-           cascade bits (8 ones + ending zero). 40 + 15 + 9 = 64 bits. */
+           cascade bits (8 ones + ending zero). 40 + 15 + 9 + 1 = 65. */
     ecs_input_set(&a, 12, sa, &vs[4], true);
 
     memset(buf, 0, sizeof(buf));
@@ -1087,15 +1088,14 @@ static void test_input_serialize_redundancy_eight(void) {
     ecs_input_serialize_tick(&a, &s, 12, 8);
     ecs_serializer_flush_bits(&s);
     bits = ecs_serializer_get_bits_written(&s);
-    EXPECT(bits == 64,                        "redundancy=8 T-8 match: 64 bits");
+    EXPECT(bits == 65,                        "redundancy=8 T-8 match: 65 bits (incl cmd-gate)");
 
     ecs_deserializer_init(&d, buf, sizeof(buf));
     ecs_input_deserialize_tick(&b, &d);
     EXPECT(ti_eq(ti_get(&b, 12, sb), vs[4]),  "redundancy=8 T-8 match: round-trip");
 
     /* (D) Tick 13 == zero -> baseline match: 1 cascade bit.
-       40 + 16 = 56 bits (slot 0 collapses to a single baseline bit
-       just like the dead slots). */
+       40 + 16 + 1 cmd-gate = 57 bits. */
     ti_input_t zero = ti_make(0, 0, 0);
     ecs_input_set(&a, 13, sa, &zero, true);
 
@@ -1104,7 +1104,7 @@ static void test_input_serialize_redundancy_eight(void) {
     ecs_input_serialize_tick(&a, &s, 13, 8);
     ecs_serializer_flush_bits(&s);
     bits = ecs_serializer_get_bits_written(&s);
-    EXPECT(bits == 56,                        "redundancy=8 baseline match: 56 bits");
+    EXPECT(bits == 57,                        "redundancy=8 baseline match: 57 bits (incl cmd-gate)");
 
     ecs_deserializer_init(&d, buf, sizeof(buf));
     ecs_input_deserialize_tick(&b, &d);
@@ -1118,6 +1118,445 @@ static void test_input_serialize_redundancy_eight(void) {
 
     ecs_input_destroy(&a);
     ecs_input_destroy(&b);
+}
+
+/* --- command stream: basic append + iter FIFO ------------------------- */
+
+static void test_input_cmd_basic_fifo(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    /* Empty: iter returns false. */
+    ecs_input_cmd_iter_t iter0 = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p0 = NULL; uint32_t bl0 = 0;
+    EXPECT(!ecs_input_cmd_iter_next(&iter0, &p0, &bl0),
+                                            "empty (no row resident): iter exhausted");
+
+    /* Append three commands of distinct sizes. */
+    uint32_t v0 = 0xDEADBEEFu;            /* 32 bits */
+    uint64_t v1 = 0x0123456789ABCDEFull;  /* 64 bits */
+    uint8_t  v2[3] = { 0xAB, 0xCD, 0x12 };/* 24 bits */
+    ecs_input_cmd_append(&it, 1, s, &v0, 32);
+    ecs_input_cmd_append(&it, 1, s, &v1, 64);
+    ecs_input_cmd_append(&it, 1, s, v2, 24);
+
+    /* FIFO: visit in append order. */
+    ecs_input_cmd_iter_t iter = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p = NULL; uint32_t bl = 0;
+
+    EXPECT(ecs_input_cmd_iter_next(&iter, &p, &bl), "iter[0] yields");
+    EXPECT(bl == 32u, "iter[0]: bit_len 32");
+    EXPECT(p && memcmp(p, &v0, 4) == 0, "iter[0]: bytes match v0");
+
+    EXPECT(ecs_input_cmd_iter_next(&iter, &p, &bl), "iter[1] yields");
+    EXPECT(bl == 64u, "iter[1]: bit_len 64");
+    EXPECT(p && memcmp(p, &v1, 8) == 0, "iter[1]: bytes match v1");
+
+    EXPECT(ecs_input_cmd_iter_next(&iter, &p, &bl), "iter[2] yields");
+    EXPECT(bl == 24u, "iter[2]: bit_len 24");
+    EXPECT(p && memcmp(p, v2, 3) == 0, "iter[2]: bytes match v2");
+
+    EXPECT(!ecs_input_cmd_iter_next(&iter, &p, &bl), "iter exhausted after 3");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: per-slot independence ----------------------------- */
+
+static void test_input_cmd_multi_slot_fifo(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s0 = ecs_input_alloc_slot(&it);
+    uint32_t s1 = ecs_input_alloc_slot(&it);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+
+    /* Interleaved appends across slots; each slot must keep its own
+       FIFO order. */
+    uint32_t a[2] = { 0x1111u, 0x2222u };  /* slot 0 */
+    uint32_t b[3] = { 0xAAAAu, 0xBBBBu, 0xCCCCu };  /* slot 1 */
+    /* slot 2: no commands */
+
+    ecs_input_cmd_append(&it, 7, s1, &b[0], 16);
+    ecs_input_cmd_append(&it, 7, s0, &a[0], 16);
+    ecs_input_cmd_append(&it, 7, s1, &b[1], 16);
+    ecs_input_cmd_append(&it, 7, s0, &a[1], 16);
+    ecs_input_cmd_append(&it, 7, s1, &b[2], 16);
+
+    /* slot 0 FIFO: a[0], a[1]. */
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&it, 7, s0);
+    const void* p; uint32_t bl;
+    EXPECT(ecs_input_cmd_iter_next(&i0, &p, &bl) && bl == 16u && memcmp(p, &a[0], 2) == 0,
+                                            "s0 iter[0] = a[0]");
+    EXPECT(ecs_input_cmd_iter_next(&i0, &p, &bl) && bl == 16u && memcmp(p, &a[1], 2) == 0,
+                                            "s0 iter[1] = a[1]");
+    EXPECT(!ecs_input_cmd_iter_next(&i0, &p, &bl), "s0 exhausted");
+
+    /* slot 1 FIFO: b[0], b[1], b[2]. */
+    ecs_input_cmd_iter_t i1 = ecs_input_cmd_iter_begin(&it, 7, s1);
+    EXPECT(ecs_input_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &b[0], 2) == 0,
+                                            "s1 iter[0] = b[0]");
+    EXPECT(ecs_input_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &b[1], 2) == 0,
+                                            "s1 iter[1] = b[1]");
+    EXPECT(ecs_input_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &b[2], 2) == 0,
+                                            "s1 iter[2] = b[2]");
+    EXPECT(!ecs_input_cmd_iter_next(&i1, &p, &bl), "s1 exhausted");
+
+    /* slot 2 empty. */
+    ecs_input_cmd_iter_t i2 = ecs_input_cmd_iter_begin(&it, 7, s2);
+    EXPECT(!ecs_input_cmd_iter_next(&i2, &p, &bl), "s2 empty (no commands)");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: ring wrap evicts commands ------------------------- */
+
+static void test_input_cmd_first_touch_reset(void) {
+    const uint32_t BUF = 8;
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), BUF);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v_old = 0x11111111u;
+    uint32_t v_new = 0x22222222u;
+
+    /* tick 1 commands. */
+    ecs_input_cmd_append(&it, 1, s, &v_old, 32);
+    ecs_input_cmd_append(&it, 1, s, &v_old, 32);
+    ecs_input_advance_to_tick(&it, 1);
+
+    /* tick 9 aliases tick 1's ring slot. tick 1 <= frontier so evictable. */
+    ecs_input_cmd_append(&it, BUF + 1u, s, &v_new, 32);
+
+    /* Old tick 1 commands gone (row evicted). */
+    ecs_input_cmd_iter_t it_old = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p; uint32_t bl;
+    EXPECT(!ecs_input_cmd_iter_next(&it_old, &p, &bl),
+                                            "ring-wrap: tick 1 commands evicted");
+
+    /* New tick 9: only the one fresh command. */
+    ecs_input_cmd_iter_t it_new = ecs_input_cmd_iter_begin(&it, BUF + 1u, s);
+    EXPECT(ecs_input_cmd_iter_next(&it_new, &p, &bl) && bl == 32u && memcmp(p, &v_new, 4) == 0,
+                                            "ring-wrap: tick 9 fresh command");
+    EXPECT(!ecs_input_cmd_iter_next(&it_new, &p, &bl),
+                                            "ring-wrap: tick 9 has only one cmd");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: sealed-tick append is no-op ----------------------- */
+
+static void test_input_cmd_sealed_drop(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ecs_input_advance_to_tick(&it, 5);
+    uint32_t v = 0xCAFEu;
+    ecs_input_cmd_append(&it, 5, s, &v, 16);
+    ecs_input_cmd_append(&it, 3, s, &v, 16);
+    ecs_input_cmd_append(&it, 6, s, &v, 16);
+
+    ecs_input_cmd_iter_t i5 = ecs_input_cmd_iter_begin(&it, 5, s);
+    const void* p; uint32_t bl;
+    EXPECT(!ecs_input_cmd_iter_next(&i5, &p, &bl),
+                                            "sealed tick 5: append dropped");
+    ecs_input_cmd_iter_t i3 = ecs_input_cmd_iter_begin(&it, 3, s);
+    EXPECT(!ecs_input_cmd_iter_next(&i3, &p, &bl),
+                                            "below-frontier tick 3: append dropped");
+    ecs_input_cmd_iter_t i6 = ecs_input_cmd_iter_begin(&it, 6, s);
+    EXPECT(ecs_input_cmd_iter_next(&i6, &p, &bl) && bl == 16u,
+                                            "above-frontier tick 6: append kept");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: dead slot append is no-op ------------------------- */
+
+static void test_input_cmd_dead_slot_drop(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t v = 0xAAu;
+
+    /* Slot never allocated. */
+    ecs_input_cmd_append(&it, 1, 0, &v, 8);
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 1, 0);
+    const void* p; uint32_t bl;
+    EXPECT(!ecs_input_cmd_iter_next(&i, &p, &bl), "dead slot: append dropped");
+
+    /* Allocate, free, append -> dropped. */
+    uint32_t s = ecs_input_alloc_slot(&it);
+    ecs_input_free_slot(&it, s);
+    ecs_input_cmd_append(&it, 1, s, &v, 8);
+    ecs_input_cmd_iter_t i2 = ecs_input_cmd_iter_begin(&it, 1, s);
+    EXPECT(!ecs_input_cmd_iter_next(&i2, &p, &bl), "freed slot: append dropped");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: alloc/free ABA scrubs commands -------------------- */
+
+static void test_input_cmd_alloc_aba(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v = 0x1234u;
+    ecs_input_cmd_append(&it, 1, s, &v, 16);
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p; uint32_t bl;
+    EXPECT(ecs_input_cmd_iter_next(&i0, &p, &bl), "first owner: command visible");
+
+    ecs_input_free_slot(&it, s);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+    EXPECT(s2 == s, "alloc reuses slot");
+
+    /* New owner must NOT see prior owner's commands. */
+    ecs_input_cmd_iter_t i1 = ecs_input_cmd_iter_begin(&it, 1, s2);
+    EXPECT(!ecs_input_cmd_iter_next(&i1, &p, &bl),
+                                            "ABA defense: new owner has no commands at tick 1");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: serialize/deserialize FIFO order ------------------ */
+
+static void test_input_cmd_serialize_order_roundtrip(void) {
+    /* Two peers, slot-aligned. Sender appends a known sequence at tick T;
+       deserialize on receiver and verify EXACT iter order match. */
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+
+    uint32_t sa[3], sb[3];
+    for (int i = 0; i < 3; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+        EXPECT(sa[i] == sb[i], "slot align");
+    }
+
+    /* Distinct payloads per command, distinct sizes per slot. */
+    /* slot 0: 4 commands at 8/13/20/64 bits.
+       slot 1: 0 commands (sparse path).
+       slot 2: 2 commands at 32/32 bits. */
+    uint8_t  s0_c0[1]  = { 0xA5 };
+    uint8_t  s0_c1[2]  = { 0x12, 0x1F };  /* 13 bits: only low 13 used = 0x1F12 & 0x1FFF */
+    uint8_t  s0_c2[3]  = { 0xDE, 0xAD, 0x0B }; /* 20 bits */
+    uint8_t  s0_c3[8]  = { 1, 2, 3, 4, 5, 6, 7, 8 }; /* 64 bits */
+    uint32_t s2_c0     = 0xCAFEBABEu;
+    uint32_t s2_c1     = 0xFEEDF00Du;
+
+    ecs_input_cmd_append(&a, 11, sa[0], s0_c0, 8);
+    ecs_input_cmd_append(&a, 11, sa[2], &s2_c0, 32);
+    ecs_input_cmd_append(&a, 11, sa[0], s0_c1, 13);
+    ecs_input_cmd_append(&a, 11, sa[0], s0_c2, 20);
+    ecs_input_cmd_append(&a, 11, sa[2], &s2_c1, 32);
+    ecs_input_cmd_append(&a, 11, sa[0], s0_c3, 64);
+
+    /* Capture sender iter order. */
+    typedef struct { uint32_t bit_len; uint8_t bytes[16]; } ti_cmd_snap;
+    ti_cmd_snap snap[3][8];
+    int snap_n[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        ecs_input_cmd_iter_t it = ecs_input_cmd_iter_begin(&a, 11, sa[i]);
+        const void* p; uint32_t bl;
+        while (ecs_input_cmd_iter_next(&it, &p, &bl)) {
+            snap[i][snap_n[i]].bit_len = bl;
+            uint32_t bytes = (bl + 7u) >> 3;
+            memset(snap[i][snap_n[i]].bytes, 0, sizeof(snap[i][snap_n[i]].bytes));
+            if (bytes) memcpy(snap[i][snap_n[i]].bytes, p, bytes);
+            snap_n[i]++;
+        }
+    }
+    EXPECT(snap_n[0] == 4, "sender slot 0 has 4 commands");
+    EXPECT(snap_n[1] == 0, "sender slot 1 has 0 commands");
+    EXPECT(snap_n[2] == 2, "sender slot 2 has 2 commands");
+
+    /* Round-trip via serialize. */
+    uint64_t buf[256] = {0};
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 11, 0);
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d;
+    ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+
+    /* Verify receiver iter order matches sender exactly. */
+    for (int i = 0; i < 3; i++) {
+        ecs_input_cmd_iter_t it = ecs_input_cmd_iter_begin(&b, 11, sb[i]);
+        const void* p; uint32_t bl;
+        int k = 0;
+        while (ecs_input_cmd_iter_next(&it, &p, &bl)) {
+            EXPECT(k < snap_n[i], "receiver does not over-deliver");
+            EXPECT(bl == snap[i][k].bit_len, "receiver bit_len matches sender");
+            uint32_t bytes = (bl + 7u) >> 3;
+            int byte_match = (bytes == 0) || (memcmp(p, snap[i][k].bytes, bytes) == 0);
+            EXPECT(byte_match, "receiver bytes match sender (in order)");
+            k++;
+        }
+        EXPECT(k == snap_n[i], "receiver yields exactly sender count");
+    }
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: deserialize skips dead slot ----------------------- */
+
+static void test_input_cmd_deserialize_dead_skip(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_init(&b, sizeof(ti_input_t), 16);
+
+    uint32_t sa0 = ecs_input_alloc_slot(&a);
+    uint32_t sa1 = ecs_input_alloc_slot(&a);
+    uint32_t sb0 = ecs_input_alloc_slot(&b);
+    /* b has only slot 0 live. Sender's slot 1 must be skipped. */
+    EXPECT(sa0 == sb0 && sa1 == 1u, "alignment");
+    EXPECT(!ecs_input_slot_is_live(&b, 1), "receiver slot 1 dead");
+
+    uint32_t v0 = 0xAAu;
+    uint32_t v1 = 0xBBu;
+    ecs_input_cmd_append(&a, 5, sa0, &v0, 8);
+    ecs_input_cmd_append(&a, 5, sa1, &v1, 8);
+
+    uint64_t buf[64] = {0};
+    ecs_serializer_t s; ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 5, 0);
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d; ecs_deserializer_init(&d, buf, sizeof(buf));
+    ecs_input_deserialize_tick(&b, &d);
+
+    /* slot 0 received. */
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&b, 5, sb0);
+    const void* p; uint32_t bl;
+    EXPECT(ecs_input_cmd_iter_next(&i0, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0xAAu,
+                                            "receiver slot 0: command applied");
+    EXPECT(!ecs_input_cmd_iter_next(&i0, &p, &bl), "slot 0 single command");
+
+    /* slot 1 dropped silently. No iter call; just no observable state. */
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: deserialize is idempotent on duplicate packets --- */
+
+static void test_input_cmd_deserialize_idempotent(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+
+    uint32_t sa[2], sb[2];
+    for (int i = 0; i < 2; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+    }
+
+    uint32_t v0 = 0x11223344u;
+    uint32_t v1 = 0xAABBCCDDu;
+    uint16_t v2 = 0x55AAu;
+    ecs_input_cmd_append(&a, 7, sa[0], &v0, 32);
+    ecs_input_cmd_append(&a, 7, sa[0], &v1, 32);
+    ecs_input_cmd_append(&a, 7, sa[1], &v2, 16);
+
+    uint64_t buf[64] = {0};
+    ecs_serializer_t s; ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 7, 0);
+    ecs_serializer_flush_bits(&s);
+
+    /* Apply the SAME packet 3 times. */
+    for (int n = 0; n < 3; n++) {
+        ecs_deserializer_t d; ecs_deserializer_init(&d, buf, sizeof(buf));
+        ecs_input_deserialize_tick(&b, &d);
+    }
+
+    /* Receiver state must equal sender's: 2 commands on slot 0, 1 on slot 1,
+       in append order. NOT 6/3/etc. */
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&b, 7, sb[0]);
+    const void* p; uint32_t bl;
+    EXPECT(ecs_input_cmd_iter_next(&i0, &p, &bl) && bl == 32u && memcmp(p, &v0, 4) == 0,
+                                            "idempotent: slot 0 cmd[0] = v0 (not duplicated)");
+    EXPECT(ecs_input_cmd_iter_next(&i0, &p, &bl) && bl == 32u && memcmp(p, &v1, 4) == 0,
+                                            "idempotent: slot 0 cmd[1] = v1");
+    EXPECT(!ecs_input_cmd_iter_next(&i0, &p, &bl),
+                                            "idempotent: slot 0 has exactly 2 cmds after 3 receives");
+
+    ecs_input_cmd_iter_t i1 = ecs_input_cmd_iter_begin(&b, 7, sb[1]);
+    EXPECT(ecs_input_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &v2, 2) == 0,
+                                            "idempotent: slot 1 cmd[0] = v2");
+    EXPECT(!ecs_input_cmd_iter_next(&i1, &p, &bl),
+                                            "idempotent: slot 1 has exactly 1 cmd after 3 receives");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: clear evicts ------------------------------------- */
+
+static void test_input_cmd_clear_resets(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v = 0x77u;
+    ecs_input_cmd_append(&it, 3, s, &v, 8);
+    ecs_input_cmd_append(&it, 3, s, &v, 8);
+
+    ecs_input_clear(&it, 3);
+
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 3, s);
+    const void* p; uint32_t bl;
+    EXPECT(!ecs_input_cmd_iter_next(&i, &p, &bl), "clear: tick commands gone");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: grow_buf preserves resident commands -------------- */
+
+static void test_input_cmd_grow_buf_preserves(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v[3] = { 0x11u, 0x22u, 0x33u };
+    ecs_input_cmd_append(&it, 5, s, &v[0], 8);
+    ecs_input_cmd_append(&it, 5, s, &v[1], 8);
+    ecs_input_cmd_append(&it, 5, s, &v[2], 8);
+
+    ecs_input_grow_buf(&it, 64);
+    EXPECT(it.buf_size == 64u, "ring grew");
+
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 5, s);
+    const void* p; uint32_t bl;
+    EXPECT(ecs_input_cmd_iter_next(&i, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0x11u,
+                                            "post-grow: cmd[0]");
+    EXPECT(ecs_input_cmd_iter_next(&i, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0x22u,
+                                            "post-grow: cmd[1]");
+    EXPECT(ecs_input_cmd_iter_next(&i, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0x33u,
+                                            "post-grow: cmd[2]");
+    EXPECT(!ecs_input_cmd_iter_next(&i, &p, &bl), "post-grow: exhausted");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: grow_player_cap preserves ------------------------- */
+
+static void test_input_cmd_grow_player_cap_preserves(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+    uint32_t s0 = ecs_input_alloc_slot(&it);
+
+    uint32_t v[2] = { 0xABu, 0xCDu };
+    ecs_input_cmd_append(&it, 2, s0, &v[0], 8);
+    ecs_input_cmd_append(&it, 2, s0, &v[1], 8);
+
+    ecs_input_grow_player_cap(&it, 64);
+    EXPECT(it.active_cap == 64u, "active_cap grew");
+
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 2, s0);
+    const void* p; uint32_t bl;
+    EXPECT(ecs_input_cmd_iter_next(&i, &p, &bl) && *(const uint8_t*)p == 0xABu,
+                                            "post-cap-grow: cmd[0]");
+    EXPECT(ecs_input_cmd_iter_next(&i, &p, &bl) && *(const uint8_t*)p == 0xCDu,
+                                            "post-cap-grow: cmd[1]");
+    EXPECT(!ecs_input_cmd_iter_next(&i, &p, &bl), "post-cap-grow: exhausted");
+
+    ecs_input_destroy(&it);
 }
 
 /* --- entry point ------------------------------------------------------- */
@@ -1154,6 +1593,18 @@ static int test_input_all(void) {
     RUN_TEST(test_input_serialize_all_zero_compact);
     RUN_TEST(test_input_serialize_unregistered_skipped);
     RUN_TEST(test_input_serialize_redundancy_eight);
+    RUN_TEST(test_input_cmd_basic_fifo);
+    RUN_TEST(test_input_cmd_multi_slot_fifo);
+    RUN_TEST(test_input_cmd_first_touch_reset);
+    RUN_TEST(test_input_cmd_sealed_drop);
+    RUN_TEST(test_input_cmd_dead_slot_drop);
+    RUN_TEST(test_input_cmd_alloc_aba);
+    RUN_TEST(test_input_cmd_serialize_order_roundtrip);
+    RUN_TEST(test_input_cmd_deserialize_dead_skip);
+    RUN_TEST(test_input_cmd_deserialize_idempotent);
+    RUN_TEST(test_input_cmd_clear_resets);
+    RUN_TEST(test_input_cmd_grow_buf_preserves);
+    RUN_TEST(test_input_cmd_grow_player_cap_preserves);
     int failed = g_failed - before;
     printf("\ninput: %d failed\n", failed);
     return failed ? 1 : 0;
