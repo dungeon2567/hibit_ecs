@@ -470,6 +470,9 @@ void ecs_input_clear(ecs_input_t* it, uint64_t tick) {
 }
 
 bool ecs_input_tick_confirmed(const ecs_input_t* it, uint64_t tick) {
+    /* Anything sim has already sealed is authoritative by definition --
+       even if its ring slot has since been evicted by a newer write. */
+    if (tick != 0ull && tick <= it->confirmed_frontier) return true;
     if (it->active_count == 0u) return true;
     uint32_t t = (uint32_t)(tick & it->buf_mask);
     uint8_t* row = in_row_ptr(it, t);

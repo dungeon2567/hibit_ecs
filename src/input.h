@@ -254,7 +254,10 @@ void ecs_input_clear(ecs_input_t* it, uint64_t tick);
 /* True iff every currently-registered player has a confirmed bit set
    for `tick`. Computed on demand from the row's confirmed bitmap and
    the live dense_ids[] mask -- no cached counts. Returns true when
-   active_count == 0 (vacuous). */
+   active_count == 0 (vacuous). Also returns true for any tick in
+   [1, confirmed_frontier]: sim has sealed those, so they are
+   authoritative regardless of whether their ring slot is still
+   resident. */
 bool ecs_input_tick_confirmed(const ecs_input_t* it, uint64_t tick);
 
 /* Current sim-driven frontier. Returns 0 if no tick has ever been

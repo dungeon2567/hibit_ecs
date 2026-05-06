@@ -177,6 +177,43 @@ static void test_input_frontier_sim_driven(void) {
     ecs_input_destroy(&it);
 }
 
+/* --- past-frontier ticks are vacuously confirmed ----------------------- */
+
+static void test_input_past_frontier_confirmed(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+    ecs_input_register_player(&it, 1);
+    ecs_input_register_player(&it, 2);
+
+    /* Tick 5 partial-confirmed (only pid 1). Without frontier advance,
+       tick_confirmed must report false. */
+    ti_input_t v = ti_make(0xAA, 1, 1);
+    ecs_input_set(&it, 5, 1, &v, true);
+    EXPECT(!ecs_input_tick_confirmed(&it, 5),    "partial tick: not confirmed pre-frontier");
+
+    /* Sim seals tick 10. Now ticks 1..10 must report confirmed even
+       though pid 2 was never written and bitmaps disagree. */
+    ecs_input_advance_to_tick(&it, 10);
+    EXPECT(ecs_input_tick_confirmed(&it, 5),     "tick 5 <= frontier: confirmed by seal");
+    EXPECT(ecs_input_tick_confirmed(&it, 10),    "tick 10 == frontier: confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 1),     "tick 1 <= frontier: confirmed even if never written");
+    EXPECT(!ecs_input_tick_confirmed(&it, 11),   "tick 11 > frontier: still gated by bitmap");
+
+    /* Evicted slot: write tick 100 -> aliases slot of tick 100 % 8 = 4.
+       Old occupants of any slot whose stored tick <= frontier are evictable.
+       After this write, tick 5 may or may not still be resident depending
+       on slot, but tick_confirmed(5) must still return true since 5 <= frontier. */
+    ti_input_t w = ti_make(0xBB, 2, 2);
+    ecs_input_set(&it, 100, 1, &w, true);
+    ecs_input_set(&it, 100, 2, &w, true);
+    EXPECT(ecs_input_tick_confirmed(&it, 5),     "evicted past-frontier tick still reports confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 3),     "never-written past-frontier tick reports confirmed");
+
+    /* Tick 0 is the "no frontier" sentinel and must NOT be claimed confirmed. */
+    EXPECT(!ecs_input_tick_confirmed(&it, 0),    "tick 0 sentinel: not confirmed");
+
+    ecs_input_destroy(&it);
+}
+
 /* --- partial confirm reports tick as not-confirmed --------------------- */
 
 static void test_input_partial_no_advance(void) {
@@ -216,7 +253,12 @@ static void test_input_ring_wrap(void) {
                                               "wrap: new tick bytes visible");
     EXPECT(ecs_input_tick_confirmed(&it, BUF + 1u),
                                               "wrap: new tick confirmed");
-    EXPECT(!ecs_input_tick_confirmed(&it, 1), "wrap: old tick no longer confirmed at slot");
+    /* Old tick row was evicted but tick 1 <= frontier, so it is sealed
+       and tick_confirmed reports true (sim authority overrides bitmap). */
+    EXPECT(ecs_input_tick_confirmed(&it, 1),  "wrap: evicted past-frontier tick still confirmed by seal");
+    /* Data eviction is unchanged: ti_get returns NULL because the slot
+       no longer holds tick 1. */
+    EXPECT(ecs_input_get(&it, 1, 1) == NULL,  "wrap: evicted tick no longer resident in its slot");
 
     ecs_input_destroy(&it);
 }
@@ -473,6 +515,48 @@ static void test_input_auto_grow_burst(void) {
     EXPECT(ecs_input_frontier(&it) == 600ull,
                                               "sim advanced frontier to 600");
 
+    /* All 600 ticks must report confirmed and yield the confirm-pass bytes
+       (NOT the earlier predicted bytes). */
+    bool all_conf = true;
+    bool all_bytes = true;
+    bool no_pred_leak = true;
+    for (uint64_t t = 1; t <= 600; t++) {
+        if (!ecs_input_tick_confirmed(&it, t)) { all_conf = false; break; }
+        ti_input_t expect_v = ti_make((uint32_t)t, (int16_t)t, 0);
+        ti_input_t got = ti_get(&it, t, 1);
+        if (!ti_eq(got, expect_v))      { all_bytes = false; break; }
+        if (ti_eq(got, pred_v[t-1]))    { no_pred_leak = false; break; }
+    }
+    EXPECT(all_conf,                          "every tick 1..600 reports confirmed");
+    EXPECT(all_bytes,                         "every tick 1..600 returns confirm-pass bytes");
+    EXPECT(no_pred_leak,                      "predicted bytes overwritten by confirm pass");
+
+    /* view flags consistent on a spot-check tick. */
+    ecs_input_view_t mid = ecs_input_get_view(&it, 300, 1);
+    EXPECT(mid.present && mid.confirmed,      "mid-burst view: present + confirmed");
+    EXPECT(mid.data != NULL,                  "mid-burst view: data ptr non-null");
+
+    /* Frontier must be untouched by all the prior set() calls. */
+    EXPECT(ecs_input_frontier(&it) == 600ull, "frontier still 600 (set never moves it)");
+
+    /* Past-frontier write into a slot whose old tick is now <= frontier
+       must succeed without further ring growth. tick 601 aliases slot of
+       tick (601 % buf_size); old occupant is evictable. */
+    uint32_t buf_before = it.buf_size;
+    ti_input_t fresh = ti_make(0xFEEDF00Du, 1234, -1234);
+    ecs_input_set(&it, 700, 1, &fresh, true);
+    EXPECT(it.buf_size == buf_before,         "no extra grow when victim slot <= frontier");
+    EXPECT(ti_eq(ti_get(&it, 700, 1), fresh), "tick 700 confirmed bytes visible");
+    EXPECT(ecs_input_tick_confirmed(&it, 700),"tick 700 reports confirmed");
+
+    /* Old tick whose ring slot was just stolen is no longer the row's
+       resident -- ti_get returns NULL because tick_in_slot != requested. */
+    uint64_t evicted = 700ull - (uint64_t)it.buf_size;
+    if (evicted >= 1ull && evicted <= 600ull) {
+        EXPECT(ecs_input_get(&it, evicted, 1) == NULL,
+                                              "evicted tick no longer resident in its slot");
+    }
+
     ecs_input_destroy(&it);
 }
 
@@ -708,6 +792,7 @@ static int test_input_all(void) {
     RUN_TEST(test_input_set_overwrite);
     RUN_TEST(test_input_multi_packet_split);
     RUN_TEST(test_input_frontier_sim_driven);
+    RUN_TEST(test_input_past_frontier_confirmed);
     RUN_TEST(test_input_partial_no_advance);
     RUN_TEST(test_input_ring_wrap);
     RUN_TEST(test_input_clear);

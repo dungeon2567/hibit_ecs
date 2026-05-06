@@ -1,11 +1,10 @@
 #include "broadphase.h"
 
 #include <assert.h>
-#include <mimalloc.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+
+#include "ecs.h"   /* ecs_xmalloc_aligned, ecs_xrealloc_aligned, ecs_free */
 
 #if defined(__BMI2__)
 #include <immintrin.h>
@@ -108,43 +107,35 @@ void broadphase_init(broadphase_t* bp, size_t item_cap) {
     size_t pad_cap = (item_cap + 7u) & ~(size_t)7u;
     size_t axis_bytes = pad_cap * sizeof(fixed_t);
 
-    bp->item_ids   = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->objects    = (broadphase_object_t*)mi_malloc_aligned(pad_cap * sizeof(broadphase_object_t), BP_NODE_ALIGN);
-    bp->item_min_x = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
-    bp->item_min_y = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
-    bp->item_min_z = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
-    bp->item_max_x = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
-    bp->item_max_y = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
-    bp->item_max_z = (fixed_t*) mi_malloc_aligned(axis_bytes, BP_NODE_ALIGN);
-    bp->morton     = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->perm       = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->perm_alt   = (uint32_t*)mi_malloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->nodes      = (broadphase_node_t*)mi_malloc_aligned(
+    bp->item_ids   = (uint32_t*)ecs_xmalloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->objects    = (broadphase_object_t*)ecs_xmalloc_aligned(pad_cap * sizeof(broadphase_object_t), BP_NODE_ALIGN);
+    bp->item_min_x = (fixed_t*) ecs_xmalloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_min_y = (fixed_t*) ecs_xmalloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_min_z = (fixed_t*) ecs_xmalloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_max_x = (fixed_t*) ecs_xmalloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_max_y = (fixed_t*) ecs_xmalloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->item_max_z = (fixed_t*) ecs_xmalloc_aligned(axis_bytes, BP_NODE_ALIGN);
+    bp->morton     = (uint32_t*)ecs_xmalloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->perm       = (uint32_t*)ecs_xmalloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->perm_alt   = (uint32_t*)ecs_xmalloc_aligned(pad_cap * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->nodes      = (broadphase_node_t*)ecs_xmalloc_aligned(
                          node_cap * sizeof(broadphase_node_t), BP_NODE_ALIGN);
-
-    if (!bp->item_ids   || !bp->objects    || !bp->item_min_x || !bp->item_min_y || !bp->item_min_z ||
-        !bp->item_max_x || !bp->item_max_y || !bp->item_max_z ||
-        !bp->morton     || !bp->perm       || !bp->perm_alt   || !bp->nodes) {
-        fprintf(stderr, "broadphase: OOM (item_cap=%zu node_cap=%zu)\n",
-                item_cap, node_cap);
-        abort();
-    }
 }
 
 void broadphase_destroy(broadphase_t* bp) {
     assert(bp);
-    if (bp->item_ids)   mi_free(bp->item_ids);
-    if (bp->objects)    mi_free(bp->objects);
-    if (bp->item_min_x) mi_free(bp->item_min_x);
-    if (bp->item_min_y) mi_free(bp->item_min_y);
-    if (bp->item_min_z) mi_free(bp->item_min_z);
-    if (bp->item_max_x) mi_free(bp->item_max_x);
-    if (bp->item_max_y) mi_free(bp->item_max_y);
-    if (bp->item_max_z) mi_free(bp->item_max_z);
-    if (bp->morton)     mi_free(bp->morton);
-    if (bp->perm)       mi_free(bp->perm);
-    if (bp->perm_alt)   mi_free(bp->perm_alt);
-    if (bp->nodes)      mi_free(bp->nodes);
+    if (bp->item_ids)   ecs_free(bp->item_ids);
+    if (bp->objects)    ecs_free(bp->objects);
+    if (bp->item_min_x) ecs_free(bp->item_min_x);
+    if (bp->item_min_y) ecs_free(bp->item_min_y);
+    if (bp->item_min_z) ecs_free(bp->item_min_z);
+    if (bp->item_max_x) ecs_free(bp->item_max_x);
+    if (bp->item_max_y) ecs_free(bp->item_max_y);
+    if (bp->item_max_z) ecs_free(bp->item_max_z);
+    if (bp->morton)     ecs_free(bp->morton);
+    if (bp->perm)       ecs_free(bp->perm);
+    if (bp->perm_alt)   ecs_free(bp->perm_alt);
+    if (bp->nodes)      ecs_free(bp->nodes);
     bp->item_ids = bp->morton = bp->perm = bp->perm_alt = NULL;
     bp->item_min_x = bp->item_min_y = bp->item_min_z = NULL;
     bp->item_max_x = bp->item_max_y = bp->item_max_z = NULL;
@@ -170,27 +161,19 @@ static void bp_grow(broadphase_t* bp) {
     size_t new_axis     = new_pad * sizeof(fixed_t);
     size_t new_node_cap = new_cap / 7 + 8;
 
-    bp->item_ids   = (uint32_t*)mi_realloc_aligned(bp->item_ids,   new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->objects    = (broadphase_object_t*)mi_realloc_aligned(bp->objects, new_pad * sizeof(broadphase_object_t), BP_NODE_ALIGN);
-    bp->item_min_x = (fixed_t*) mi_realloc_aligned(bp->item_min_x, new_axis,                   BP_NODE_ALIGN);
-    bp->item_min_y = (fixed_t*) mi_realloc_aligned(bp->item_min_y, new_axis,                   BP_NODE_ALIGN);
-    bp->item_min_z = (fixed_t*) mi_realloc_aligned(bp->item_min_z, new_axis,                   BP_NODE_ALIGN);
-    bp->item_max_x = (fixed_t*) mi_realloc_aligned(bp->item_max_x, new_axis,                   BP_NODE_ALIGN);
-    bp->item_max_y = (fixed_t*) mi_realloc_aligned(bp->item_max_y, new_axis,                   BP_NODE_ALIGN);
-    bp->item_max_z = (fixed_t*) mi_realloc_aligned(bp->item_max_z, new_axis,                   BP_NODE_ALIGN);
-    bp->morton     = (uint32_t*)mi_realloc_aligned(bp->morton,     new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->perm       = (uint32_t*)mi_realloc_aligned(bp->perm,       new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->perm_alt   = (uint32_t*)mi_realloc_aligned(bp->perm_alt,   new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
-    bp->nodes      = (broadphase_node_t*)mi_realloc_aligned(
+    bp->item_ids   = (uint32_t*)ecs_xrealloc_aligned(bp->item_ids,   new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->objects    = (broadphase_object_t*)ecs_xrealloc_aligned(bp->objects, new_pad * sizeof(broadphase_object_t), BP_NODE_ALIGN);
+    bp->item_min_x = (fixed_t*) ecs_xrealloc_aligned(bp->item_min_x, new_axis,                   BP_NODE_ALIGN);
+    bp->item_min_y = (fixed_t*) ecs_xrealloc_aligned(bp->item_min_y, new_axis,                   BP_NODE_ALIGN);
+    bp->item_min_z = (fixed_t*) ecs_xrealloc_aligned(bp->item_min_z, new_axis,                   BP_NODE_ALIGN);
+    bp->item_max_x = (fixed_t*) ecs_xrealloc_aligned(bp->item_max_x, new_axis,                   BP_NODE_ALIGN);
+    bp->item_max_y = (fixed_t*) ecs_xrealloc_aligned(bp->item_max_y, new_axis,                   BP_NODE_ALIGN);
+    bp->item_max_z = (fixed_t*) ecs_xrealloc_aligned(bp->item_max_z, new_axis,                   BP_NODE_ALIGN);
+    bp->morton     = (uint32_t*)ecs_xrealloc_aligned(bp->morton,     new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->perm       = (uint32_t*)ecs_xrealloc_aligned(bp->perm,       new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->perm_alt   = (uint32_t*)ecs_xrealloc_aligned(bp->perm_alt,   new_pad * sizeof(uint32_t), BP_NODE_ALIGN);
+    bp->nodes      = (broadphase_node_t*)ecs_xrealloc_aligned(
                          bp->nodes, new_node_cap * sizeof(broadphase_node_t), BP_NODE_ALIGN);
-
-    if (!bp->item_ids   || !bp->objects    || !bp->item_min_x || !bp->item_min_y || !bp->item_min_z ||
-        !bp->item_max_x || !bp->item_max_y || !bp->item_max_z ||
-        !bp->morton     || !bp->perm       || !bp->perm_alt   || !bp->nodes) {
-        fprintf(stderr, "broadphase: OOM grow (new_item_cap=%zu node_cap=%zu)\n",
-                new_cap, new_node_cap);
-        abort();
-    }
 
     bp->item_cap   = (uint32_t)new_cap;
     bp->object_cap = (uint32_t)new_cap;
