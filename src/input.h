@@ -98,8 +98,8 @@
 
 /* Hard cap on buf_size for auto-grow. Beyond this the caller must take
    the snapshot/resync path -- a tick lateness larger than this exceeds
-   any reasonable rollback budget. 65536 ticks ~= 18 minutes @ 60fps. */
-#define ECS_INPUT_BUFSIZE_MAX 65536u
+   any reasonable rollback budget. 2048 ticks ~= 34 seconds @ 60fps. */
+#define ECS_INPUT_BUFSIZE_MAX 2048u
 
 /* Initial player capacity allocated on first register. Grows pow2. */
 #define ECS_INPUT_PLAYER_CAP_INIT 16u

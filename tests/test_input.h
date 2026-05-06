@@ -495,6 +495,208 @@ static void test_input_grow_buf_preemptive(void) {
     ecs_input_destroy(&it);
 }
 
+/* --- grow consistency: active_cap (player dimension) ------------------ */
+
+static void test_input_grow_player_cap_consistency(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+
+    const uint32_t pids[5] = { 7, 13, 100, 256, 999 };
+    for (int i = 0; i < 5; i++) ecs_input_register_player(&it, pids[i]);
+
+    EXPECT(it.active_cap == 16u, "initial cap is ECS_INPUT_PLAYER_CAP_INIT (16)");
+
+    /* Populate ticks 1..4 with mixed predicted/confirmed. Tick 3 is
+       intentionally partial so tick_confirmed must report false. */
+    ti_input_t snap_data[4][5];
+    bool snap_present[4][5];
+    bool snap_confirmed[4][5];
+    bool snap_tick_conf[4];
+
+    for (uint64_t t = 1; t <= 4; t++) {
+        bool all_conf = true;
+        for (int i = 0; i < 5; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 100u + i),
+                                   (int16_t)(t + i), (int16_t)(t * i));
+            bool conf = !(t == 3 && i >= 3);
+            ecs_input_set(&it, t, pids[i], &v, conf);
+            snap_data[t-1][i]      = v;
+            snap_present[t-1][i]   = true;
+            snap_confirmed[t-1][i] = conf;
+            if (!conf) all_conf = false;
+        }
+        snap_tick_conf[t-1] = all_conf;
+    }
+
+    /* Sanity on snapshot itself before any grow. */
+    for (uint64_t t = 1; t <= 4; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "snapshot: tick_confirmed matches expected");
+    }
+
+    /* Grow active_cap: triggers row-width realloc + per-row remap. */
+    ecs_input_grow_player_cap(&it, 64);
+    EXPECT(it.active_cap == 64u,                  "active_cap grown to 64");
+
+    for (uint64_t t = 1; t <= 4; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across active_cap grow");
+        for (int i = 0; i < 5; i++) {
+            ecs_input_view_t v = ecs_input_get_view(&it, t, pids[i]);
+            EXPECT(v.present   == snap_present[t-1][i],
+                                                  "view.present preserved across active_cap grow");
+            EXPECT(v.confirmed == snap_confirmed[t-1][i],
+                                                  "view.confirmed preserved across active_cap grow");
+            EXPECT(ti_eq(ti_get(&it, t, pids[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across active_cap grow");
+        }
+    }
+
+    /* Second grow: re-runs the same remap with already-grown layout. */
+    ecs_input_grow_player_cap(&it, 256);
+    EXPECT(it.active_cap == 256u,                 "active_cap grown to 256");
+    for (uint64_t t = 1; t <= 4; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across second grow");
+        for (int i = 0; i < 5; i++) {
+            EXPECT(ti_eq(ti_get(&it, t, pids[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across second grow");
+        }
+    }
+
+    /* Register a new pid post-grow; must not disturb prior state. */
+    EXPECT(ecs_input_register_player(&it, 12345), "register new pid after grow");
+    ti_input_t fresh = ti_make(0xFEED, 5, 5);
+    ecs_input_set(&it, 5, 12345, &fresh, true);
+    EXPECT(ti_eq(ti_get(&it, 5, 12345), fresh),   "new-pid bytes visible after register-post-grow");
+    for (int i = 0; i < 5; i++) {
+        EXPECT(ti_eq(ti_get(&it, 1, pids[i]), snap_data[0][i]),
+                                                  "old-pid data intact after new-pid register");
+    }
+
+    ecs_input_destroy(&it);
+}
+
+/* --- grow consistency: buf_size (ring dimension) ----------------------- */
+
+static void test_input_grow_buf_consistency(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+
+    const uint32_t pids[3] = { 1, 2, 3 };
+    for (int i = 0; i < 3; i++) ecs_input_register_player(&it, pids[i]);
+
+    /* Fill entire ring (ticks 1..8). Frontier stays at 0 so every slot
+       counts as "live" — auto-grow on first-touch must NOT be triggered
+       inside this loop because we only write within the existing ring. */
+    ti_input_t snap_data[8][3];
+    bool snap_present[8][3];
+    bool snap_confirmed[8][3];
+    bool snap_tick_conf[8];
+
+    for (uint64_t t = 1; t <= 8; t++) {
+        bool all_conf = true;
+        for (int i = 0; i < 3; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 11u + i),
+                                   (int16_t)(t * 2), (int16_t)(i + 1));
+            bool conf = !(t == 5 && i == 2);   /* tick 5 partial-confirmed */
+            ecs_input_set(&it, t, pids[i], &v, conf);
+            snap_data[t-1][i]      = v;
+            snap_present[t-1][i]   = true;
+            snap_confirmed[t-1][i] = conf;
+            if (!conf) all_conf = false;
+        }
+        snap_tick_conf[t-1] = all_conf;
+    }
+
+    EXPECT(it.buf_size == 8u,                     "ring at original size before grow");
+
+    /* Grow buf_size: triggers row-count realloc + per-row remap under wider mask. */
+    ecs_input_grow_buf(&it, 32);
+    EXPECT(it.buf_size == 32u,                    "ring grown to 32");
+
+    /* All ticks 1..8 still readable; their slot indices changed only
+       for tick 8 (old slot 0, new slot 8) but content must be identical. */
+    for (uint64_t t = 1; t <= 8; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across buf_size grow");
+        for (int i = 0; i < 3; i++) {
+            ecs_input_view_t v = ecs_input_get_view(&it, t, pids[i]);
+            EXPECT(v.present   == snap_present[t-1][i],
+                                                  "view.present preserved across buf_size grow");
+            EXPECT(v.confirmed == snap_confirmed[t-1][i],
+                                                  "view.confirmed preserved across buf_size grow");
+            EXPECT(ti_eq(ti_get(&it, t, pids[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across buf_size grow");
+        }
+    }
+
+    /* Second grow. */
+    ecs_input_grow_buf(&it, 128);
+    EXPECT(it.buf_size == 128u,                   "ring grown to 128");
+    for (uint64_t t = 1; t <= 8; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across second grow");
+        for (int i = 0; i < 3; i++) {
+            EXPECT(ti_eq(ti_get(&it, t, pids[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across second grow");
+        }
+    }
+
+    /* Far-future write into newly available slots works. */
+    ti_input_t v = ti_make(0xDADA, 9, 9);
+    ecs_input_set(&it, 100, 1, &v, true);
+    EXPECT(ti_eq(ti_get(&it, 100, 1), v),         "post-grow far-tick write works");
+    /* Old data still intact. */
+    for (uint64_t t = 1; t <= 8; t++) {
+        for (int i = 0; i < 3; i++) {
+            EXPECT(ti_eq(ti_get(&it, t, pids[i]), snap_data[t-1][i]),
+                                                  "old data intact after far-tick write");
+        }
+    }
+
+    ecs_input_destroy(&it);
+}
+
+/* --- grow consistency: combined (cap then buf) ------------------------- */
+
+static void test_input_grow_combined_consistency(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+
+    const uint32_t pids[4] = { 5, 50, 500, 5000 };
+    for (int i = 0; i < 4; i++) ecs_input_register_player(&it, pids[i]);
+
+    ti_input_t snap_data[6][4];
+    bool snap_confirmed[6][4];
+    for (uint64_t t = 1; t <= 6; t++) {
+        for (int i = 0; i < 4; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 1000u + i * 7u),
+                                   (int16_t)(t - i), (int16_t)(t + i));
+            bool conf = ((t + i) & 1u) == 0u;
+            ecs_input_set(&it, t, pids[i], &v, conf);
+            snap_data[t-1][i] = v;
+            snap_confirmed[t-1][i] = conf;
+        }
+    }
+
+    /* Interleaved grows on both axes. */
+    ecs_input_grow_player_cap(&it, 64);
+    ecs_input_grow_buf(&it, 64);
+    ecs_input_grow_player_cap(&it, 128);
+    ecs_input_grow_buf(&it, 256);
+
+    for (uint64_t t = 1; t <= 6; t++) {
+        for (int i = 0; i < 4; i++) {
+            ecs_input_view_t v = ecs_input_get_view(&it, t, pids[i]);
+            EXPECT(v.present,                     "present preserved through combined grows");
+            EXPECT(v.confirmed == snap_confirmed[t-1][i],
+                                                  "confirmed preserved through combined grows");
+            EXPECT(ti_eq(ti_get(&it, t, pids[i]), snap_data[t-1][i]),
+                                                  "bytes preserved through combined grows");
+        }
+    }
+
+    ecs_input_destroy(&it);
+}
+
 /* --- entry point ------------------------------------------------------- */
 
 static int test_input_all(void) {
@@ -519,6 +721,9 @@ static int test_input_all(void) {
     RUN_TEST(test_input_persistence);
     RUN_TEST(test_input_auto_grow_burst);
     RUN_TEST(test_input_grow_buf_preemptive);
+    RUN_TEST(test_input_grow_player_cap_consistency);
+    RUN_TEST(test_input_grow_buf_consistency);
+    RUN_TEST(test_input_grow_combined_consistency);
     int failed = g_failed - before;
     printf("\ninput: %d failed\n", failed);
     return failed ? 1 : 0;

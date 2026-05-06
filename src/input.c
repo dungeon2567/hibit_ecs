@@ -264,7 +264,7 @@ static void in_grow_buf_size(ecs_input_t* it, uint32_t new_buf_size) {
     assert(new_buf_size > it->buf_size);
     assert((new_buf_size & (new_buf_size - 1u)) == 0u);
     assert(new_buf_size <= ECS_INPUT_BUFSIZE_MAX);
-    in_realloc_table(it, it->active_cap ? it->active_cap : 0u, new_buf_size);
+    in_realloc_table(it, it->active_cap, new_buf_size);
 }
 
 void ecs_input_grow_buf(ecs_input_t* it, uint32_t new_buf_size) {
@@ -442,13 +442,14 @@ ecs_input_view_t ecs_input_get_view(const ecs_input_t* it,
                                     uint64_t tick, ecs_pid_t pid)
 {
     ecs_input_view_t v = { NULL, false, false };
-    uint32_t idx = in_pid_lookup(it, pid);
-    if (idx == ECS_INPUT_PID_NIL) return v;
 
     uint32_t t  = (uint32_t)(tick & it->buf_mask);
     uint32_t W  = it->words_per_row;
     uint8_t* row = in_row_ptr(it, t);
     if (*in_row_tick(row) != tick || !W) return v;
+
+    uint32_t idx = in_pid_lookup(it, pid);
+    if (idx == ECS_INPUT_PID_NIL) return v;
 
     const uint64_t* pres = in_row_present(row);
     const uint64_t* conf = in_row_confirmed(row, W);
