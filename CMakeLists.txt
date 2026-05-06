@@ -51,19 +51,34 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # -------------------------
-# mimalloc (default allocator, all platforms)
+# mimalloc (Release-only allocator)
+#   Debug builds use libc malloc so Valgrind / ASan / debugging
+#   tools see real allocator state -- mimalloc's internal pool
+#   layout confuses memcheck and obscures use-after-free reports.
 # -------------------------
 include(FetchContent)
-set(MI_OVERRIDE        OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_SHARED    OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_OBJECT    OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    mimalloc
-    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
-    GIT_TAG        v2.1.7
-)
-FetchContent_MakeAvailable(mimalloc)
+if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
+    set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "" FORCE)
+endif()
+
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(ECS_USE_MIMALLOC FALSE)
+else()
+    set(ECS_USE_MIMALLOC TRUE)
+endif()
+
+if (ECS_USE_MIMALLOC)
+    set(MI_OVERRIDE        OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED    OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT    OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        mimalloc
+        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+        GIT_TAG        v2.1.7
+    )
+    FetchContent_MakeAvailable(mimalloc)
+endif()
 
 # -------------------------
 # zstd (static, used by serialize tests)
@@ -87,10 +102,6 @@ FetchContent_MakeAvailable(zstd)
 #   Release  → ecs_bench (Google Benchmark only, no test runtime)
 # Override either side with -DECS_FORCE_BUILD_TESTS=ON / -DECS_FORCE_BUILD_BENCH=ON.
 # -------------------------
-if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
-    set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "" FORCE)
-endif()
-
 option(ECS_FORCE_BUILD_TESTS "Force-build the ecs (tests) target" OFF)
 option(ECS_FORCE_BUILD_BENCH "Force-build the ecs_bench target"   OFF)
 
@@ -120,7 +131,12 @@ if (ECS_BUILD_TESTS)
         ${zstd_SOURCE_DIR}/lib
     )
 
-    target_link_libraries(ecs PRIVATE mimalloc-static libzstd_static)
+    if (ECS_USE_MIMALLOC)
+        target_link_libraries(ecs PRIVATE mimalloc-static libzstd_static)
+    else()
+        target_compile_definitions(ecs PRIVATE ECS_NO_MIMALLOC)
+        target_link_libraries(ecs PRIVATE libzstd_static)
+    endif()
 endif()
 
 if (ECS_BUILD_BENCH)
@@ -149,7 +165,12 @@ if (ECS_BUILD_BENCH)
         benchmarks
     )
 
-    target_link_libraries(ecs_bench PRIVATE mimalloc-static benchmark::benchmark)
+    if (ECS_USE_MIMALLOC)
+        target_link_libraries(ecs_bench PRIVATE mimalloc-static benchmark::benchmark)
+    else()
+        target_compile_definitions(ecs_bench PRIVATE ECS_NO_MIMALLOC)
+        target_link_libraries(ecs_bench PRIVATE benchmark::benchmark)
+    endif()
 endif()
 
 # -------------------------

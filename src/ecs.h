@@ -5,13 +5,74 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
-#include <mimalloc.h>
 #include "ecs_math.h"
 #include "ecs_serializer.h"
 
-/* mimalloc wrappers. 'x' prefix = abort on OOM (xmalloc convention) -- every
-   allocation site in this engine treats failure as fatal, so callers don't
-   check. ecs_free is a thin pass-through for symmetry. */
+/* Allocator wrappers. 'x' prefix = abort on OOM (xmalloc convention) --
+   every allocation site treats failure as fatal so callers don't check.
+   ecs_free is a thin pass-through for symmetry.
+
+   ECS_NO_MIMALLOC (set on Debug builds): fall back to libc malloc.
+   Picks the right aligned-alloc on each platform so all allocations are
+   consistently freed by the matching free fn. Lets Valgrind / ASan see
+   real heap state (mimalloc's pool layout confuses memcheck). */
+
+#ifdef ECS_NO_MIMALLOC
+
+#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__)
+  #include <malloc.h>
+  #define ECS_NMI_ALIGNED_MALLOC(sz, al)        _aligned_malloc((sz), (al))
+  #define ECS_NMI_ALIGNED_REALLOC(p, sz, al)    _aligned_realloc((p), (sz), (al))
+  #define ECS_NMI_ALIGNED_FREE(p)               _aligned_free(p)
+#else
+  static inline void* ecs__nmi_aligned_malloc(size_t sz, size_t al) {
+      /* C11 aligned_alloc requires size multiple of align. */
+      size_t rounded = (sz + al - 1u) & ~(al - 1u);
+      return aligned_alloc(al, rounded);
+  }
+  static inline void* ecs__nmi_aligned_realloc(void* p, size_t sz, size_t al) {
+      /* No posix aligned_realloc. glibc malloc is 16B-aligned, so plain
+         realloc keeps that for al <= 16. All call sites use al <= 16. */
+      (void)al;
+      assert(al <= 16u);
+      return realloc(p, sz);
+  }
+  #define ECS_NMI_ALIGNED_MALLOC(sz, al)        ecs__nmi_aligned_malloc((sz), (al))
+  #define ECS_NMI_ALIGNED_REALLOC(p, sz, al)    ecs__nmi_aligned_realloc((p), (sz), (al))
+  #define ECS_NMI_ALIGNED_FREE(p)               free(p)
+#endif
+
+/* All ECS_NO_MIMALLOC allocations route through the aligned API so a
+   single free fn handles everything. Non-aligned paths default to 8B
+   alignment (matches mimalloc's default). */
+static inline void* ecs_xmalloc_aligned(size_t size, size_t align) {
+    void* p = ECS_NMI_ALIGNED_MALLOC(size, align);
+    if (!p) { fprintf(stderr, "ecs: OOM xmalloc_aligned(%zu, %zu)\n", size, align); abort(); }
+    return p;
+}
+static inline void* ecs_xcalloc(size_t n, size_t size) {
+    size_t total = n * size;
+    void* p = ECS_NMI_ALIGNED_MALLOC(total, 8u);
+    if (!p) { fprintf(stderr, "ecs: OOM xcalloc(%zu, %zu)\n", n, size); abort(); }
+    memset(p, 0, total);
+    return p;
+}
+static inline void ecs_free(void* p) { ECS_NMI_ALIGNED_FREE(p); }
+static inline void* ecs_xrealloc(void* p, size_t size) {
+    void* q = ECS_NMI_ALIGNED_REALLOC(p, size, 8u);
+    if (!q) { fprintf(stderr, "ecs: OOM xrealloc(%zu)\n", size); abort(); }
+    return q;
+}
+static inline void* ecs_xrealloc_aligned(void* p, size_t size, size_t align) {
+    void* q = ECS_NMI_ALIGNED_REALLOC(p, size, align);
+    if (!q) { fprintf(stderr, "ecs: OOM xrealloc_aligned(%zu, %zu)\n", size, align); abort(); }
+    return q;
+}
+
+#else
+
+#include <mimalloc.h>
+
 static inline void* ecs_xmalloc_aligned(size_t size, size_t align) {
     void* p = mi_malloc_aligned(size, align);
     if (!p) { fprintf(stderr, "ecs: OOM xmalloc_aligned(%zu, %zu)\n", size, align); abort(); }
@@ -33,6 +94,8 @@ static inline void* ecs_xrealloc_aligned(void* p, size_t size, size_t align) {
     if (!q) { fprintf(stderr, "ecs: OOM xrealloc_aligned(%zu, %zu)\n", size, align); abort(); }
     return q;
 }
+
+#endif
 
 /* ==========================================================================
    ecs_buffer_t -- typed dynamic array. Wraps a single `ecs_buffer_header_t*`
