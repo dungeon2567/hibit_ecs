@@ -266,10 +266,10 @@ struct ecs_world_t {
     ecs_tree_t trees[64];
     uint64_t   mask;
     uint64_t   dirty;
-    uint64_t   confirmed_tick; /* gameplay/network clock. Bumped by
+    uint32_t   confirmed_tick; /* gameplay/network clock. Bumped by
                                   ecs_world_rollback when any tree advanced.
                                   Serialized; replicated across machines. */
-    uint64_t   predicted_tick; /* local frame counter. Bumped every
+    uint32_t   predicted_tick; /* local frame counter. Bumped every
                                   ecs_world_end_tick (CONFIRMED or PREDICT).
                                   Reset to confirmed_tick on rollback so
                                   predicted - confirmed = pending predict frames. */
@@ -402,7 +402,7 @@ int      ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d);
 
 /* Serialize an entire world. Format:
        version    = u8 (2)
-       tick       = u64
+       tick       = u32
        tree_mask  = encoded u64 (which of the 64 tree slots are populated)
        per set bit i in tree_mask:
            tree i serialized via ecs_tree_serialize

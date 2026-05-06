@@ -4,13 +4,12 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "ecs.h"   /* ecs_xmalloc_aligned, ecs_xcalloc, ecs_xrealloc, ecs_free, ecs_ctz32 */
-#include "fixed.h" /* fixed_8_t portable SIMD eq */
+#include "ecs.h"   /* ecs_xmalloc_aligned, ecs_xcalloc, ecs_xrealloc, ecs_free, ecs_ctz64 */
 
 /* ==========================================================================
    Row layout (packed, single allocation in it->table)
 
-     offset 0           : u64 tick_in_slot
+     offset 0           : u32 tick_in_slot  (+4 bytes pad)
      offset 8           : u64 present[words_per_row]
      offset 8+W*8       : u64 confirmed[words_per_row]
      offset 8+2*W*8     : u8  payload[active_cap * stride]
@@ -20,9 +19,14 @@
    Per-slot ops (set/get/get_view, advance_row, reset_row, all_confirmed
    check) touch a single row = warm cache.
 
-   "all_confirmed" for a slot is computed on demand by SIMD-scanning
-   dense_ids[] for the live mask and AND-checking against the row's
-   confirmed bits. No cached counts / bitmap.
+   "all_confirmed" for a tick is computed on demand by AND-checking
+   the row's confirmed bits against live_bm (W u64 ops). No cached
+   counts / bitmap.
+
+   Slot membership: live_bm is a single bitmap of width W. Bit `idx`
+   set <=> slot idx is registered. alloc_slot finds the lowest 0 bit
+   via word-wise ctz; free_slot clears the bit. No SIMD scan, no
+   pid -> slot lookup -- callers pass slots directly.
    ========================================================================== */
 
 #define IN_HDR_BYTES 8u   /* tick_in_slot prefix size */
@@ -39,8 +43,8 @@ static inline uint32_t in_compute_row_bytes(uint32_t W, uint32_t A, uint32_t S) 
 static inline uint8_t* in_row_ptr(const ecs_input_t* it, uint32_t slot) {
     return it->table + (size_t)slot * (size_t)it->row_bytes;
 }
-static inline uint64_t* in_row_tick(uint8_t* row) {
-    return (uint64_t*)row;
+static inline uint32_t* in_row_tick(uint8_t* row) {
+    return (uint32_t*)row;
 }
 static inline uint64_t* in_row_present(uint8_t* row) {
     return (uint64_t*)(row + IN_HDR_BYTES);
@@ -56,57 +60,37 @@ static inline uint8_t* in_row_cell(uint8_t* row, uint32_t W,
     return in_row_payload(row, W) + (size_t)idx * (size_t)stride;
 }
 
-/* SIMD scan dense_ids for first slot whose value == target_val.
-   dense_ids is 32-byte aligned and active_cap is pow2 >= 8 — direct
-   reinterpret as fixed_8_t* is safe end-to-end. */
-static uint32_t in_scan_dense_ids(const ecs_input_t* it, uint32_t target_val) {
+static inline bool in_slot_live(const ecs_input_t* it, uint32_t slot) {
+    if (slot >= it->active_cap) return false;
+    return ((it->live_bm[slot >> 6] >> (slot & 63u)) & 1ull) != 0ull;
+}
+
+/* Find the lowest free slot via word-wise ctz on inverted live_bm.
+   Returns ECS_INPUT_SLOT_NIL when every slot in [0, active_cap) is
+   live. */
+static uint32_t in_find_free_slot(const ecs_input_t* it) {
+    uint32_t W = it->words_per_row;
     uint32_t cap = it->active_cap;
-    if (!cap) return ECS_INPUT_PID_NIL;
-    const fixed_8_t* ids = (const fixed_8_t*)it->dense_ids;
-    fixed_8_t target = fixed8_set1((fixed_t)target_val);
-    uint32_t blocks = cap >> 3;
-    for (uint32_t b = 0; b < blocks; b++) {
-        uint8_t mask = fixed8_eq(ids[b], target);
-        if (mask) return (b << 3) + (uint32_t)ecs_ctz32(mask);
+    for (uint32_t w = 0; w < W; w++) {
+        uint64_t inv = ~it->live_bm[w];
+        if (inv) {
+            uint32_t bit = (uint32_t)ecs_ctz64(inv);
+            uint32_t slot = (w << 6) + bit;
+            if (slot < cap) return slot;
+        }
     }
-    return ECS_INPUT_PID_NIL;
+    return ECS_INPUT_SLOT_NIL;
 }
 
-static inline uint32_t in_pid_lookup(const ecs_input_t* it, ecs_pid_t pid) {
-    if (pid >= ECS_INPUT_PID_MAX) return ECS_INPUT_PID_NIL;
-    return in_scan_dense_ids(it, (uint32_t)pid);
-}
-
-/* Build live mask per word: bits set where dense_ids[w*64+b] != NIL.
-   dense_ids is 32-byte aligned + cap pow2 >= 8: reinterpret as fixed_8_t*
-   directly, no load helper needed. */
-static inline uint64_t in_live_mask_word(const ecs_input_t* it, uint32_t w) {
-    uint64_t live = 0;
-    uint32_t base_block = (w * 64u) >> 3;
-    uint32_t cap  = it->active_cap;
-    uint32_t cap_blocks = cap >> 3;
-    const fixed_8_t* ids = (const fixed_8_t*)it->dense_ids;
-    fixed_8_t nil_v = fixed8_set1((fixed_t)ECS_INPUT_PID_NIL);
-    for (uint32_t k = 0; k < 64u; k += 8u) {
-        uint32_t blk = base_block + (k >> 3);
-        if (blk >= cap_blocks) break;
-        uint8_t mask = fixed8_eq(ids[blk], nil_v);
-        /* mask: bit b set => dense_ids[off+b] == NIL.  live bit = !NIL. */
-        uint64_t bits = ((uint64_t)(uint8_t)~mask) & 0xFFull;
-        live |= bits << k;
-    }
-    return live;
-}
-
-/* True iff every currently-registered player has its confirmed bit set
-   at ring slot `t`. Computed on demand. O(active_cap / 8) SIMD ops. */
+/* True iff every currently-registered slot has its confirmed bit set
+   at ring slot `t`. Computed on demand. O(W) word ops. */
 static bool in_tick_all_confirmed(const ecs_input_t* it, uint32_t t) {
-    if (it->active_cap == 0u) return true;
+    if (it->active_count == 0u) return true;
     uint8_t* row = in_row_ptr(it, t);
     uint64_t* confirmed = in_row_confirmed(row, it->words_per_row);
     uint32_t W = it->words_per_row;
     for (uint32_t w = 0; w < W; w++) {
-        uint64_t live = in_live_mask_word(it, w);
+        uint64_t live = it->live_bm[w];
         if ((confirmed[w] & live) != live) return false;
     }
     return true;
@@ -124,10 +108,10 @@ static void in_reset_row(ecs_input_t* it, uint32_t t) {
     *in_row_tick(row) = ECS_INPUT_TICK_NIL;
 }
 
-/* First-touch advance: carry every live player's bytes forward from
+/* First-touch advance: carry every live slot's bytes forward from
    prev tick into the new ring slot, mark them present (predicted),
    clear confirmed. Implements input persistence. */
-static void in_advance_row(ecs_input_t* it, uint32_t t, uint64_t tick) {
+static void in_advance_row(ecs_input_t* it, uint32_t t, uint32_t tick) {
     uint8_t* row = in_row_ptr(it, t);
     uint32_t W = it->words_per_row;
 
@@ -138,10 +122,10 @@ static void in_advance_row(ecs_input_t* it, uint32_t t, uint64_t tick) {
 
     bool has_prev = false;
     uint32_t prev_t = 0;
-    if (tick > 0ull) {
-        prev_t = (uint32_t)((tick - 1ull) & it->buf_mask);
+    if (tick > 0u) {
+        prev_t = (tick - 1u) & it->buf_mask;
         uint8_t* prev_row = in_row_ptr(it, prev_t);
-        has_prev = (*in_row_tick(prev_row) == tick - 1ull);
+        has_prev = (*in_row_tick(prev_row) == tick - 1u);
     }
 
     if (has_prev && W) {
@@ -152,15 +136,17 @@ static void in_advance_row(ecs_input_t* it, uint32_t t, uint64_t tick) {
         uint8_t* new_payload  = in_row_payload(row, W);
         size_t stride = (size_t)it->stride;
 
-        for (uint32_t idx = 0; idx < it->dense_high; idx++) {
-            if (it->dense_ids[idx] == ECS_INPUT_PID_NIL) continue;
-            uint64_t bit = 1ull << (idx & 63u);
-            uint32_t word = idx >> 6;
-            if (!(prev_pres[word] & bit)) continue;
-            memcpy(new_payload  + (size_t)idx * stride,
-                   prev_payload + (size_t)idx * stride,
-                   stride);
-            new_pres[word] |= bit;
+        for (uint32_t w = 0; w < W; w++) {
+            uint64_t carry = it->live_bm[w] & prev_pres[w];
+            new_pres[w] |= carry;
+            uint64_t m = carry;
+            while (m) {
+                uint32_t b = (uint32_t)ecs_ctz64(m); m &= m - 1ull;
+                uint32_t idx = (w << 6) + b;
+                memcpy(new_payload  + (size_t)idx * stride,
+                       prev_payload + (size_t)idx * stride,
+                       stride);
+            }
         }
     }
 }
@@ -187,26 +173,27 @@ static void in_realloc_table(ecs_input_t* it, uint32_t new_cap,
 
     size_t   total          = (size_t)new_buf_size * (size_t)new_row_bytes;
     uint8_t* new_table      = (uint8_t*)ecs_xmalloc_aligned(total, 8);
-    /* Mark all new rows empty. tick_in_slot at offset 0 of each row. */
+    /* Mark all new rows empty. tick_in_slot at offset 0 of each row.
+       Pad bytes [4..8) left undefined -- only the u32 at offset 0 is read. */
     for (uint32_t i = 0; i < new_buf_size; i++) {
-        uint64_t* tick_p = (uint64_t*)(new_table + (size_t)i * new_row_bytes);
+        uint32_t* tick_p = (uint32_t*)(new_table + (size_t)i * new_row_bytes);
         *tick_p = ECS_INPUT_TICK_NIL;
     }
 
     if (it->table && old_cap > 0u && old_buf_size > 0u) {
         /* Walk old rows, place each at its new slot. */
         uint32_t common_buf = old_buf_size < new_buf_size ? old_buf_size : new_buf_size;
-        uint64_t new_mask = new_buf_size - 1u;
+        uint32_t new_mask = new_buf_size - 1u;
 
         for (uint32_t old_slot = 0; old_slot < common_buf; old_slot++) {
             uint8_t* old_row = it->table + (size_t)old_slot * old_row_bytes;
-            uint64_t T = *(uint64_t*)old_row;
+            uint32_t T = *(uint32_t*)old_row;
             if (T == ECS_INPUT_TICK_NIL) continue;
-            uint32_t new_slot = (uint32_t)(T & new_mask);
+            uint32_t new_slot = T & new_mask;
             uint8_t* new_row = new_table + (size_t)new_slot * new_row_bytes;
 
             /* tick_in_slot */
-            *(uint64_t*)new_row = T;
+            *(uint32_t*)new_row = T;
 
             /* Bitmaps: present + confirmed. Copy old_W words into the
                low part of new_W; rest stays 0 (alloc was xmalloc, but
@@ -244,18 +231,17 @@ static void in_realloc_table(ecs_input_t* it, uint32_t new_cap,
 
 static void in_grow_active_cap(ecs_input_t* it, uint32_t need) {
     uint32_t old_cap = it->active_cap;
+    uint32_t old_W   = it->words_per_row;
     uint32_t new_cap = old_cap ? old_cap : ECS_INPUT_PLAYER_CAP_INIT;
     while (new_cap < need) new_cap <<= 1;
     if (new_cap == old_cap) return;
 
-    /* Dense bookkeeping: realloc + init NIL for new entries. 32-byte
-       aligned so SIMD can reinterpret-cast as fixed_8_t* without
-       a load helper. */
-    it->dense_ids = (uint32_t*)ecs_xrealloc_aligned(it->dense_ids,
-                        (size_t)new_cap * sizeof(*it->dense_ids), 32);
-    for (uint32_t i = old_cap; i < new_cap; i++) {
-        it->dense_ids[i] = ECS_INPUT_PID_NIL;
-    }
+    uint32_t new_W = in_words_for_cap(new_cap);
+
+    /* Live bitmap: realloc + zero-extend new words. Old bits preserved. */
+    it->live_bm = (uint64_t*)ecs_xrealloc(it->live_bm,
+                        (size_t)new_W * sizeof(uint64_t));
+    for (uint32_t w = old_W; w < new_W; w++) it->live_bm[w] = 0ull;
 
     in_realloc_table(it, new_cap, it->buf_size);
 }
@@ -299,21 +285,21 @@ void ecs_input_init(ecs_input_t* it, uint32_t stride, uint32_t buf_size) {
 
     /* Allocate table immediately with active_cap=0 so all rows have
        a valid tick_in_slot header. Payload region is empty until first
-       register grows active_cap. row_bytes = padded(8 + 0 + 0) = 8. */
+       alloc_slot grows active_cap. row_bytes = padded(8 + 0 + 0) = 8. */
     it->row_bytes     = in_compute_row_bytes(0u, 0u, stride);
     size_t total      = (size_t)buf_size * (size_t)it->row_bytes;
     it->table         = (uint8_t*)ecs_xmalloc_aligned(total, 8);
     for (uint32_t i = 0; i < buf_size; i++) {
-        *(uint64_t*)(it->table + (size_t)i * it->row_bytes) = ECS_INPUT_TICK_NIL;
+        *(uint32_t*)(it->table + (size_t)i * it->row_bytes) = ECS_INPUT_TICK_NIL;
     }
 
-    it->confirmed_frontier = 0ull;
+    it->confirmed_frontier = 0u;
 }
 
 void ecs_input_destroy(ecs_input_t* it) {
     if (!it) return;
-    if (it->table)     ecs_free(it->table);
-    if (it->dense_ids) ecs_free(it->dense_ids);
+    if (it->table)   ecs_free(it->table);
+    if (it->live_bm) ecs_free(it->live_bm);
     memset(it, 0, sizeof(*it));
 }
 
@@ -321,27 +307,22 @@ void ecs_input_destroy(ecs_input_t* it) {
    Membership
    ========================================================================== */
 
-bool ecs_input_register_player(ecs_input_t* it, ecs_pid_t pid) {
+uint32_t ecs_input_alloc_slot(ecs_input_t* it) {
     assert(it);
-    if (pid >= ECS_INPUT_PID_MAX) return false;
-    if (it->active_count >= ECS_INPUT_PLAYER_MAX) return false;
+    if (it->active_count >= ECS_INPUT_PLAYER_MAX) return ECS_INPUT_SLOT_NIL;
 
-    if (in_pid_lookup(it, pid) != ECS_INPUT_PID_NIL) return false;
-
-    if (it->active_cap == 0u || it->dense_high >= it->active_cap) {
-        in_grow_active_cap(it, it->dense_high + 1u);
+    if (it->active_cap == 0u || it->active_count >= it->active_cap) {
+        in_grow_active_cap(it, it->active_count + 1u);
     }
-    uint32_t idx = in_scan_dense_ids(it, ECS_INPUT_PID_NIL);
-    assert(idx != ECS_INPUT_PID_NIL);
+    uint32_t slot = in_find_free_slot(it);
+    assert(slot != ECS_INPUT_SLOT_NIL);
 
-    bool reused = (idx < it->dense_high);
-    if (!reused) it->dense_high = idx + 1u;
-
-    /* ABA defense: clear stale bits at idx in any still-live tick row. */
-    if (reused && it->words_per_row) {
+    /* ABA defense: clear stale bits at slot in any still-live tick row.
+       Safe to always run -- empty rows have tick == NIL and are skipped. */
+    if (it->words_per_row) {
         uint32_t W   = it->words_per_row;
-        uint32_t word= idx >> 6;
-        uint64_t bit = 1ull << (idx & 63u);
+        uint32_t word= slot >> 6;
+        uint64_t bit = 1ull << (slot & 63u);
         uint64_t notbit = ~bit;
         for (uint32_t t = 0; t < it->buf_size; t++) {
             uint8_t* row = in_row_ptr(it, t);
@@ -353,45 +334,51 @@ bool ecs_input_register_player(ecs_input_t* it, ecs_pid_t pid) {
         }
     }
 
-    it->dense_ids[idx] = pid;
+    it->live_bm[slot >> 6] |= 1ull << (slot & 63u);
     it->active_count++;
-    return true;
+    return slot;
 }
 
-void ecs_input_unregister_player(ecs_input_t* it, ecs_pid_t pid) {
+void ecs_input_free_slot(ecs_input_t* it, uint32_t slot) {
     assert(it);
-    uint32_t idx = in_pid_lookup(it, pid);
-    if (idx == ECS_INPUT_PID_NIL) return;
-    it->dense_ids[idx] = ECS_INPUT_PID_NIL;
+    if (slot >= it->active_cap) return;
+    uint64_t bit = 1ull << (slot & 63u);
+    uint64_t* w = &it->live_bm[slot >> 6];
+    if (!(*w & bit)) return;
+    *w &= ~bit;
     it->active_count--;
+}
+
+bool ecs_input_slot_is_live(const ecs_input_t* it, uint32_t slot) {
+    assert(it);
+    return in_slot_live(it, slot);
 }
 
 /* ==========================================================================
    Hot path
    ========================================================================== */
 
-void ecs_input_set(ecs_input_t* it, uint64_t tick, ecs_pid_t pid,
+void ecs_input_set(ecs_input_t* it, uint32_t tick, uint32_t slot,
                    const void* value, bool confirmed)
 {
     assert(it);
     assert(value);
     assert(tick != ECS_INPUT_TICK_NIL);
-    assert(tick >= 1ull);   /* tick 0 reserved as "no frontier" sentinel */
+    assert(tick >= 1u);   /* tick 0 reserved as "no frontier" sentinel */
 
-    uint32_t idx = in_pid_lookup(it, pid);
-    if (idx == ECS_INPUT_PID_NIL) return;
+    if (!in_slot_live(it, slot)) return;
 
     /* Auto-grow ring if first-touch would clobber a still-live slot. */
     {
-        uint32_t t0   = (uint32_t)(tick & it->buf_mask);
+        uint32_t t0   = tick & it->buf_mask;
         uint8_t* row0 = in_row_ptr(it, t0);
-        uint64_t prev = *in_row_tick(row0);
+        uint32_t prev = *in_row_tick(row0);
         bool would_evict = (prev != ECS_INPUT_TICK_NIL && prev != tick &&
                             prev > it->confirmed_frontier);
         if (would_evict) {
-            uint64_t diff = (tick > prev) ? (tick - prev) : (prev - tick);
-            if (diff < (uint64_t)ECS_INPUT_BUFSIZE_MAX) {
-                uint32_t need = (uint32_t)diff + 1u;
+            uint32_t diff = (tick > prev) ? (tick - prev) : (prev - tick);
+            if (diff < ECS_INPUT_BUFSIZE_MAX) {
+                uint32_t need = diff + 1u;
                 uint32_t ns   = it->buf_size;
                 while (ns < need) ns <<= 1;
                 if (ns <= ECS_INPUT_BUFSIZE_MAX) in_grow_buf_size(it, ns);
@@ -399,7 +386,7 @@ void ecs_input_set(ecs_input_t* it, uint64_t tick, ecs_pid_t pid,
         }
     }
 
-    uint32_t t  = (uint32_t)(tick & it->buf_mask);
+    uint32_t t  = tick & it->buf_mask;
     uint32_t W  = it->words_per_row;
     uint8_t* row = in_row_ptr(it, t);
 
@@ -411,13 +398,13 @@ void ecs_input_set(ecs_input_t* it, uint64_t tick, ecs_pid_t pid,
 
     uint64_t* conf = in_row_confirmed(row, W);
     uint64_t* pres = in_row_present(row);
-    uint64_t  bit  = 1ull << (idx & 63u);
-    uint32_t  word = idx >> 6;
+    uint64_t  bit  = 1ull << (slot & 63u);
+    uint32_t  word = slot >> 6;
     bool was_confirmed = (conf[word] & bit) != 0ull;
 
     if (!confirmed && was_confirmed) return;
 
-    memcpy(in_row_cell(row, W, idx, it->stride), value, it->stride);
+    memcpy(in_row_cell(row, W, slot, it->stride), value, it->stride);
     pres[word] |= bit;
 
     if (confirmed && !was_confirmed) {
@@ -425,75 +412,69 @@ void ecs_input_set(ecs_input_t* it, uint64_t tick, ecs_pid_t pid,
     }
 }
 
-const void* ecs_input_get(const ecs_input_t* it, uint64_t tick, ecs_pid_t pid) {
-    uint32_t idx = in_pid_lookup(it, pid);
-    if (idx == ECS_INPUT_PID_NIL) return NULL;
-    uint32_t t  = (uint32_t)(tick & it->buf_mask);
+const void* ecs_input_get(const ecs_input_t* it, uint32_t tick, uint32_t slot) {
+    if (!in_slot_live(it, slot)) return NULL;
+    uint32_t t  = tick & it->buf_mask;
     uint8_t* row = in_row_ptr(it, t);
     if (*in_row_tick(row) != tick) return NULL;
     uint32_t W  = it->words_per_row;
     if (!W) return NULL;
     const uint64_t* pres = in_row_present(row);
-    if (!((pres[idx >> 6] >> (idx & 63u)) & 1u)) return NULL;
-    return in_row_cell(row, W, idx, it->stride);
+    if (!((pres[slot >> 6] >> (slot & 63u)) & 1u)) return NULL;
+    return in_row_cell(row, W, slot, it->stride);
 }
 
 ecs_input_view_t ecs_input_get_view(const ecs_input_t* it,
-                                    uint64_t tick, ecs_pid_t pid)
+                                    uint32_t tick, uint32_t slot)
 {
     ecs_input_view_t v = { NULL, false, false };
 
-    uint32_t t  = (uint32_t)(tick & it->buf_mask);
+    uint32_t t  = tick & it->buf_mask;
     uint32_t W  = it->words_per_row;
     uint8_t* row = in_row_ptr(it, t);
     if (*in_row_tick(row) != tick || !W) return v;
 
-    uint32_t idx = in_pid_lookup(it, pid);
-    if (idx == ECS_INPUT_PID_NIL) return v;
+    if (!in_slot_live(it, slot)) return v;
 
     const uint64_t* pres = in_row_present(row);
     const uint64_t* conf = in_row_confirmed(row, W);
-    v.present   = (pres[idx >> 6] >> (idx & 63u)) & 1u;
-    v.confirmed = (conf[idx >> 6] >> (idx & 63u)) & 1u;
+    v.present   = (pres[slot >> 6] >> (slot & 63u)) & 1u;
+    v.confirmed = (conf[slot >> 6] >> (slot & 63u)) & 1u;
     if (v.present) {
-        v.data = in_row_cell(row, W, idx, it->stride);
+        v.data = in_row_cell(row, W, slot, it->stride);
     }
     return v;
 }
 
-void ecs_input_clear(ecs_input_t* it, uint64_t tick) {
+void ecs_input_clear(ecs_input_t* it, uint32_t tick) {
     assert(it);
     assert(tick != ECS_INPUT_TICK_NIL);
-    assert(tick >= 1ull);
-    uint32_t t = (uint32_t)(tick & it->buf_mask);
+    assert(tick >= 1u);
+    uint32_t t = tick & it->buf_mask;
     in_reset_row(it, t);
 }
 
-bool ecs_input_tick_confirmed(const ecs_input_t* it, uint64_t tick) {
+bool ecs_input_tick_confirmed(const ecs_input_t* it, uint32_t tick) {
     /* Anything sim has already sealed is authoritative by definition --
        even if its ring slot has since been evicted by a newer write. */
-    if (tick != 0ull && tick <= it->confirmed_frontier) return true;
+    if (tick != 0u && tick <= it->confirmed_frontier) return true;
     if (it->active_count == 0u) return true;
-    uint32_t t = (uint32_t)(tick & it->buf_mask);
+    uint32_t t = tick & it->buf_mask;
     uint8_t* row = in_row_ptr(it, t);
     if (*in_row_tick(row) != tick) return false;
     return in_tick_all_confirmed(it, t);
 }
 
-uint64_t ecs_input_frontier(const ecs_input_t* it) {
+uint32_t ecs_input_frontier(const ecs_input_t* it) {
     return it->confirmed_frontier;
 }
 
-void ecs_input_advance_to_tick(ecs_input_t* it, uint64_t tick) {
+void ecs_input_advance_to_tick(ecs_input_t* it, uint32_t tick) {
     assert(it);
     assert(tick != ECS_INPUT_TICK_NIL);
-    assert(tick >= 1ull);
+    assert(tick >= 1u);
     assert(tick >= it->confirmed_frontier);   /* frontier monotonic */
     it->confirmed_frontier = tick;
-}
-
-bool ecs_input_is_registered(const ecs_input_t* it, ecs_pid_t pid) {
-    return in_pid_lookup(it, pid) != ECS_INPUT_PID_NIL;
 }
 
 /* ==========================================================================
@@ -543,16 +524,16 @@ static inline void in_write_payload_bits(ecs_serializer_t* s,
 
 void ecs_input_serialize_tick(const ecs_input_t* it,
                               ecs_serializer_t* s,
-                              uint64_t tick,
+                              uint32_t tick,
                               uint32_t redundancy)
 {
     assert(it);
     assert(s);
-    assert(tick >= 1ull);
+    assert(tick >= 1u);
 
     /* Header. Caller is responsible for ensuring peer agrees on
        active_cap and stride out-of-band. */
-    ecs_serializer_write_bits(s, tick, 64);
+    ecs_serializer_write_bits(s, tick, 32);
     ecs_serializer_write_bits(s, (uint64_t)redundancy, 8);
 
     uint32_t cap = it->active_cap;
@@ -564,7 +545,7 @@ void ecs_input_serialize_tick(const ecs_input_t* it,
 
     /* Resolve current row. If the ring slot does not hold this tick
        every slot is treated as zeros (matches baseline -> 1 bit each). */
-    uint32_t t_cur   = (uint32_t)(tick & mask);
+    uint32_t t_cur   = tick & mask;
     uint8_t* row_cur = in_row_ptr(it, t_cur);
     int cur_valid   = (*in_row_tick(row_cur) == tick);
     const uint64_t* pres_cur = cur_valid ? in_row_present(row_cur)    : NULL;
@@ -596,10 +577,10 @@ void ecs_input_serialize_tick(const ecs_input_t* it,
         int matched = 0;
         for (uint32_t r = 0; r < redundancy; r++) {
             const uint8_t* ref_bytes = zero_buf;
-            uint64_t off = (uint64_t)(r + 1u);
+            uint32_t off = r + 1u;
             if (tick > off) {
-                uint64_t past   = tick - off;
-                uint32_t tp     = (uint32_t)(past & mask);
+                uint32_t past   = tick - off;
+                uint32_t tp     = past & mask;
                 uint8_t* row_p  = in_row_ptr(it, tp);
                 if (*in_row_tick(row_p) == past) {
                     const uint64_t* pres_p = in_row_present(row_p);
@@ -624,9 +605,9 @@ void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d) {
     assert(it);
     assert(d);
 
-    uint64_t tick       = ecs_deserializer_read_bits(d, 64);
+    uint32_t tick       = (uint32_t)ecs_deserializer_read_bits(d, 32);
     uint32_t redundancy = (uint32_t)ecs_deserializer_read_bits(d, 8);
-    assert(tick >= 1ull);
+    assert(tick >= 1u);
 
     uint32_t cap = it->active_cap;
     if (cap == 0u) return;
@@ -653,10 +634,10 @@ void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d) {
                 if (ecs_deserializer_read_bits(d, 1) == 0ull) {
                     /* Slot equals tick T-r in receiver's ring; resolve. */
                     value_bytes = zero_buf;
-                    uint64_t off = (uint64_t)(r + 1u);
+                    uint32_t off = r + 1u;
                     if (tick > off) {
-                        uint64_t past = tick - off;
-                        uint32_t tp = (uint32_t)(past & mask);
+                        uint32_t past = tick - off;
+                        uint32_t tp = past & mask;
                         uint8_t* row_p = in_row_ptr(it, tp);
                         if (*in_row_tick(row_p) == past) {
                             const uint64_t* pres_p = in_row_present(row_p);
@@ -677,27 +658,39 @@ void ecs_input_deserialize_tick(ecs_input_t* it, ecs_deserializer_t* d) {
             }
         }
 
-        /* Apply as confirmed. Skip slots without a registered pid. */
-        ecs_pid_t pid = it->dense_ids[idx];
-        if (pid == ECS_INPUT_PID_NIL) continue;
-        ecs_input_set(it, tick, pid, value_bytes, true);
+        /* Apply as confirmed. Skip slots whose live bit is clear. */
+        if (!in_slot_live(it, idx)) continue;
+        ecs_input_set(it, tick, idx, value_bytes, true);
     }
 }
 
 bool ecs_input_iter_next(ecs_input_iter_t* iter) {
     assert(iter && iter->it);
     const ecs_input_t* it = iter->it;
-    uint32_t i = iter->cursor;
-    while (i < it->dense_high) {
-        if (it->dense_ids[i] != ECS_INPUT_PID_NIL) {
-            iter->dense_idx = i;
-            iter->pid       = it->dense_ids[i];
-            iter->cursor    = i + 1u;
+    uint32_t cap = it->active_cap;
+    uint32_t i   = iter->cursor;
+    if (i >= cap) {
+        iter->cursor = cap;
+        iter->slot   = ECS_INPUT_SLOT_NIL;
+        return false;
+    }
+    uint32_t W = it->words_per_row;
+    uint32_t w = i >> 6;
+    /* Mask off bits below i in the starting word, then ctz across words. */
+    uint64_t m = it->live_bm[w] & (~0ull << (i & 63u));
+    while (w < W) {
+        if (m) {
+            uint32_t b    = (uint32_t)ecs_ctz64(m);
+            uint32_t slot = (w << 6) + b;
+            if (slot >= cap) break;
+            iter->slot   = slot;
+            iter->cursor = slot + 1u;
             return true;
         }
-        i++;
+        if (++w >= W) break;
+        m = it->live_bm[w];
     }
-    iter->cursor    = i;
-    iter->pid       = ECS_INPUT_PID_NIL;
+    iter->cursor = cap;
+    iter->slot   = ECS_INPUT_SLOT_NIL;
     return false;
 }

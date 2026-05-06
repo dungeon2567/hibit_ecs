@@ -1168,7 +1168,7 @@ int ecs_tree_deserialize(ecs_tree_t* tree, ecs_deserializer_t* d) {
 
 void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
     assert(world && s);
-    ecs_serializer_write_bits(s, world->confirmed_tick, 64);
+    ecs_serializer_write_bits(s, world->confirmed_tick, 32);
     ecs_serialize_mask(world->mask, s);
 
     /* Both sides are assumed to share identical schema (which slots exist
@@ -1183,7 +1183,7 @@ void ecs_world_serialize(const ecs_world_t* world, ecs_serializer_t* s) {
 
 int ecs_world_deserialize(ecs_world_t* world, ecs_deserializer_t* d) {
     assert(world && d);
-    world->confirmed_tick = ecs_deserializer_read_bits(d, 64);
+    world->confirmed_tick = (uint32_t)ecs_deserializer_read_bits(d, 32);
     /* Snapshot is a confirmed-state ground truth; predicted clock re-syncs
        to confirmed (no pending speculative frames after a load). */
     world->predicted_tick = world->confirmed_tick;
